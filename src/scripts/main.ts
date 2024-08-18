@@ -55,7 +55,7 @@ function setUpLights() {
   scene.add(light2);
 
   const light3 = new THREE.AmbientLight();
-  light3.intensity = 0.1
+  light3.intensity = 0.5
   scene.add(light3);
 }
 
