@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/Addons.js';
+import Stats from 'three/examples/jsm/libs/stats.module.js';
 import { World } from './world';
 
 // Get window size
@@ -13,6 +14,10 @@ window.addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(winWidth, winHeight);
 })
+
+// Stats = FPS monitor
+const stats = new Stats();
+document.body.appendChild(stats.dom);
 
 // Setup for renderer
 const renderer = new THREE.WebGLRenderer();
@@ -57,6 +62,8 @@ function setUpLights() {
 function animate() {
   requestAnimationFrame(animate);
   renderer.render(scene, camera);
+
+  stats.update();
 }
 
 setUpLights();
