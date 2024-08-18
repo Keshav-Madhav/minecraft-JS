@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { SimplexNoise } from 'three/examples/jsm/Addons.js';
 
 const goemetry = new THREE.BoxGeometry(1, 1, 1);
 const material = new THREE.MeshLambertMaterial({ color: 0x00ff00 });
@@ -10,6 +11,14 @@ export class World extends THREE.Group {
     instanceId: number,
   }[][][] = [];
 
+  params = {
+    terrain: {
+      scale: 30,
+      magnitude: 0.5,
+      offset: 0.2,
+    }
+  }
+
   constructor(size = {width: 64, height: 16}) {
     super();
 
@@ -17,12 +26,13 @@ export class World extends THREE.Group {
   }
 
   generate(){
+    this.InitializeTerrain();
     this.generateTerrain();
     this.generateMeshes();
   }
 
-  // Generate the world terrain data
-  generateTerrain(){
+  // Initialize the world terrain data
+  InitializeTerrain(){
     this.data =[]
     for(let x = 0; x < this.size.width; x++) {
       const slice = [];
@@ -30,13 +40,35 @@ export class World extends THREE.Group {
         const row = [];
         for(let z = 0; z < this.size.width; z++) {
           row.push({
-            id: 1,
+            id: 0,
             instanceId: -1,
           });
         }
         slice.push(row);
       }
       this.data.push(slice);
+    }
+  }
+
+  // Generate the world terrain data
+  generateTerrain(){
+    const simplex = new SimplexNoise();
+    for(let x = 0; x < this.size.width; x++) {
+      for(let z = 0; z < this.size.width; z++) {
+        const val = simplex.noise(
+          x/this.params.terrain.scale,
+          z/this.params.terrain.scale
+        )
+
+        const scaledNoice = this.params.terrain.offset + this.params.terrain.magnitude * val;
+
+        let height = Math.floor(scaledNoice * this.size.height);
+        height = Math.max(0, Math.min(height, this.size.height - 1));
+
+        for(let y = 0; y < height; y++) {
+          this.setBlockId(x, y, z, 1);
+        }
+      }
     }
   }
 
