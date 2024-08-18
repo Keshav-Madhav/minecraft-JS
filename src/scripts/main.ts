@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/Addons.js';
 import Stats from 'three/examples/jsm/libs/stats.module.js';
 import { World } from './world';
+import { createGUI } from './ui';
 
 // Get window size
 let winWidth = window.innerWidth;
@@ -67,4 +68,5 @@ function animate() {
 }
 
 setUpLights();
+createGUI(world);
 animate();
