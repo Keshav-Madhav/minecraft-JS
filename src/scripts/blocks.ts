@@ -1,9 +1,32 @@
+import * as THREE from 'three';
+
+const textureLoader = new THREE.TextureLoader();
+
+function loadTexture(url: string) {
+  const texture = textureLoader.load(url);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.minFilter = THREE.NearestFilter;
+  texture.magFilter = THREE.NearestFilter;
+
+  return texture;
+}
+
+const textures = {
+  dirt: loadTexture('textures/dirt.png'),
+  grass: loadTexture('textures/grass.png'),
+  grassSide: loadTexture('textures/grass_side.png'),
+  stone: loadTexture('textures/stone.png'),
+  coalOre: loadTexture('textures/coal_ore.png'),
+  ironOre: loadTexture('textures/iron_ore.png'),
+}
+
 type allBlocks = 'air' | 'grass' | 'dirt' | 'stone' | 'coalOre' | 'ironOre';
 
 export const blocks:{
   [key in allBlocks]: {
     id: number;
     name: string;
+    material: THREE.Material[];
     color?: number;
     scale?: {
       x: number;
@@ -16,16 +39,26 @@ export const blocks:{
   air: {
     id: 0,
     name: 'Air',
+    material: []
   },
   grass:{
     id: 1,
     name: 'Grass Block',
-    color: 0x559020
+    color: 0x559020,
+    material: [
+      new THREE.MeshBasicMaterial({ map: textures.grassSide }),
+      new THREE.MeshBasicMaterial({ map: textures.grassSide }),
+      new THREE.MeshBasicMaterial({ map: textures.grass }),
+      new THREE.MeshBasicMaterial({ map: textures.dirt }),
+      new THREE.MeshBasicMaterial({ map: textures.grassSide }),
+      new THREE.MeshBasicMaterial({ map: textures.grassSide }),
+    ]
   },
   dirt:{
     id: 2,
     name: 'Dirt Block',
-    color: 0x807020
+    color: 0x807020,
+    material: new Array(6).fill(new THREE.MeshBasicMaterial({ map: textures.dirt }))
   },
   stone:{
     id: 3,
@@ -36,7 +69,8 @@ export const blocks:{
       y: 30,
       z: 30
     },
-    scarcity: 0.76
+    scarcity: 0.76,
+    material: new Array(6).fill(new THREE.MeshBasicMaterial({ map: textures.stone }))
   },
   coalOre:{
     id: 4,
@@ -47,7 +81,8 @@ export const blocks:{
       y: 20,
       z: 20
     },
-    scarcity: 0.8
+    scarcity: 0.8,
+    material: new Array(6).fill(new THREE.MeshBasicMaterial({ map: textures.coalOre }))
   },
   ironOre:{
     id: 5,
@@ -58,7 +93,8 @@ export const blocks:{
       y: 14,
       z: 22
     },
-    scarcity: 0.8
+    scarcity: 0.8,
+    material: new Array(6).fill(new THREE.MeshBasicMaterial({ map: textures.ironOre }))
   },
 }
 

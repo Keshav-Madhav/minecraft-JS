@@ -4,7 +4,6 @@ import { RNG } from './rng';
 import { blocks, resources } from './blocks';
 
 const goemetry = new THREE.BoxGeometry(1, 1, 1);
-const material = new THREE.MeshLambertMaterial();
 
 export class World extends THREE.Group {
   size: {width: number, height: number};
@@ -32,7 +31,7 @@ export class World extends THREE.Group {
     const rng = new RNG(this.params.seed);
     this.InitializeTerrain();
     this.generateResources(rng);
-    // this.generateTerrain(rng);
+    this.generateTerrain(rng);
     this.generateMeshes();
   }
 
@@ -114,29 +113,41 @@ export class World extends THREE.Group {
   generateMeshes(){
     this.clear();
     const maxCount = this.size.width * this.size.height * this.size.width;
-    const mesh = new THREE.InstancedMesh(goemetry, material, maxCount);
-    mesh.count = 0;
+
+    // creating a look up table for block instance ids
+    const meshes: {[key: number]: THREE.InstancedMesh} = {};
+
+    Object.values(blocks).
+      filter(block => block.id !== blocks.air.id).
+      forEach(block => {
+        const mesh = new THREE.InstancedMesh(goemetry, block.material, maxCount);
+        mesh.name = block.name;
+        mesh.count = 0;
+        meshes[block.id] = mesh;
+      });
+
 
     const matrix = new THREE.Matrix4();
     for(let i = 0; i < this.size.width; i++) {
       for(let k = 0; k < this.size.height; k++) {
         for(let j = 0; j < this.size.width; j++) {
           const blockId = this.getBlock(i, k, j)?.id;
-          const instanceId = mesh.count;
-          const blockType = Object.values(blocks).find(block => block.id === blockId);
-
-          if(blockId !== blocks.air.id && !this.isBlockObscured(i, k, j)){
-            matrix.setPosition(i+0.5 , k+0.5, j+0.5);
-            mesh.setMatrixAt(instanceId, matrix);
-            mesh.setColorAt(instanceId, new THREE.Color(blockType?.color));
-            this.setBlockInstanceId(i, k, j, instanceId);
-            mesh.count++;
-          }
+          if(blockId && blockId !== blocks.air.id) {
+            const mesh = meshes[blockId];
+            const instanceId = mesh.count;
+  
+            if(!this.isBlockObscured(i, k, j)){
+              matrix.setPosition(i+0.5 , k+0.5, j+0.5);
+              mesh.setMatrixAt(instanceId, matrix);
+              this.setBlockInstanceId(i, k, j, instanceId);
+              mesh.count++;
+            }
+          };
         }
       }
     }
 
-    this.add(mesh);
+    this.add(...Object.values(meshes));
   }
 
   getBlock(x: number, y: number, z: number){
