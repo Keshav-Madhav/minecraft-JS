@@ -28,6 +28,11 @@ export class Player {
 
       this.controls.moveRight(this.input.x * delta);
       this.controls.moveForward(this.input.y * delta);
+
+      const infoElement = document.getElementById('player-pos');
+      if (infoElement) {
+        infoElement.innerText = this.toString();
+      }
     }
   }
 
@@ -49,6 +54,10 @@ export class Player {
       case 'd':
         this.input.x = this.maxSpeed;
         break;
+      case 'r':
+        this.camera.position.set(32, 16, 32);
+        this.velocity.set(0, 0, 0);
+        break
     }
   }
 
@@ -63,5 +72,9 @@ export class Player {
         this.input.x = 0;
         break;
     }
+  }
+
+  toString(){
+    return `Player: (X:${this.position.x.toFixed(3)}  Y:${this.position.y.toFixed(3)}  Z:${this.position.z.toFixed(3)})`;
   }
 }

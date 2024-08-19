@@ -1,12 +1,17 @@
 import GUI from "three/examples/jsm/libs/lil-gui.module.min.js";
 import { World } from "./world";
 import { resources } from "./blocks";
+import { Player } from "./player";
 
-export function createGUI(world: World) {
+export function createGUI(world: World, player: Player) {
   const gui = new GUI();
+
+  const playerFolder = gui.addFolder('Player');
+  playerFolder.add(player, 'maxSpeed', 1, 40).name('Max Speed');
   
-  gui.add(world.size, 'width', 4, 128, 1).name('Width')
-  gui.add(world.size, 'height', 1, 64, 1).name('Height')
+  const worldFolder = gui.addFolder('World');
+  worldFolder.add(world.size, 'width', 4, 128, 1).name('Width')
+  worldFolder.add(world.size, 'height', 1, 64, 1).name('Height')
 
   const terrainFolder = gui.addFolder('Terrain');
   terrainFolder.add(world.params, 'seed', 0, 10000).name('Seed');

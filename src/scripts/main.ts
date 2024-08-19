@@ -12,8 +12,12 @@ window.addEventListener('resize', () => {
   winWidth = window.innerWidth;
   winHeight = window.innerHeight;
 
-  camera.aspect = winWidth / winHeight;
-  camera.updateProjectionMatrix();
+  OrbitCam.aspect = winWidth / winHeight;
+  OrbitCam.updateProjectionMatrix();
+
+  player.camera.aspect = winWidth / winHeight;
+  player.camera.updateProjectionMatrix();
+
   renderer.setSize(winWidth, winHeight);
 })
 
@@ -33,13 +37,13 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
-// Setup for camera
-const camera = new THREE.PerspectiveCamera(70, winWidth / winHeight);
-camera.position.set(-32, 16, -32); 
-camera.lookAt(0, 0, 0);
+// Setup for OrbitCam
+const OrbitCam = new THREE.PerspectiveCamera(70, winWidth / winHeight);
+OrbitCam.position.set(-32, 16, -32); 
+OrbitCam.lookAt(0, 0, 0);
 
 // Setup for controls
-const controls = new OrbitControls(camera, renderer.domElement);
+const controls = new OrbitControls(OrbitCam, renderer.domElement);
 controls.target.set(16, 0, 16);
 controls.update();
 
@@ -82,7 +86,7 @@ function animate() {
 
   requestAnimationFrame(animate);
   player.applyInputs(delta);
-  renderer.render(scene, player.camera);
+  renderer.render(scene, player.controls.isLocked ? player.camera : OrbitCam);
 
   stats.update();
 
@@ -90,5 +94,5 @@ function animate() {
 }
 
 setUpLights();
-createGUI(world);
+createGUI(world, player);
 animate();
