@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/examples/jsm/Addons.js';
 import Stats from 'three/examples/jsm/libs/stats.module.js';
 import { World } from './world';
 import { createGUI } from './ui';
+import { Player } from './player';
 
 // Get window size
 let winWidth = window.innerWidth;
@@ -15,6 +16,9 @@ window.addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(winWidth, winHeight);
 })
+
+let previousTime = performance.now();
+
 
 // Stats = FPS monitor
 const stats = new Stats();
@@ -45,6 +49,9 @@ const world = new World();
 world.generate();
 scene.add(world);
 
+// Setup for player
+const player = new Player(scene);
+
 // light
 function setUpLights() {
   const sun = new THREE.DirectionalLight();
@@ -70,10 +77,16 @@ function setUpLights() {
 
 //draw loop
 function animate() {
+  const currentTime = performance.now();
+  const delta = (currentTime - previousTime) / 1000;
+
   requestAnimationFrame(animate);
-  renderer.render(scene, camera);
+  player.applyInputs(delta);
+  renderer.render(scene, player.camera);
 
   stats.update();
+
+  previousTime = currentTime;
 }
 
 setUpLights();
