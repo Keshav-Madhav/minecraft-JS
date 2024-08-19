@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { SimplexNoise } from 'three/examples/jsm/Addons.js';
 import { RNG } from './rng';
-import { blocks } from './blocks';
+import { blocks, resources } from './blocks';
 
 const goemetry = new THREE.BoxGeometry(1, 1, 1);
 const material = new THREE.MeshLambertMaterial();
@@ -17,20 +17,22 @@ export class World extends THREE.Group {
     seed: 0,
     terrain: {
       scale: 30,
-      magnitude: 0.5,
-      offset: 0.2,
+      magnitude: 0.3,
+      offset: 0.35,
     }
   }
 
-  constructor(size = {width: 64, height: 16}) {
+  constructor(size = {width: 64, height: 48}) {
     super();
 
     this.size = size;
   }
 
   generate(){
+    const rng = new RNG(this.params.seed);
     this.InitializeTerrain();
-    this.generateTerrain();
+    this.generateResources(rng);
+    // this.generateTerrain(rng);
     this.generateMeshes();
   }
 
@@ -53,29 +55,55 @@ export class World extends THREE.Group {
     }
   }
 
-  // Generate the world terrain data
-  generateTerrain(){
-    const rng = new RNG(this.params.seed);
+  // Generate the world resources
+  generateResources(rng: RNG){
     const simplex = new SimplexNoise(rng);
-    for(let x = 0; x < this.size.width; x++) {
-      for(let z = 0; z < this.size.width; z++) {
+    resources.forEach(resource => {
+      for(let i = 0; i < this.size.width; i++) {
+        for(let j = 0; j < this.size.width; j++) {
+          for(let k = 0; k < this.size.height; k++) {
+            const val = simplex.noise3d(
+              i/ resource.scale.x,
+              j/ resource.scale.y,
+              k/ resource.scale.z
+            )
+  
+            if(val > resource.scarcity){
+              this.setBlockId(i, k, j, resource.id);
+            }
+          }
+        }
+      }
+    })
+  }
+
+  generateTerrain(rng: RNG) {
+    const simplex = new SimplexNoise(rng);
+    for (let x = 0; x < this.size.width; x++) {
+      for (let z = 0; z < this.size.width; z++) {
         const val = simplex.noise(
-          x/this.params.terrain.scale,
-          z/this.params.terrain.scale
-        )
-
-        const scaledNoice = this.params.terrain.offset + this.params.terrain.magnitude * val;
-
-        let height = Math.floor(scaledNoice * this.size.height);
+          x / this.params.terrain.scale,
+          z / this.params.terrain.scale
+        );
+  
+        const scaledNoise = this.params.terrain.offset + this.params.terrain.magnitude * val;
+  
+        let height = Math.floor(scaledNoise * this.size.height);
         height = Math.max(0, Math.min(height, this.size.height - 1));
-
-        for(let y = 0; y < this.size.height; y++) {
-          if(y < height){
-            this.setBlockId(x, y, z, blocks.dirt.id);
-          } else if (y === height){
-            this.setBlockId(x, y, z, blocks.grass.id);
-          } else {
+  
+        for (let y = 0; y < this.size.height; y++) {
+          if (y > height) {
+            // Everything above height is air
             this.setBlockId(x, y, z, blocks.air.id);
+          } else if (y === height) {
+            // Top layer is always grass
+            this.setBlockId(x, y, z, blocks.grass.id);
+          } else if (y >= height - 3 && this.getBlock(x, y, z)?.id === blocks.air.id) {
+            // Next 3 layers are dirt
+            this.setBlockId(x, y, z, blocks.dirt.id);
+          } else if(this.getBlock(x, y, z)?.id === blocks.air.id) {
+            // Everything else below is stone
+            this.setBlockId(x, y, z, blocks.stone.id);
           }
         }
       }
