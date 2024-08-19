@@ -123,6 +123,8 @@ export class World extends THREE.Group {
         const mesh = new THREE.InstancedMesh(goemetry, block.material, maxCount);
         mesh.name = block.name;
         mesh.count = 0;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
         meshes[block.id] = mesh;
       });
 

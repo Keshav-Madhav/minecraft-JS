@@ -46,19 +46,19 @@ export const blocks:{
     name: 'Grass Block',
     color: 0x559020,
     material: [
-      new THREE.MeshBasicMaterial({ map: textures.grassSide }),
-      new THREE.MeshBasicMaterial({ map: textures.grassSide }),
-      new THREE.MeshBasicMaterial({ map: textures.grass }),
-      new THREE.MeshBasicMaterial({ map: textures.dirt }),
-      new THREE.MeshBasicMaterial({ map: textures.grassSide }),
-      new THREE.MeshBasicMaterial({ map: textures.grassSide }),
+      new THREE.MeshLambertMaterial({ map: textures.grassSide }),
+      new THREE.MeshLambertMaterial({ map: textures.grassSide }),
+      new THREE.MeshLambertMaterial({ map: textures.grass }),
+      new THREE.MeshLambertMaterial({ map: textures.dirt }),
+      new THREE.MeshLambertMaterial({ map: textures.grassSide }),
+      new THREE.MeshLambertMaterial({ map: textures.grassSide }),
     ]
   },
   dirt:{
     id: 2,
     name: 'Dirt Block',
     color: 0x807020,
-    material: new Array(6).fill(new THREE.MeshBasicMaterial({ map: textures.dirt }))
+    material: new Array(6).fill(new THREE.MeshLambertMaterial({ map: textures.dirt }))
   },
   stone:{
     id: 3,
@@ -70,7 +70,7 @@ export const blocks:{
       z: 30
     },
     scarcity: 0.76,
-    material: new Array(6).fill(new THREE.MeshBasicMaterial({ map: textures.stone }))
+    material: new Array(6).fill(new THREE.MeshLambertMaterial({ map: textures.stone }))
   },
   coalOre:{
     id: 4,
@@ -82,7 +82,7 @@ export const blocks:{
       z: 20
     },
     scarcity: 0.8,
-    material: new Array(6).fill(new THREE.MeshBasicMaterial({ map: textures.coalOre }))
+    material: new Array(6).fill(new THREE.MeshLambertMaterial({ map: textures.coalOre }))
   },
   ironOre:{
     id: 5,
@@ -94,7 +94,7 @@ export const blocks:{
       z: 22
     },
     scarcity: 0.8,
-    material: new Array(6).fill(new THREE.MeshBasicMaterial({ map: textures.ironOre }))
+    material: new Array(6).fill(new THREE.MeshLambertMaterial({ map: textures.ironOre }))
   },
 }
 

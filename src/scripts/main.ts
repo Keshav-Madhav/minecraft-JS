@@ -25,7 +25,8 @@ const renderer = new THREE.WebGLRenderer();
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(winWidth, winHeight);
 renderer.setClearColor(0x80a0e0);
-
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
 // Setup for camera
@@ -46,17 +47,25 @@ scene.add(world);
 
 // light
 function setUpLights() {
-  const light1 = new THREE.DirectionalLight();
-  light1.position.set(1, 1, 1);
-  scene.add(light1);
+  const sun = new THREE.DirectionalLight();
+  sun.position.set(50, 50, 50);
+  sun.castShadow = true;
+  sun.shadow.camera.left = -50;
+  sun.shadow.camera.right = 50;
+  sun.shadow.camera.top = 50;
+  sun.shadow.camera.bottom = -50;
+  sun.shadow.camera.near = 0.1;
+  sun.shadow.camera.far = 100;
+  sun.shadow.bias = -0.0005;
+  sun.shadow.mapSize = new THREE.Vector2(1024, 1024);
+  scene.add(sun);
 
-  const light2 = new THREE.DirectionalLight();
-  light2.position.set(-1, -1, -0.5);
-  scene.add(light2);
+  const shadowHelper = new THREE.CameraHelper(sun.shadow.camera);
+  scene.add(shadowHelper);
 
-  const light3 = new THREE.AmbientLight();
-  light3.intensity = 0.5
-  scene.add(light3);
+  const ambient = new THREE.AmbientLight();
+  ambient.intensity = 0.1
+  scene.add(ambient);
 }
 
 //draw loop
