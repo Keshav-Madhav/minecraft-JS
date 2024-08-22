@@ -1,9 +1,9 @@
 import GUI from "three/examples/jsm/libs/lil-gui.module.min.js";
-import { World } from "./world";
+import { WorldChunk } from "./worldChunk";
 import { resources } from "./blocks";
 import { Player } from "./player";
 
-export function createGUI(world: World, player: Player) {
+export function createGUI(world: WorldChunk, player: Player) {
   const gui = new GUI();
 
   const playerFolder = gui.addFolder('Player');
