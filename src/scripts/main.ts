@@ -5,6 +5,7 @@ import { WorldChunk } from './worldChunk';
 import { createGUI } from './ui';
 import { Player } from './player';
 import { Physics } from './physics';
+import { World } from './world';
 
 // Get window size
 let winWidth = window.innerWidth;
@@ -50,7 +51,7 @@ controls.update();
 
 // Setup for scene
 const scene = new THREE.Scene();
-const world = new WorldChunk();
+const world = new World();
 world.generate();
 scene.add(world);
 

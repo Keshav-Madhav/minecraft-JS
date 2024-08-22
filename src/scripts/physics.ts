@@ -1,7 +1,7 @@
 import * as Three from 'three';
 import { Player } from './player';
-import { WorldChunk } from './worldChunk';
 import { blocks } from './blocks';
+import { World } from './world';
 
 const collisionMaterial = new Three.MeshBasicMaterial({ color: 0xff0000, transparent: true, opacity:0.2 });
 const collisionGeometry = new Three.BoxGeometry(1.0001, 1.001, 1.001);
@@ -29,7 +29,7 @@ export class Physics {
     scene.add(this.helpers);
   }
 
-  update(delta: number, player: Player, world: WorldChunk){
+  update(delta: number, player: Player, world: World){
     this.accumulator += delta;
 
     while(this.accumulator >= this.timeStep){
@@ -45,7 +45,7 @@ export class Physics {
     }
   }
 
-  detectCollisions(player: Player, world: WorldChunk){
+  detectCollisions(player: Player, world: World){
     player.onGround = false;
     const candidates = this.broadPhase(player, world);
     const collisions = this.narrowPhase(player, candidates);
@@ -72,7 +72,7 @@ export class Physics {
     }
   }
 
-  broadPhase(player: Player, world: WorldChunk){
+  broadPhase(player: Player, world: World){
     const candidates = [];
 
     const extents = {

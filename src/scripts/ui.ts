@@ -1,9 +1,9 @@
 import GUI from "three/examples/jsm/libs/lil-gui.module.min.js";
-import { WorldChunk } from "./worldChunk";
 import { resources } from "./blocks";
 import { Player } from "./player";
+import { World } from "./world";
 
-export function createGUI(world: WorldChunk, player: Player) {
+export function createGUI(world: World, player: Player) {
   const gui = new GUI();
 
   const playerFolder = gui.addFolder('Player');
@@ -11,8 +11,8 @@ export function createGUI(world: WorldChunk, player: Player) {
   playerFolder.add(player.cameraHelper, 'visible').name('Camera Helper');
   
   const worldFolder = gui.addFolder('World');
-  worldFolder.add(world.size, 'width', 4, 128, 1).name('Width')
-  worldFolder.add(world.size, 'height', 1, 64, 1).name('Height')
+  worldFolder.add(world.chunkSize, 'width', 4, 128, 1).name('Width')
+  worldFolder.add(world.chunkSize, 'height', 1, 64, 1).name('Height')
 
   const terrainFolder = gui.addFolder('Terrain');
   terrainFolder.add(world.params, 'seed', 0, 10000).name('Seed');

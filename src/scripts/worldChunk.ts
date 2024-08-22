@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { Object3D, Object3DEventMap } from 'three';
 import { SimplexNoise } from 'three/examples/jsm/Addons.js';
 import { RNG } from './rng';
 import { blocks, resources } from './blocks';
@@ -7,24 +8,18 @@ const goemetry = new THREE.BoxGeometry(1, 1, 1);
 
 export class WorldChunk extends THREE.Group {
   size: {width: number, height: number};
+  params: {seed: number, terrain: {scale: number, magnitude: number, offset: number}};
   data: {
     id: number,
     instanceId: number,
   }[][][] = [];
 
-  params = {
-    seed: 0,
-    terrain: {
-      scale: 30,
-      magnitude: 0.3,
-      offset: 0.35,
-    }
-  }
 
-  constructor(size = {width: 64, height: 48}) {
+  constructor(size: {width: number, height: number}, params: {seed: number, terrain: {scale: number, magnitude: number, offset: number}}){
     super();
 
     this.size = size;
+    this.params = params;
   }
 
   generate(){
@@ -62,9 +57,9 @@ export class WorldChunk extends THREE.Group {
         for(let j = 0; j < this.size.width; j++) {
           for(let k = 0; k < this.size.height; k++) {
             const val = simplex.noise3d(
-              i/ resource.scale.x,
-              j/ resource.scale.y,
-              k/ resource.scale.z
+              (this.position.x + i)/ resource.scale.x,
+              (this.position.y + j)/ resource.scale.y,
+              (this.position.z + k)/ resource.scale.z
             )
   
             if(val > resource.scarcity){
@@ -81,8 +76,8 @@ export class WorldChunk extends THREE.Group {
     for (let x = 0; x < this.size.width; x++) {
       for (let z = 0; z < this.size.width; z++) {
         const val = simplex.noise(
-          x / this.params.terrain.scale,
-          z / this.params.terrain.scale
+          (this.position.x + x) / this.params.terrain.scale,
+          (this.position.z + z) / this.params.terrain.scale
         );
   
         const scaledNoise = this.params.terrain.offset + this.params.terrain.magnitude * val;
@@ -197,5 +192,23 @@ export class WorldChunk extends THREE.Group {
     } else {
       return false;
     }
+  }
+
+  disposeInstance() {
+    this.traverse((child: Object3D) => {
+      if (child instanceof THREE.Mesh) {
+        if (child.geometry) {
+          child.geometry.dispose();
+        }
+        if (child.material) {
+          if (Array.isArray(child.material)) {
+            child.material.forEach(material => material.dispose());
+          } else {
+            child.material.dispose();
+          }
+        }
+      }
+    });
+    this.clear();
   }
 }
