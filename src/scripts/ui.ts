@@ -8,6 +8,7 @@ export function createGUI(world: World, player: Player) {
 
   const playerFolder = gui.addFolder('Player');
   playerFolder.add(player, 'maxSpeed', 1, 40).name('Max Speed');
+  playerFolder.add(player.cameraHelper, 'visible').name('Camera Helper');
   
   const worldFolder = gui.addFolder('World');
   worldFolder.add(world.size, 'width', 4, 128, 1).name('Width')

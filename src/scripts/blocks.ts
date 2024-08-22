@@ -108,6 +108,7 @@ function assertFullBlock(block: typeof blocks[keyof typeof blocks]): Required<ty
 export const resources: {
   id: number;
   name: string;
+  material: THREE.Material[];
   color: number;
   scale: {
     x: number;
