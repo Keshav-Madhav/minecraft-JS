@@ -4,6 +4,7 @@ import Stats from 'three/examples/jsm/libs/stats.module.js';
 import { World } from './world';
 import { createGUI } from './ui';
 import { Player } from './player';
+import { Physics } from './physics';
 
 // Get window size
 let winWidth = window.innerWidth;
@@ -56,6 +57,8 @@ scene.add(world);
 // Setup for player
 const player = new Player(scene);
 
+const physics = new Physics(scene);
+
 // light
 function setUpLights() {
   const sun = new THREE.DirectionalLight();
@@ -81,11 +84,12 @@ function setUpLights() {
 
 //draw loop
 function animate() {
-  const currentTime = performance.now();
+  const currentTime = performance.now(); 
   const delta = (currentTime - previousTime) / 1000;
 
   requestAnimationFrame(animate);
-  player.applyInputs(delta);
+  
+  physics.update(delta, player, world);
   renderer.render(scene, player.controls.isLocked ? player.camera : OrbitCam);
 
   stats.update();
