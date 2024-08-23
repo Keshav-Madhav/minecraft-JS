@@ -12,6 +12,7 @@ export function createGUI(world: World, player: Player) {
   
   
   const terrainFolder = gui.addFolder('Terrain');
+  terrainFolder.add(world, 'asyncLoading').name('Async Loading');
   terrainFolder.add(world, 'drawDistance', 0, 10, 1).name('Draw Distance');
   terrainFolder.add(world.params, 'seed', 0, 10000).name('Seed');
   terrainFolder.add(world.params.terrain, 'scale', 10, 100).name('Scale');

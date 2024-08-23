@@ -7,6 +7,7 @@ import { blocks, resources } from './blocks';
 const goemetry = new THREE.BoxGeometry(1, 1, 1);
 
 export class WorldChunk extends THREE.Group {
+  loaded: boolean
   size: {width: number, height: number};
   params: {seed: number, terrain: {scale: number, magnitude: number, offset: number}};
   data: {
@@ -18,6 +19,7 @@ export class WorldChunk extends THREE.Group {
   constructor(size: {width: number, height: number}, params: {seed: number, terrain: {scale: number, magnitude: number, offset: number}}){
     super();
 
+    this.loaded = false;
     this.size = size;
     this.params = params;
   }
@@ -28,6 +30,8 @@ export class WorldChunk extends THREE.Group {
     this.generateResources(rng);
     this.generateTerrain(rng);
     this.generateMeshes();
+
+    this.loaded = true;
   }
 
   // Initialize the world terrain data

@@ -18,6 +18,8 @@ export class World extends Three.Group {
   }
   drawDistance = 1;
 
+  asyncLoading = true;
+
   constructor(seed = 0){
     super();
     this.seed = seed
@@ -75,7 +77,12 @@ export class World extends Three.Group {
     const chunk = new WorldChunk(this.chunkSize, this.params);
     chunk.position.set(x * this.chunkSize.width, 0, z * this.chunkSize.width);
     chunk.userData = {x, z};
-    chunk.generate();
+
+    if(this.asyncLoading){
+      requestIdleCallback(chunk.generate.bind(chunk), {timeout: 1000});
+    } else{
+      chunk.generate();
+    }
     this.add(chunk);
   }
 
@@ -98,7 +105,7 @@ export class World extends Three.Group {
     const coords = this.worldToChunkCoords(x, y, z);
     const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
 
-    if(chunk){
+    if(chunk && chunk.loaded){
       return chunk.getBlock(coords.block.x, coords.block.y, coords.block.z);
     } else {
       return null;
