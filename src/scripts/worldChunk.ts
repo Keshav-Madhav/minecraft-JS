@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { Object3D, Object3DEventMap } from 'three';
+import { Object3D } from 'three';
 import { SimplexNoise } from 'three/examples/jsm/Addons.js';
 import { RNG } from './rng';
 import { blocks, resources } from './blocks';

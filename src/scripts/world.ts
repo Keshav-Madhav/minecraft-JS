@@ -34,7 +34,40 @@ export class World extends Three.Group {
   }
 
   getBlock(x: number, y: number, z: number){
-    return null
+    const coords = this.worldToChunkCoords(x, y, z);
+    const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
+
+    console.log(coords);
+
+    if(chunk){
+      return chunk.getBlock(coords.block.x, coords.block.y, coords.block.z);
+    } else {
+      return null;
+    }
+  }
+
+  worldToChunkCoords(x: number, y: number, z: number){
+    const chunkCoords = {
+      x: Math.floor(x / this.chunkSize.width),
+      z: Math.floor(z / this.chunkSize.width)
+    }
+
+    const blockCoords ={
+      x: x - this.chunkSize.width * chunkCoords.x,
+      y,
+      z: z - this.chunkSize.width * chunkCoords.z
+    }
+
+    return {
+      chunk: chunkCoords,
+      block: blockCoords
+    }
+  }
+
+  getChunk(x: number, z: number){
+    return this.children.find((child: Three.Object3D) => {
+      return child.userData.x === x && child.userData.z === z
+    }) as WorldChunk;
   }
 
   disposeChunks() {
