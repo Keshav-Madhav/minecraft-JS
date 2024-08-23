@@ -20,7 +20,7 @@ export class Player {
   cameraHelper = new Three.CameraHelper(this.camera);
 
   constructor(scene: Three.Scene) {
-    this.camera.position.set(32, 16, 32);    
+    this.camera.position.set(0, 64, 0);    
     scene.add(this.camera);
     scene.add(this.cameraHelper);
 
@@ -85,7 +85,7 @@ export class Player {
         this.input.x = this.maxSpeed;
         break;
       case 'r':
-        this.camera.position.set(32, 16, 32);
+        this.camera.position.set(0, 64, 0);
         this.velocity.set(0, 0, 0);
         break
       case ' ':

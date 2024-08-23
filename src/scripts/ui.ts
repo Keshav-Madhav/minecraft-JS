@@ -10,11 +10,9 @@ export function createGUI(world: World, player: Player) {
   playerFolder.add(player, 'maxSpeed', 1, 40).name('Max Speed');
   playerFolder.add(player.cameraHelper, 'visible').name('Camera Helper');
   
-  const worldFolder = gui.addFolder('World');
-  worldFolder.add(world.chunkSize, 'width', 4, 128, 1).name('Width')
-  worldFolder.add(world.chunkSize, 'height', 1, 64, 1).name('Height')
-
+  
   const terrainFolder = gui.addFolder('Terrain');
+  terrainFolder.add(world, 'drawDistance', 0, 10, 1).name('Draw Distance');
   terrainFolder.add(world.params, 'seed', 0, 10000).name('Seed');
   terrainFolder.add(world.params.terrain, 'scale', 10, 100).name('Scale');
   terrainFolder.add(world.params.terrain, 'magnitude', 0, 1).name('Magnitude');
