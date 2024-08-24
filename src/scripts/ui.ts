@@ -2,9 +2,14 @@ import GUI from "three/examples/jsm/libs/lil-gui.module.min.js";
 import { resources } from "./blocks";
 import { Player } from "./player";
 import { World } from "./world";
+import { Scene } from "three";
 
-export function createGUI(world: World, player: Player) {
+export function createGUI(world: World, player: Player, scene: Scene) {
   const gui = new GUI();
+
+  const sceneFolder = gui.addFolder('Scene');
+  sceneFolder.add(scene.fog, 'near', 0, 100).name('Fog Near');
+  sceneFolder.add(scene.fog, 'far', 0, 100).name('Fog Far');
 
   const playerFolder = gui.addFolder('Player');
   playerFolder.add(player, 'maxSpeed', 1, 40).name('Max Speed');

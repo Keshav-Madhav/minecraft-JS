@@ -7,16 +7,16 @@ type chunkCoords = {x: number, z: number};
 export class World extends Three.Group {
   seed: number;
 
-  chunkSize = {width: 16, height: 64}
+  chunkSize = {width: 16, height: 32}
   params = {
     seed: 0,
     terrain: {
-      scale: 30,
-      magnitude: 0.3,
+      scale: 60,
+      magnitude: 0.1,
       offset: 0.35,
     }
   }
-  drawDistance = 1;
+  drawDistance = 3;
 
   asyncLoading = true;
 
