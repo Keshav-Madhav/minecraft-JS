@@ -78,6 +78,7 @@ function setUpLights() {
   scene.add(sun.target)
 
   const shadowHelper = new THREE.CameraHelper(sun.shadow.camera);
+  shadowHelper.visible = false;
   scene.add(shadowHelper);
 
   const ambient = new THREE.AmbientLight();
@@ -93,6 +94,7 @@ function animate() {
   requestAnimationFrame(animate);
   
   if(player.controls.isLocked) {
+    player.update(world);
     physics.update(delta, player, world);
     world.update(player)
     

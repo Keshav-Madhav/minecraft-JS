@@ -1,5 +1,8 @@
 import * as Three from 'three';
 import { PointerLockControls } from 'three/examples/jsm/Addons.js';
+import { World } from './world';
+
+const screeCenter=new Three.Vector2();
 
 export class Player {
   camera = new Three.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 200);
@@ -19,6 +22,10 @@ export class Player {
   input = new Three.Vector3();
   cameraHelper = new Three.CameraHelper(this.camera);
 
+  raycaster = new Three.Raycaster(undefined, undefined, 0, 4);
+  selectedCoords:  Three.Vector3 | null = null;
+  selectionHelper: Three.Mesh;
+
   constructor(scene: Three.Scene) {
     this.camera.position.set(0, 64, 0);    
     scene.add(this.camera);
@@ -31,7 +38,44 @@ export class Player {
       new Three.CylinderGeometry(this.radius, this.radius, this.height, 16),
       new Three.MeshBasicMaterial({ wireframe: true})
     )
+    this.boundsHelper.visible = false;
+    this.cameraHelper.visible = false;
     scene.add(this.boundsHelper);
+
+    const selectionMaterial = new Three.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.3 });
+    const selectionGeometry = new Three.BoxGeometry(1.001, 1.001, 1.001);
+    this.selectionHelper = new Three.Mesh(selectionGeometry, selectionMaterial);
+    scene.add(this.selectionHelper);
+  }
+
+  update(world: World) {
+    this.updateRayCast(world)
+  }
+
+  updateRayCast(world: World) {
+    this.raycaster.setFromCamera(screeCenter, this.camera);   
+    const intersects = this.raycaster.intersectObject(world, true);
+
+    if(intersects.length > 0){
+      const intersection = intersects[0];
+
+      const chunk = intersection.object.parent!;
+
+      const blockMatrix = new Three.Matrix4()
+      // @ts-ignore: Method exists but is not in the type definition
+      intersection.object.getMatrixAt(intersection.instanceId, blockMatrix);
+
+      this.selectedCoords = chunk.position.clone();
+      this.selectedCoords.applyMatrix4(blockMatrix);
+
+      this.selectionHelper.position.copy(this.selectedCoords); 
+      this.selectionHelper.visible = true;
+
+      console.log(this.selectedCoords);
+    } else {
+      this.selectedCoords = null;
+      this.selectionHelper.visible = false;
+    }
   }
 
   get position() {
