@@ -120,7 +120,8 @@ export class WorldChunk extends THREE.Group {
       filter(block => block.id !== blocks.air.id).
       forEach(block => {
         const mesh = new THREE.InstancedMesh(goemetry, block.material, maxCount);
-        mesh.name = block.name;
+        // modified mesh name type defination to accept number
+        mesh.name = block.id;
         mesh.count = 0;
         mesh.castShadow = true;
         mesh.receiveShadow = true;
@@ -196,6 +197,57 @@ export class WorldChunk extends THREE.Group {
     } else {
       return false;
     }
+  }
+
+  addBlockInstance(x: number, y: number, z: number){
+    const block = this.getBlock(x, y, z)!
+
+    if(block && block.id !== blocks.air.id && block.instanceId === -1){
+      const mesh = this.children.find((child: Object3D) => child.name === block.id)! as THREE.InstancedMesh;
+      const instanceId = mesh.count++;
+  
+      this.setBlockInstanceId(x, y, z, instanceId);
+  
+      const matrix = new THREE.Matrix4();
+      matrix.setPosition(x, y, z);
+  
+      mesh.setMatrixAt(instanceId, matrix);
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingSphere();
+    };
+  }
+
+  removeBlock(x: number, y: number, z: number){
+    const block = this.getBlock(x, y, z);
+    if(block && block.id !== blocks.air.id){
+      this.deleteBlockInstance(x, y, z);
+      this.setBlockId(x, y, z, blocks.air.id);
+    }
+  }
+
+  deleteBlockInstance(x: number, y: number, z: number){
+    const block = this.getBlock(x, y, z)!;
+
+    if(block.instanceId === -1 || block.id === blocks.air.id) return;
+
+    const mesh = this.children.find((child: Object3D) => child.name === block.id)! as THREE.InstancedMesh;
+    const instanceId = block.instanceId;
+
+    const lastMatrix = new THREE.Matrix4();
+    mesh.getMatrixAt(mesh.count - 1, lastMatrix);
+
+    const v = new THREE.Vector3();
+    v.setFromMatrixPosition(lastMatrix);
+    this.setBlockInstanceId(v.x, v.y, v.z, instanceId);
+
+    mesh.setMatrixAt(instanceId, lastMatrix);
+
+    mesh.count--;
+    
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.computeBoundingSphere();
+
+    this.setBlockInstanceId(x, y, z, -1);
   }
 
   disposeInstance() {

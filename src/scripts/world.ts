@@ -136,6 +136,40 @@ export class World extends Three.Group {
     }) as WorldChunk;
   }
 
+  removeBlock(x: number, y: number, z: number){
+    const coords = this.worldToChunkCoords(x, y, z);
+    const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
+
+    if(chunk){
+      chunk.removeBlock(
+        coords.block.x,
+        coords.block.y,
+        coords.block.z
+      );
+
+      // reveal blocks that were previously obscured
+      this.revealBlock(x-1, y, z);
+      this.revealBlock(x+1, y, z);
+      this.revealBlock(x, y-1, z);
+      this.revealBlock(x, y+1, z);
+      this.revealBlock(x, y, z-1);
+      this.revealBlock(x, y, z+1);
+    }
+  }
+
+  revealBlock(x: number, y: number, z: number){
+    const coords = this.worldToChunkCoords(x, y, z);
+    const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
+    
+    if(chunk){
+      chunk.addBlockInstance(
+        coords.block.x,
+        coords.block.y,
+        coords.block.z
+      )
+    }
+  }
+
   disposeChunks() {
     this.traverse((child: Three.Object3D) => {
       if (child instanceof WorldChunk && typeof child.disposeInstance === 'function') {

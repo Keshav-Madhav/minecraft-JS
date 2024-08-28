@@ -9,7 +9,7 @@ export class Player {
   controls = new PointerLockControls(this.camera, document.body);
   boundsHelper: Three.Mesh;
 
-  radius = 0.5;
+  radius = 0.4;
 
   height = 1.8;
   jumpSpeed = 10;
@@ -70,8 +70,6 @@ export class Player {
 
       this.selectionHelper.position.copy(this.selectedCoords); 
       this.selectionHelper.visible = true;
-
-      console.log(this.selectedCoords);
     } else {
       this.selectedCoords = null;
       this.selectionHelper.visible = false;

@@ -86,6 +86,13 @@ function setUpLights() {
   scene.add(ambient);
 }
 
+function onMouseDown(event: MouseEvent) {
+  if(player.controls.isLocked && player.selectedCoords){
+    world.removeBlock(player.selectedCoords.x, player.selectedCoords.y, player.selectedCoords.z);
+  }
+}
+document.addEventListener('mousedown', onMouseDown);
+
 //draw loop
 function animate() {
   const currentTime = performance.now(); 
