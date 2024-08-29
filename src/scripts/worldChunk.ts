@@ -217,6 +217,13 @@ export class WorldChunk extends THREE.Group {
     };
   }
 
+  addBlock(x: number, y: number, z: number, id: number){
+    if(this.getBlock(x, y, z)?.id === blocks.air.id){
+      this.setBlockId(x, y, z, id);
+      this.addBlockInstance(x, y, z);
+    }
+  }
+
   removeBlock(x: number, y: number, z: number){
     const block = this.getBlock(x, y, z);
     if(block && block.id !== blocks.air.id){

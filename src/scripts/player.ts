@@ -1,6 +1,7 @@
 import * as Three from 'three';
 import { PointerLockControls } from 'three/examples/jsm/Addons.js';
 import { World } from './world';
+import { blocks } from './blocks';
 
 const screeCenter=new Three.Vector2();
 
@@ -25,6 +26,8 @@ export class Player {
   raycaster = new Three.Raycaster(undefined, undefined, 0, 4);
   selectedCoords:  Three.Vector3 | null = null;
   selectionHelper: Three.Mesh;
+
+  activeBlockId = blocks.grass.id;
 
   constructor(scene: Three.Scene) {
     this.camera.position.set(0, 64, 0);    
@@ -67,6 +70,10 @@ export class Player {
 
       this.selectedCoords = chunk.position.clone();
       this.selectedCoords.applyMatrix4(blockMatrix);
+
+      if(this.activeBlockId !== blocks.air.id){
+        this.selectedCoords.add(intersection.normal!);
+      }
 
       this.selectionHelper.position.copy(this.selectedCoords); 
       this.selectionHelper.visible = true;
@@ -114,6 +121,15 @@ export class Player {
     }
 
     switch(event.key) {
+      case '0':
+      case '1':
+      case '2':
+      case '3':
+      case '4':
+      case '5':
+      case '6':
+        this.activeBlockId = parseInt(event.key);
+        break;
       case 'w':
         this.input.y = this.maxSpeed;
         break;

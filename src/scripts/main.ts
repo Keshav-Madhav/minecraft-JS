@@ -5,6 +5,7 @@ import { createGUI } from './ui';
 import { Player } from './player';
 import { Physics } from './physics';
 import { World } from './world';
+import { blocks } from './blocks';
 
 // Get window size
 let winWidth = window.innerWidth;
@@ -88,7 +89,15 @@ function setUpLights() {
 
 function onMouseDown(event: MouseEvent) {
   if(player.controls.isLocked && player.selectedCoords){
-    world.removeBlock(player.selectedCoords.x, player.selectedCoords.y, player.selectedCoords.z);
+    if(event.button === 0){
+      if(player.activeBlockId === blocks.air.id){
+        world.removeBlock(player.selectedCoords.x, player.selectedCoords.y, player.selectedCoords.z);
+      } else {
+        world.setBlock(player.selectedCoords.x, player.selectedCoords.y, player.selectedCoords.z, player.activeBlockId);
+      }
+    } else if(event.button === 2){
+      player.activeBlockId = world.getBlock(player.selectedCoords.x, player.selectedCoords.y, player.selectedCoords.z)?.id ?? blocks.air.id;
+    }
   }
 }
 document.addEventListener('mousedown', onMouseDown);
