@@ -1,6 +1,7 @@
 import * as Three from 'three';
 import { WorldChunk } from './worldChunk';
 import { Player } from './player';
+import { DataStore } from './dataStore';
 
 type chunkCoords = {x: number, z: number};
 
@@ -19,6 +20,8 @@ export class World extends Three.Group {
   drawDistance = 3;
 
   asyncLoading = true;
+
+  dataStore = new DataStore();
 
   constructor(seed = 0){
     super();
@@ -74,7 +77,7 @@ export class World extends Three.Group {
   }
 
   generateChunk(x: number, z: number){
-    const chunk = new WorldChunk(this.chunkSize, this.params);
+    const chunk = new WorldChunk(this.chunkSize, this.params, this.dataStore);
     chunk.position.set(x * this.chunkSize.width, 0, z * this.chunkSize.width);
     chunk.userData = {x, z};
 
@@ -87,12 +90,13 @@ export class World extends Three.Group {
   }
 
   generate(){
+    this.dataStore.clear();
     this.disposeChunks();
     this.children.length = 0
 
     for(let x = -this.drawDistance; x <= this.drawDistance; x++){
       for(let z = -this.drawDistance; z <= this.drawDistance; z++){
-        const chunk = new WorldChunk(this.chunkSize, this.params);
+        const chunk = new WorldChunk(this.chunkSize, this.params, this.dataStore);
         chunk.position.set(x * this.chunkSize.width, 0, z * this.chunkSize.width);
         chunk.userData = {x, z};
         chunk.generate();

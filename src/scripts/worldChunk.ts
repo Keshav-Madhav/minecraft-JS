@@ -3,6 +3,7 @@ import { Object3D } from 'three';
 import { SimplexNoise } from 'three/examples/jsm/Addons.js';
 import { RNG } from './rng';
 import { blocks, resources } from './blocks';
+import { DataStore } from './dataStore';
 
 const goemetry = new THREE.BoxGeometry(1, 1, 1);
 
@@ -14,14 +15,15 @@ export class WorldChunk extends THREE.Group {
     id: number,
     instanceId: number,
   }[][][] = [];
+  dataStore: DataStore;
 
-
-  constructor(size: {width: number, height: number}, params: {seed: number, terrain: {scale: number, magnitude: number, offset: number}}){
+  constructor(size: {width: number, height: number}, params: {seed: number, terrain: {scale: number, magnitude: number, offset: number}}, dataStore: DataStore){
     super();
 
     this.loaded = false;
     this.size = size;
     this.params = params;
+    this.dataStore = dataStore;
   }
 
   generate(){
@@ -29,6 +31,7 @@ export class WorldChunk extends THREE.Group {
     this.InitializeTerrain();
     this.generateResources(rng);
     this.generateTerrain(rng);
+    this.loadPlayerChanges();
     this.generateMeshes();
 
     this.loaded = true;
@@ -103,6 +106,19 @@ export class WorldChunk extends THREE.Group {
             // Everything else below is stone
             this.setBlockId(x, y, z, blocks.stone.id);
           }
+        }
+      }
+    }
+  }
+
+  loadPlayerChanges(){
+    for(let i = 0; i < this.size.width; i++) {
+      for(let k = 0; k < this.size.height; k++) {
+        for(let j = 0; j < this.size.width; j++) {
+          if(this.dataStore.contains({chunkX: this.position.x, chunkZ: this.position.z, blockX: i, blockY: k, blockZ: j})){
+            const blockID = this.dataStore.get({chunkX: this.position.x, chunkZ: this.position.z, blockX: i, blockY: k, blockZ: j});
+            this.setBlockId(i, k, j, blockID);
+          }          
         }
       }
     }
@@ -221,6 +237,7 @@ export class WorldChunk extends THREE.Group {
     if(this.getBlock(x, y, z)?.id === blocks.air.id){
       this.setBlockId(x, y, z, id);
       this.addBlockInstance(x, y, z);
+      this.dataStore.set({chunkX: this.position.x, chunkZ: this.position.z, blockX: x, blockY: y, blockZ: z, blockID: id});
     }
   }
 
@@ -229,6 +246,7 @@ export class WorldChunk extends THREE.Group {
     if(block && block.id !== blocks.air.id){
       this.deleteBlockInstance(x, y, z);
       this.setBlockId(x, y, z, blocks.air.id);
+      this.dataStore.set({chunkX: this.position.x, chunkZ: this.position.z, blockX: x, blockY: y, blockZ: z, blockID: blocks.air.id});
     }
   }
 
