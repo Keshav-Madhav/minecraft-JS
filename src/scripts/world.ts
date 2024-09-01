@@ -42,8 +42,8 @@ export class World extends Three.Group {
         maxHeight: 7,
       },
       canopy:{
-        minRadius: 2,
-        maxRadius: 4,
+        minRadius: 1,
+        maxRadius: 3,
         density: 0.8,
       },
       frequency: 0.008

@@ -5,19 +5,40 @@ import { RNG } from './rng';
 import { blocks, resources } from './blocks';
 import { DataStore } from './dataStore';
 
+type paramsType = {
+  seed: number,
+  terrain: {
+    scale: number,
+    magnitude: number,
+    offset: number,
+  },
+  trees:{
+    trunk:{
+      minHeight: number,
+      maxHeight: number,
+    },
+    canopy:{
+      minRadius: number,
+      maxRadius: number,
+      density: number,
+    },
+    frequency: number
+  }
+}
+
 const goemetry = new THREE.BoxGeometry(1, 1, 1);
 
 export class WorldChunk extends THREE.Group {
   loaded: boolean
   size: {width: number, height: number};
-  params: {seed: number, terrain: {scale: number, magnitude: number, offset: number}};
+  params: paramsType;
   data: {
     id: number,
     instanceId: number,
   }[][][] = [];
   dataStore: DataStore;
 
-  constructor(size: {width: number, height: number}, params: {seed: number, terrain: {scale: number, magnitude: number, offset: number}}, dataStore: DataStore){
+  constructor(size: {width: number, height: number}, params: paramsType, dataStore: DataStore){
     super();
 
     this.loaded = false;
@@ -31,6 +52,7 @@ export class WorldChunk extends THREE.Group {
     this.InitializeTerrain();
     this.generateResources(rng);
     this.generateTerrain(rng);
+    this.generateTrees(rng);
     this.loadPlayerChanges();
     this.generateMeshes();
 
@@ -106,6 +128,57 @@ export class WorldChunk extends THREE.Group {
             // Everything else below is stone
             this.setBlockId(x, y, z, blocks.stone.id);
           }
+        }
+      }
+    }
+  }
+
+  generateTrees(rng: RNG){
+    const generateTreeTrunk = ( x: number, z: number, rng: RNG) =>{
+      const minH = this.params.trees.trunk.minHeight;
+      const maxH = this.params.trees.trunk.maxHeight;
+
+      const h = Math.round(minH + (maxH - minH) * rng.random());
+
+      for(let y = this.size.height - 1; y >= 0; y--) {
+        const block = this.getBlock(x, y, z);
+        if(block && block.id === blocks.grass.id){
+          for(let treeY = y+1; treeY <= y + h; treeY++){
+            this.setBlockId(x, treeY, z, blocks.tree.id);
+          }
+
+          generateTreeCanopy(x, y+h, z, rng);
+          break;
+        }
+      }
+    }
+
+    const generateTreeCanopy = (x: number, y: number, z: number, rng: RNG) => {
+      const minR = this.params.trees.canopy.minRadius;
+      const maxR = this.params.trees.canopy.maxRadius;
+      const r = Math.round(minR + (maxR - minR) * rng.random());
+      const density = this.params.trees.canopy.density;
+
+      for(let i = -maxR; i <= maxR; i++) {
+        for(let j = -maxR; j <= maxR; j++) {
+          for(let k = -maxR; k <= maxR; k++) {
+            if((i*i + j*j + k*k) < r*r ){
+              const block = this.getBlock(i+x, j+y, k+z);
+              if(block && block.id !== blocks.air.id) continue;
+              if(rng.random() < density){
+                this.setBlockId(x + i, y + j, z + k, blocks.leaves.id);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    let offset = this.params.trees.canopy.maxRadius
+    for( let x = offset; x < this.size.width - offset; x++) {
+      for( let z = offset; z < this.size.width - offset; z++) {
+        if(rng.random() < this.params.trees.frequency){
+          generateTreeTrunk(x, z, rng);
         }
       }
     }

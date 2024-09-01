@@ -24,6 +24,14 @@ export function createGUI(world: World, player: Player, scene: Scene) {
   terrainFolder.add(world.params.terrain, 'magnitude', 0, 1).name('Magnitude');
   terrainFolder.add(world.params.terrain, 'offset', 0, 1).name('Offset');
 
+  const treesFolder = terrainFolder.addFolder('Trees');
+  treesFolder.add(world.params.trees, 'frequency', 0, 0.5, 0.01).name('Frequency');
+  treesFolder.add(world.params.trees.trunk, 'minHeight', 1, 10, 1).name('Min Height');
+  treesFolder.add(world.params.trees.trunk, 'maxHeight', 1, 10, 1).name('Max Height');
+  treesFolder.add(world.params.trees.canopy, 'minRadius', 1, 10, 1).name('Min Radius');
+  treesFolder.add(world.params.trees.canopy, 'maxRadius', 1, 10, 1).name('Max Radius');
+  treesFolder.add(world.params.trees.canopy, 'density', 0, 1).name('Density');
+
   const resourcesFolder = gui.addFolder('Resources');
 
   resources.forEach(resource => {
