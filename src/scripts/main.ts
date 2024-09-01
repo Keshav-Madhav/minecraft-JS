@@ -42,6 +42,7 @@ document.body.appendChild(renderer.domElement);
 // Setup for OrbitCam
 const OrbitCam = new THREE.PerspectiveCamera(70, winWidth / winHeight);
 OrbitCam.position.set(-32, 16, -32); 
+OrbitCam.layers.enable(1);
 OrbitCam.lookAt(0, 0, 0);
 
 // Setup for controls
