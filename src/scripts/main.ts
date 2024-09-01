@@ -6,6 +6,7 @@ import { Player } from './player';
 import { Physics } from './physics';
 import { World } from './world';
 import { blocks } from './blocks';
+import { ModelLoader } from './ModelLoader';
 
 // Get window size
 let winWidth = window.innerWidth;
@@ -57,10 +58,16 @@ scene.fog = new THREE.Fog(0x80a0e0, 20, 50);
 world.generate();
 scene.add(world);
 
+
 // Setup for player
 const player = new Player(scene);
 
 const physics = new Physics(scene);
+
+const modelLoader = new ModelLoader();
+modelLoader.loadModels((models) => {
+  player.tool.setMesh(models.pickaxe);
+})
 
 // light
 const sun = new THREE.DirectionalLight();
@@ -93,6 +100,7 @@ function onMouseDown(event: MouseEvent) {
     if(event.button === 0){
       if(player.activeBlockId === blocks.air.id){
         world.removeBlock(player.selectedCoords.x, player.selectedCoords.y, player.selectedCoords.z);
+        player.tool.startAnimation();
       } else {
         world.setBlock(player.selectedCoords.x, player.selectedCoords.y, player.selectedCoords.z, player.activeBlockId);
       }
