@@ -18,9 +18,13 @@ const textures = {
   stone: loadTexture('textures/stone.png'),
   coalOre: loadTexture('textures/coal_ore.png'),
   ironOre: loadTexture('textures/iron_ore.png'),
+  sand: loadTexture('textures/sand.png'),
+  treeSide: loadTexture('textures/tree_side.png'),
+  treeTop: loadTexture('textures/tree_top.png'),
+  leaves: loadTexture('textures/leaves.png'),
 }
 
-type allBlocks = 'air' | 'grass' | 'dirt' | 'stone' | 'coalOre' | 'ironOre';
+type allBlocks = 'air' | 'grass' | 'dirt' | 'stone' | 'coalOre' | 'ironOre' | 'tree' | 'leaves' | 'sand' | 'cloud';
 
 export const blocks:{
   [key in allBlocks]: {
@@ -96,6 +100,37 @@ export const blocks:{
     scarcity: 0.8,
     material: new Array(6).fill(new THREE.MeshLambertMaterial({ map: textures.ironOre }))
   },
+  tree:{
+    id: 6,
+    name: 'Tree',
+    color: 0x805020,
+    material: [
+      new THREE.MeshLambertMaterial({ map: textures.treeSide }),
+      new THREE.MeshLambertMaterial({ map: textures.treeSide }),
+      new THREE.MeshLambertMaterial({ map: textures.treeTop }),
+      new THREE.MeshLambertMaterial({ map: textures.treeTop }),
+      new THREE.MeshLambertMaterial({ map: textures.treeSide }),
+      new THREE.MeshLambertMaterial({ map: textures.treeSide }),
+    ],
+  },
+  leaves:{
+    id: 7,
+    name: 'Leaves',
+    color: 0x208020,
+    material: new Array(6).fill(new THREE.MeshLambertMaterial({ map: textures.leaves }))
+  },
+  sand:{
+    id: 8,
+    name: 'Sand',
+    color: 0x908020,
+    material: new Array(6).fill(new THREE.MeshLambertMaterial({ map: textures.sand }))
+  },
+  cloud:{
+    id: 9,
+    name: 'Cloud',
+    color: 0xf0f0f0,
+    material: new Array(6).fill(new THREE.MeshBasicMaterial({ color: 0xf0f0f0 }))
+  }
 }
 
 function assertFullBlock(block: typeof blocks[keyof typeof blocks]): Required<typeof block> {

@@ -28,4 +28,4 @@ export class DataStore {
   getKey({chunkX, chunkZ, blockX, blockY, blockZ}: {chunkX: number, chunkZ: number, blockX: number, blockY: number, blockZ: number}){
     return `${chunkX}-${chunkZ},${blockX}-${blockY}-${blockZ}`;
   }
-}
+} 

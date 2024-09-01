@@ -4,17 +4,49 @@ import { Player } from './player';
 import { DataStore } from './dataStore';
 
 type chunkCoords = {x: number, z: number};
+type paramsType = {
+  seed: number,
+  terrain: {
+    scale: number,
+    magnitude: number,
+    offset: number,
+  },
+  trees:{
+    trunk:{
+      minHeight: number,
+      maxHeight: number,
+    },
+    canopy:{
+      minRadius: number,
+      maxRadius: number,
+      density: number,
+    },
+    frequency: number
+  }
+}
 
 export class World extends Three.Group {
   seed: number;
 
   chunkSize = {width: 16, height: 32}
-  params = {
+  params: paramsType = {
     seed: 0,
     terrain: {
       scale: 60,
       magnitude: 0.1,
       offset: 0.35,
+    },
+    trees:{
+      trunk:{
+        minHeight: 4,
+        maxHeight: 7,
+      },
+      canopy:{
+        minRadius: 2,
+        maxRadius: 4,
+        density: 0.8,
+      },
+      frequency: 0.008
     }
   }
   drawDistance = 3;
