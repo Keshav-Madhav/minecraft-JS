@@ -23,6 +23,10 @@ type paramsType = {
       density: number,
     },
     frequency: number
+  },
+  clouds:{
+    scale: number,
+    density: number
   }
 }
 
@@ -53,6 +57,7 @@ export class WorldChunk extends THREE.Group {
     this.generateResources(rng);
     this.generateTerrain(rng);
     this.generateTrees(rng);
+    this.generateClouds(rng);
     this.loadPlayerChanges();
     this.generateMeshes();
 
@@ -162,23 +167,42 @@ export class WorldChunk extends THREE.Group {
       for(let i = -maxR; i <= maxR; i++) {
         for(let j = -maxR; j <= maxR; j++) {
           for(let k = -maxR; k <= maxR; k++) {
-            if((i*i + j*j + k*k) < r*r ){
-              const block = this.getBlock(i+x, j+y, k+z);
-              if(block && block.id !== blocks.air.id) continue;
-              if(rng.random() < density){
-                this.setBlockId(x + i, y + j, z + k, blocks.leaves.id);
-              }
+            const n = rng.random();
+            if((i*i + j*j + k*k) > r*r ) continue;
+
+            const block = this.getBlock(i+x, j+y, k+z);
+            if(block && block.id !== blocks.air.id) continue;
+            
+            if(n < density){
+              this.setBlockId(x + i, y + j, z + k, blocks.leaves.id);
             }
           }
         }
       }
     }
 
-    let offset = this.params.trees.canopy.maxRadius
+    let offset = 1
     for( let x = offset; x < this.size.width - offset; x++) {
       for( let z = offset; z < this.size.width - offset; z++) {
         if(rng.random() < this.params.trees.frequency){
           generateTreeTrunk(x, z, rng);
+        }
+      }
+    }
+  }
+
+  generateClouds(rng: RNG){
+    const simplex = new SimplexNoise(rng);
+
+    for(let x = 0; x < this.size.width; x++) {
+      for(let z = 0; z < this.size.width; z++) {
+        const value = (simplex.noise(
+          this.position.x + x / this.params.clouds.scale,
+          this.position.z + z / this.params.clouds.scale
+        ) + 1) * 0.5;
+
+        if(value < this.params.clouds.density){
+          this.setBlockId(x, this.size.height - 1, z, blocks.cloud.id);
         }
       }
     }

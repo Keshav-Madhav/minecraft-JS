@@ -22,6 +22,10 @@ type paramsType = {
       density: number,
     },
     frequency: number
+  },
+  clouds:{
+    scale: number,
+    density: number
   }
 }
 
@@ -47,6 +51,10 @@ export class World extends Three.Group {
         density: 0.8,
       },
       frequency: 0.008
+    },
+    clouds:{
+      scale:20,
+      density: 0.2
     }
   }
   drawDistance = 3;
