@@ -10,6 +10,7 @@ type paramsType = {
     scale: number,
     magnitude: number,
     offset: number,
+    waterOffset: number
   },
   trees:{
     trunk:{
@@ -32,13 +33,14 @@ type paramsType = {
 export class World extends Three.Group {
   seed: number;
 
-  chunkSize = {width: 16, height: 32}
+  chunkSize = {width: 16, height: 64}
   params: paramsType = {
     seed: 0,
     terrain: {
       scale: 60,
-      magnitude: 0.1,
-      offset: 0.35,
+      magnitude: 14,
+      offset: 23,
+      waterOffset: 15
     },
     trees:{
       trunk:{

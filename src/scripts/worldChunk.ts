@@ -11,6 +11,7 @@ type paramsType = {
     scale: number,
     magnitude: number,
     offset: number,
+    waterOffset: number
   },
   trees:{
     trunk:{
@@ -60,6 +61,8 @@ export class WorldChunk extends THREE.Group {
     this.generateClouds(rng);
     this.loadPlayerChanges();
     this.generateMeshes();
+
+    this.generateWater();
 
     this.loaded = true;
   }
@@ -116,7 +119,7 @@ export class WorldChunk extends THREE.Group {
   
         const scaledNoise = this.params.terrain.offset + this.params.terrain.magnitude * val;
   
-        let height = Math.floor(scaledNoise * this.size.height);
+        let height = Math.floor(scaledNoise);
         height = Math.max(0, Math.min(height, this.size.height - 1));
   
         for (let y = 0; y < this.size.height; y++) {
@@ -124,8 +127,12 @@ export class WorldChunk extends THREE.Group {
             // Everything above height is air
             this.setBlockId(x, y, z, blocks.air.id);
           } else if (y === height) {
-            // Top layer is always grass
-            this.setBlockId(x, y, z, blocks.grass.id);
+            // Top layer is always grass or sand
+            if(y <= this.params.terrain.waterOffset){
+              this.setBlockId(x, y, z, blocks.sand.id);
+            } else {
+              this.setBlockId(x, y, z, blocks.grass.id);
+            }
           } else if (y >= height - 3 && this.getBlock(x, y, z)?.id === blocks.air.id) {
             // Next 3 layers are dirt
             this.setBlockId(x, y, z, blocks.dirt.id);
@@ -219,6 +226,18 @@ export class WorldChunk extends THREE.Group {
         }
       }
     }
+  }
+
+  generateWater(){
+    const material = new THREE.MeshLambertMaterial({color: 0x9090e0, transparent: true, opacity: 0.5, side: THREE.DoubleSide});
+    const waterMesh = new THREE.Mesh(new THREE.PlaneGeometry(), material);
+
+    waterMesh.rotateX(-Math.PI/2);
+    waterMesh.position.set(this.size.width/2, this.params.terrain.waterOffset + 0.45, this.size.width/2);
+
+    waterMesh.scale.set(this.size.width, this.size.width, 1);
+
+    this.add(waterMesh);
   }
 
   // Create the 3D representation of the world using world data

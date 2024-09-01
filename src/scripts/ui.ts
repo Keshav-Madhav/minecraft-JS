@@ -21,8 +21,9 @@ export function createGUI(world: World, player: Player, scene: Scene) {
   terrainFolder.add(world, 'drawDistance', 0, 10, 1).name('Draw Distance');
   terrainFolder.add(world.params, 'seed', 0, 10000).name('Seed');
   terrainFolder.add(world.params.terrain, 'scale', 10, 100).name('Scale');
-  terrainFolder.add(world.params.terrain, 'magnitude', 0, 1).name('Magnitude');
-  terrainFolder.add(world.params.terrain, 'offset', 0, 1).name('Offset');
+  terrainFolder.add(world.params.terrain, 'magnitude', 0, 64, 1).name('Magnitude');
+  terrainFolder.add(world.params.terrain, 'offset', 0, 64, 1).name('Offset');
+  terrainFolder.add(world.params.terrain, 'waterOffset', 0, 64).name('Water Offset');
 
   const treesFolder = terrainFolder.addFolder('Trees');
   treesFolder.add(world.params.trees, 'frequency', 0, 0.5, 0.01).name('Frequency');
@@ -31,6 +32,8 @@ export function createGUI(world: World, player: Player, scene: Scene) {
   treesFolder.add(world.params.trees.canopy, 'minRadius', 1, 10, 1).name('Min Radius');
   treesFolder.add(world.params.trees.canopy, 'maxRadius', 1, 10, 1).name('Max Radius');
   treesFolder.add(world.params.trees.canopy, 'density', 0, 1).name('Density');
+
+  
 
   const resourcesFolder = gui.addFolder('Resources');
 
