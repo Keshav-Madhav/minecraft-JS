@@ -68,6 +68,16 @@ export class World extends Three.Group {
   constructor(seed = 0){
     super();
     this.seed = seed
+
+    document.addEventListener('keydown', (event) => {
+      if(event.key === 'n'){
+        event.preventDefault();
+        this.save();
+      } else if(event.key === 'm'){
+        event.preventDefault();
+        this.load();
+      }
+    })
   }
 
   update(player: Player){
@@ -131,8 +141,10 @@ export class World extends Three.Group {
     this.add(chunk);
   }
 
-  generate(){
-    this.dataStore.clear();
+  generate(clearCache: boolean = false){
+    if(clearCache){
+      this.dataStore.clear();
+    }
     this.disposeChunks();
     this.children.length = 0
 
@@ -257,5 +269,30 @@ export class World extends Three.Group {
         child.disposeInstance();
       }
     });
+  }
+
+  save(){
+    localStorage.setItem('minecraft_world', JSON.stringify(this.params));
+    localStorage.setItem('minecraft_data', JSON.stringify(this.dataStore.data));
+    const status = document.getElementById('status');
+    if(status){
+      status.innerHTML = 'World saved';
+      setTimeout(() => {
+        status.innerHTML = '';
+      }, 3000)
+    }
+  }
+
+  load(){
+    this.params = localStorage.getItem('minecraft_world') ? JSON.parse(localStorage.getItem('minecraft_world')!) : this.params;
+    this.dataStore.data = localStorage.getItem('minecraft_data') ? JSON.parse(localStorage.getItem('minecraft_data')!) : this.dataStore.data;
+    const status = document.getElementById('status');
+    if(status){
+      status.innerHTML = 'WORLD LOADED';
+      setTimeout(() => {
+        status.innerHTML = '';
+      }, 3000)
+    }
+    this.generate();
   }
 }

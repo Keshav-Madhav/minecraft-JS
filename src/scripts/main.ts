@@ -54,6 +54,7 @@ controls.update();
 // Setup for scene
 const scene = new THREE.Scene();
 const world = new World();
+world.params.seed = Math.floor(Math.random() * 10000);
 scene.fog = new THREE.Fog(0x80a0e0, 20, 50);
 world.generate();
 scene.add(world);

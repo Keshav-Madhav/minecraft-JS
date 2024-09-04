@@ -47,6 +47,6 @@ export function createGUI(world: World, player: Player, scene: Scene) {
   })
 
   gui.onChange(() => {
-    world.generate();
+    world.generate(true);
   });
 }

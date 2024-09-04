@@ -125,7 +125,29 @@ export class Player {
   }
 
   onkeydown(event: KeyboardEvent) {
-    if(!this.controls.isLocked) {
+    if(!this.controls.isLocked && !(
+      event.key === 'Control' || 
+      event.key === 'Shift' ||
+      event.key === 'Alt' ||
+      event.key === 'Meta' ||
+      event.key === 'CapsLock' ||
+      event.key === 'Tab' ||
+      event.key === 'Escape' ||
+      event.key === 'Enter' ||
+      event.key === 'Backspace' ||
+      event.key === 'F1' ||
+      event.key === 'F2' ||
+      event.key === 'F3' ||
+      event.key === 'F4' ||
+      event.key === 'F5' ||
+      event.key === 'F6' ||
+      event.key === 'F7' ||
+      event.key === 'F8' ||
+      event.key === 'F9' ||
+      event.key === 'F10' ||
+      event.key === 'F11' ||
+      event.key === 'F12'
+    )) {
       this.controls.lock();
     }
 
