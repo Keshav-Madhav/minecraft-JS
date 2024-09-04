@@ -28,7 +28,7 @@ export class Player {
   selectedCoords:  Three.Vector3 | null = null;
   selectionHelper: Three.Mesh;
 
-  activeBlockId = blocks.grass.id;
+  activeBlockId = blocks.air.id;
 
   tool = new Tool();
 
@@ -139,8 +139,10 @@ export class Player {
       case '6':
       case '7':
       case '8':
-      case '9':
+        document.getElementById(`toolbar-${this.activeBlockId}`)?.classList.remove('selected')
         this.activeBlockId = parseInt(event.key);
+        document.getElementById(`toolbar-${this.activeBlockId}`)?.classList.add('selected')
+        this.tool.visible = this.activeBlockId === blocks.air.id;
         break;
       case 'w':
         this.input.y = this.maxSpeed;
