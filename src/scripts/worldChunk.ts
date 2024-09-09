@@ -374,6 +374,7 @@ export class WorldChunk extends THREE.Group {
 
     if(block.instanceId === -1 || block.id === blocks.air.id) return;
 
+    // @ts-ignore
     const mesh = this.children.find((child: Object3D) => child.name === block.id)! as THREE.InstancedMesh;
     const instanceId = block.instanceId;
 
