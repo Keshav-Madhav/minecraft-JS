@@ -254,6 +254,7 @@ export class WorldChunk extends THREE.Group {
       forEach(block => {
         const mesh = new THREE.InstancedMesh(goemetry, block.material, maxCount);
         // modified mesh name type defination to accept number
+        // @ts-ignore
         mesh.name = block.id;
         mesh.count = 0;
         mesh.castShadow = true;
@@ -336,6 +337,7 @@ export class WorldChunk extends THREE.Group {
     const block = this.getBlock(x, y, z)!
 
     if(block && block.id !== blocks.air.id && block.instanceId === -1){
+      // @ts-ignore
       const mesh = this.children.find((child: Object3D) => child.name === block.id)! as THREE.InstancedMesh;
       const instanceId = mesh.count++;
   

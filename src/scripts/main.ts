@@ -136,5 +136,5 @@ function animate() {
 }
 
 setUpLights();
-createGUI(world, player, scene);
+createGUI(world, player);
 animate();
