@@ -36,7 +36,9 @@ function inBounds(x: number, y: number, z: number, size: ChunkSize) {
  * identical to keep output deterministic for a given seed.
  */
 export function generateChunkData(
-  size: ChunkSize, params: ChunkParams, worldX: number, worldZ: number, resources: ResourceGenInfo[]
+  size: ChunkSize, params: ChunkParams, worldX: number, worldZ: number, resources: ResourceGenInfo[],
+  outBiome?: Uint8Array   // optional: filled with the per-column biome (index x*width+z) so the
+                          // caller (worker) can tint plants without re-sampling columnSurface
 ): Uint8Array {
   const data = new Uint8Array(size.width * size.height * size.width); // 0 == air
 
@@ -51,7 +53,12 @@ export function generateChunkData(
   const rng = new RNG(params.seed);
   const simplex = new SimplexNoise(rng);
 
-  generateTerrain(simplex, params, size, worldX, worldZ, set);
+  // Per-column surface height + biome, filled by generateTerrain and reused by
+  // generateFoliage (so the foliage pass doesn't re-run columnSurface). 16×16.
+  const heightMap = new Int16Array(size.width * size.width);
+  const biomeMap = outBiome ?? new Uint8Array(size.width * size.width);
+
+  generateTerrain(simplex, params, size, worldX, worldZ, set, heightMap, biomeMap);
   generateResources(rng, size, worldX, worldZ, resources, get, set);
 
   // Features use a per-chunk RNG for placement (a shared rng repeats the same
@@ -61,6 +68,12 @@ export function generateChunkData(
     (Math.imul(worldX, 73856093) ^ Math.imul(worldZ, 19349663) ^ Math.imul(params.seed, 83492791)) | 0
   );
   generateFeatures(treeRng, simplex, params, size, worldX, worldZ, get, set);
+
+  // Foliage runs LAST (so it never overwrites a trunk/canopy) and is placed by a
+  // PURE function of world (x,z) — hashes + the shared simplex, no per-chunk RNG —
+  // so dense ground cover is identical from whichever chunk samples a column
+  // (seamless borders) and doesn't perturb the feature RNG sequence.
+  generateFoliage(simplex, params, size, worldX, worldZ, heightMap, biomeMap, get, set);
 
   return data;
 }
@@ -442,6 +455,17 @@ const GRASS_TINT: Record<number, readonly [number, number, number]> = {
   [BIOME.taiga]: [70, 96, 68], [BIOME.savanna]: [170, 158, 96],
   [BIOME.scrub]: [150, 160, 96], [BIOME.cherry]: [196, 150, 186], [BIOME.swamp]: [90, 116, 86],
 };
+// Per-biome grass tint for FOLIAGE, normalised to 0..1 (and lifted a touch so the
+// near-grayscale plant textures read as lush vegetation that matches the ground,
+// not a dark olive). Defaults to plains for non-grassy biomes / unknown ids. The
+// mesher bakes this into plant vertices, so a new biome's foliage colour comes
+// from its GRASS_TINT entry with no extra wiring. MC-style grayscale × biome tint.
+export function foliageGrassTint(biome: number): readonly [number, number, number] {
+  const c = GRASS_TINT[biome] ?? GRASS_TINT[BIOME.plains];
+  const k = 1.55 / 255;
+  return [Math.min(1, c[0] * k), Math.min(1, c[1] * k), Math.min(1, c[2] * k)];
+}
+
 const TERRA_COLOR: Record<number, readonly [number, number, number]> = {
   [BLOCK_IDS.terracottaOrange]: [196, 104, 52], [BLOCK_IDS.terracottaRed]: [152, 62, 42],
   [BLOCK_IDS.terracottaYellow]: [200, 158, 72], [BLOCK_IDS.terracottaWhite]: [210, 188, 168],
@@ -739,11 +763,14 @@ function generateResources(rng: RNG, size: ChunkSize, worldX: number, worldZ: nu
 // ===========================================================================
 //  TERRAIN  — fill each column; badlands columns use their per-Y band override.
 // ===========================================================================
-function generateTerrain(simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number, set: SetFn) {
+function generateTerrain(simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number,
+  set: SetFn, outHeight: Int16Array, outBiome: Uint8Array) {
   const cfg = makeSurfaceConfig(params, size);
   for (let x = 0; x < size.width; x++) {
     for (let z = 0; z < size.width; z++) {
       const { height, surfaceId, subId, biome } = columnSurface(simplex, cfg, worldX + x, worldZ + z);
+      outHeight[x * size.width + z] = height;
+      outBiome[x * size.width + z] = biome;
       const band = BIOMES[biome].band;
       for (let y = 0; y <= height; y++) {
         if (band) set(x, y, z, band(y, height, cfg.sea));
@@ -782,12 +809,25 @@ function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, 
     }
   };
   const buildTree = (x: number, z: number, roots: readonly number[], logId: number, leafId: number,
-    minH: number, maxH: number, minR: number, maxR: number, density: number) => {
+    minH: number, maxH: number, minR: number, maxR: number, density: number, vineChance = 0) => {
     const y0 = surfaceYOf(x, z, roots);
     if (y0 < 0) return;
     const h = Math.round(minH + (maxH - minH) * rng.random());
     for (let ty = y0 + 1; ty <= y0 + h; ty++) set(x, ty, z, logId);
     buildCanopy(x, y0 + h, z, Math.round(minR + (maxR - minR) * rng.random()), density, leafId);
+    // Hang vines down the trunk (jungle/swamp). Each side independently; a vine
+    // clings to the trunk face and the mesher renders it as a vertical billboard.
+    if (vineChance > 0) {
+      for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+        if (rng.random() > vineChance) continue;
+        const len = 2 + Math.floor(rng.random() * Math.max(1, h - 1));
+        for (let i = 0; i < len; i++) {
+          const ty = y0 + h - 1 - i;
+          if (ty <= y0) break;
+          setIfAir(x + dx, ty, z + dz, BLOCK_IDS.vine);
+        }
+      }
+    }
   };
   const buildCactus = (x: number, z: number) => {
     const y0 = surfaceYOf(x, z, SANDY_ROOT);
@@ -808,10 +848,10 @@ function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, 
       if (Math.abs(i) === 2 || Math.abs(k) === 2) setIfAir(x + i, cy - 1, z + k, capId);
     }
   };
-  const oak = (x: number, z: number, roots: readonly number[], density = 0.7) =>
+  const oak = (x: number, z: number, roots: readonly number[], density = 0.7, vineChance = 0) =>
     buildTree(x, z, roots, BLOCK_IDS.tree, BLOCK_IDS.leaves,
       params.trees.trunk.minHeight, params.trees.trunk.maxHeight,
-      params.trees.canopy.minRadius, params.trees.canopy.maxRadius, density);
+      params.trees.canopy.minRadius, params.trees.canopy.maxRadius, density, vineChance);
 
   const cfg = makeSurfaceConfig(params, size);
   const CELL = 6;
@@ -827,9 +867,129 @@ function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, 
       const r = rng.random();
       if (f.cherry && r < f.cherry) buildTree(x, z, GRASS_ROOT, BLOCK_IDS.cherryLog, BLOCK_IDS.cherryLeaves, 4, 6, 2, 3, 0.72);
       else if (f.giantMushroom && r < f.giantMushroom) buildGiantMushroom(x, z);
-      else if (f.swampOak && r < f.swampOak) oak(x, z, SWAMP_ROOT, 0.65);
-      else if (f.oak && r < f.oak) oak(x, z, GRASS_ROOT, params.trees.canopy.density);
+      else if (f.swampOak && r < f.swampOak) oak(x, z, SWAMP_ROOT, 0.65, 0.6);
+      else if (f.oak && r < f.oak) oak(x, z, GRASS_ROOT, params.trees.canopy.density, biome === BIOME.warmForest ? 0.45 : 0);
       else if (f.cactus && r < f.cactus) buildCactus(x, z);
+    }
+  }
+}
+
+// ===========================================================================
+//  FOLIAGE  — dense ground cover (grass, ferns, tall grass, flowers, dead bush,
+//  lily pads, leaf-litter / cherry-petal carpets, snow sheets). Placed by a PURE
+//  function of world (x,z): hashes + the shared simplex, NO per-chunk RNG — so a
+//  column grows identical foliage whichever chunk samples it (seamless borders)
+//  and the feature RNG sequence is untouched. Low-frequency patch fields cluster
+//  grass into meadows and flowers into single-species fields (MC-style), instead
+//  of a uniform sprinkle. These are non-cube "plant" blocks the mesher renders as
+//  billboards / carpets / pads, and physics treats as non-colliding.
+// ===========================================================================
+const FLOWERS = [
+  BLOCK_IDS.flowerDandelion, BLOCK_IDS.flowerPoppy, BLOCK_IDS.flowerCornflower,
+  BLOCK_IDS.flowerOxeye, BLOCK_IDS.flowerAllium, BLOCK_IDS.flowerTulip,
+];
+
+function generateFoliage(simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number,
+  heightMap: Int16Array, biomeMap: Uint8Array, get: GetFn, set: SetFn) {
+  const cfg = makeSurfaceConfig(params, size);
+  const sea = cfg.sea;
+  const W = size.width;
+  for (let x = 0; x < W; x++) {
+    for (let z = 0; z < W; z++) {
+      const wx = worldX + x, wz = worldZ + z;
+      const idx = x * W + z;
+      const biome = biomeMap[idx];
+      const h = heightMap[idx];
+
+      // --- submerged columns: lily pads (lakes/swamps) + seabed seagrass -----
+      if (h < sea) {
+        const depth = sea - h;
+        let placed = false;
+        // Lily pads only on shallow LAKE / SWAMP water (rivers excluded per request).
+        if ((biome === BIOME.lake || biome === BIOME.swamp) && depth <= 5 && get(x, sea, z) === BLOCK_IDS.air
+            && fbm(simplex, wx + 33000, wz + 33000, 22, 2) > 0.34 && hash01(wx + 5, wz + 9) < 0.55) {
+          set(x, sea, z, BLOCK_IDS.lilyPad);
+          placed = true;
+        }
+        // Seagrass / tall seagrass carpet the seabed in shallow-to-mid water of any
+        // kind (oceans, lakes, rivers); the deep abyss stays bare (depth cap + perf).
+        if (!placed && depth >= 1 && depth <= 16 && get(x, h + 1, z) === BLOCK_IDS.air) {
+          const sr = hash01(wx + 17, wz + 23);
+          if (fbm(simplex, wx + 24000, wz + 24000, 20, 2) > 0.25 && sr < 0.5) {
+            if (sr < 0.14 && h + 2 < sea && get(x, h + 2, z) === BLOCK_IDS.air) {
+              set(x, h + 1, z, BLOCK_IDS.tallSeagrassLower);
+              set(x, h + 2, z, BLOCK_IDS.tallSeagrassUpper);
+            } else {
+              set(x, h + 1, z, BLOCK_IDS.seagrass);
+            }
+          }
+        }
+        continue;                                  // submerged column — nothing else grows
+      }
+      if (h <= sea) continue;                      // exact waterline / beach lip — leave bare
+      if (get(x, h + 1, z) !== BLOCK_IDS.air) continue;   // a trunk/canopy already occupies it
+
+      const top = get(x, h, z);
+      const r = hash01(wx, wz);
+
+      // --- snow sheets on snowy ground & alpine caps ------------------------
+      if (top === BLOCK_IDS.snow) {
+        const sf = fbm(simplex, wx + 12000, wz + 12000, 26, 2);
+        const cover = clamp((biome === BIOME.snowy ? 0.7 : 0.45) + sf * 0.4, 0, 0.95);
+        if (r < cover) set(x, h + 1, z, BLOCK_IDS.snowLayer);
+        continue;
+      }
+
+      // --- dead bush on hot, dry sand --------------------------------------
+      if (top === BLOCK_IDS.sand || top === BLOCK_IDS.redSand) {
+        if (biome === BIOME.desert || biome === BIOME.redDesert || biome === BIOME.badlands
+            || biome === BIOME.savanna || biome === BIOME.scrub) {
+          const df = fbm(simplex, wx + 8000, wz + 8000, 30, 2);
+          if (df > 0.2 && r < 0.06) set(x, h + 1, z, BLOCK_IDS.deadBush);
+        }
+        continue;
+      }
+
+      if (top !== BLOCK_IDS.grass) continue;       // mud/mycelium/dirt/stone → no ground cover
+
+      // --- forest litter & cherry petals (carpets) — claim the cell first ---
+      if (biome === BIOME.cherry && hash01(wx + 71, wz + 17) < 0.45) {
+        set(x, h + 1, z, BLOCK_IDS.cherryPetals); continue;
+      }
+      if ((biome === BIOME.forest || biome === BIOME.warmForest || biome === BIOME.taiga)
+          && fbm(simplex, wx + 4000, wz + 4000, 20, 2) > 0.35 && hash01(wx + 13, wz + 91) < 0.5) {
+        set(x, h + 1, z, BLOCK_IDS.leafLitter); continue;
+      }
+
+      // --- grass / fern / tall grass (patchy meadows) -----------------------
+      const dens = fbm(simplex, wx + 200, wz + 200, 30, 2);
+      const grassProb = clamp(0.34 + dens * 0.55, 0.05, 0.9);
+      if (r < grassProb) {
+        const r2 = hash01(wx + 41, wz + 67);
+        const wooded = biome === BIOME.taiga || biome === BIOME.forest || biome === BIOME.warmForest;
+        const twoCell = h + 2 < size.height && get(x, h + 2, z) === BLOCK_IDS.air;
+        if (r2 < 0.16 && twoCell &&
+            (biome === BIOME.plains || biome === BIOME.savanna || biome === BIOME.warmForest || dens > 0.3)) {
+          set(x, h + 1, z, BLOCK_IDS.tallGrassLower);
+          set(x, h + 2, z, BLOCK_IDS.tallGrassUpper);
+        } else if (r2 < 0.24 && twoCell && wooded) {
+          set(x, h + 1, z, BLOCK_IDS.largeFernLower);   // 2-block fern in woods
+          set(x, h + 2, z, BLOCK_IDS.largeFernUpper);
+        } else if (r2 < 0.34 && wooded) {
+          set(x, h + 1, z, BLOCK_IDS.fern);
+        } else {
+          set(x, h + 1, z, BLOCK_IDS.shortGrass);
+        }
+        continue;
+      }
+
+      // --- flowers — sparse, clustered into single-species patches ----------
+      const ff = fbm(simplex, wx + 60000, wz + 60000, 16, 2);
+      const flowerProb = clamp((ff - 0.1) * 0.5, 0, 0.22);
+      if (hash01(wx + 7, wz + 3) < flowerProb) {
+        const species = (Math.abs(Math.floor(fbm(simplex, wx + 90000, wz + 90000, 40, 1) * 11))) % FLOWERS.length;
+        set(x, h + 1, z, FLOWERS[species]);
+      }
     }
   }
 }

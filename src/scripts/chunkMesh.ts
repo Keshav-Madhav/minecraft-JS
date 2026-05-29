@@ -1,5 +1,9 @@
-import { BLOCK_IDS, BLOCK_FACE_LAYERS, NON_SHADOW_CASTER_IDS } from './blockTypes';
-import { ChunkSize, blockIndex } from './chunkGen';
+import { BLOCK_IDS, BLOCK_FACE_LAYERS, NON_SHADOW_CASTER_IDS, PLANTS, PLANT_LOOKUP } from './blockTypes';
+import { ChunkSize, blockIndex, foliageGrassTint } from './chunkGen';
+
+// Returns the biome id at a LOCAL chunk coordinate (mapped to world by the
+// provider). Used only to bake the per-column grass tint into plant vertices.
+export type BiomeGetter = (localX: number, localZ: number) => number;
 
 // Pure greedy mesher: turns a chunk's flat block-id array into renderable
 // geometry buffers. Deliberately free of THREE.js and the DOM so it can run in
@@ -21,11 +25,16 @@ export type GeometryArrays = {
   // upload bandwidth vs Uint32 across thousands of streamed chunks. Falls back to
   // Uint32 for a pathological fully-exposed chunk (> 65535 verts).
   indices: Uint16Array | Uint32Array,
+  // Only the plants group carries this: vec4 per vertex = biome tint rgb + wind
+  // sway weight (a), packed as NORMALIZED Uint8 (4 bytes/vertex, not 16) — the
+  // shader reads it back as 0..1. Undefined for casters/nonCasters.
+  colors?: Uint8Array,
 };
 
 export type ChunkGeometry = {
-  casters: GeometryArrays | null,     // shadow-casting blocks
+  casters: GeometryArrays | null,     // shadow-casting solid blocks
   nonCasters: GeometryArrays | null,  // leaves / clouds
+  plants: GeometryArrays | null,      // cross-billboard / carpet / vine foliage
 };
 
 // Face order: [+x, -x, +y, -y, +z, -z].
@@ -50,8 +59,10 @@ const DIR_META: ReadonlyArray<DirMeta> = [
   { aAxis: 2, sign: -1, pAxis: 1, qAxis: 0, uAxis: 0, vAxis: 1, normal: [0, 0, -1] },  // -z
 ];
 
-type Accumulator = { pos: number[], norm: number[], uv: number[], layer: number[], idx: number[] };
-const newAccumulator = (): Accumulator => ({ pos: [], norm: [], uv: [], layer: [], idx: [] });
+// `col` (vec4/vertex: biome tint rgb + sway weight a) is only ever filled for the
+// plants accumulator; casters/nonCasters leave it empty and finalize() omits it.
+type Accumulator = { pos: number[], norm: number[], uv: number[], layer: number[], col: number[], idx: number[] };
+const newAccumulator = (): Accumulator => ({ pos: [], norm: [], uv: [], layer: [], col: [], idx: [] });
 
 function finalize(acc: Accumulator): GeometryArrays | null {
   if (acc.idx.length === 0) return null;
@@ -62,7 +73,21 @@ function finalize(acc: Accumulator): GeometryArrays | null {
     uvs: new Float32Array(acc.uv),
     layers: new Float32Array(acc.layer),
     indices: vtx > 65535 ? new Uint32Array(acc.idx) : new Uint16Array(acc.idx),
+    // pack 0..1 tint/sway into normalized bytes (shader reads them back as 0..1)
+    colors: acc.col.length ? Uint8Array.from(acc.col, (v) => v < 0 ? 0 : v > 1 ? 255 : (v * 255 + 0.5) | 0) : undefined,
   };
+}
+
+// Append one plant vertex (explicit world-local position + tint + sway). Plants
+// use an UP normal regardless of quad orientation so a billboard is lit evenly
+// like the ground it grows from (no dark-side flicker as you orbit it).
+function pushPlantVert(acc: Accumulator, x: number, y: number, z: number, u: number, v: number,
+  layer: number, r: number, g: number, b: number, sway: number) {
+  acc.pos.push(x, y, z);
+  acc.norm.push(0, 1, 0);
+  acc.uv.push(u, v);
+  acc.layer.push(layer);
+  acc.col.push(r, g, b, sway);
 }
 
 // Append one vertex to `acc` from a quad corner, WITHOUT allocating (the old
@@ -86,25 +111,30 @@ function pushVert(acc: Accumulator, meta: DirMeta, aCoord: number, pc: number, q
   acc.layer.push(layer);
 }
 
-export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside: OutsideBlockGetter): ChunkGeometry {
+export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside: OutsideBlockGetter,
+  getBiome?: BiomeGetter): ChunkGeometry {
   const W = size.width, H = size.height;
   const dim = [W, H, W];
   const casters = newAccumulator();
   const nonCasters = newAccumulator();
+  const plants = newAccumulator();
 
   const idAt = (x: number, y: number, z: number) =>
     data[blockIndex(x, y, z, size)];
 
   // ox/oy/oz are the face offset for `dir`, hoisted by the caller (constant
   // across the per-cell loops) so it isn't re-read from FACE_OFFSETS per cell.
+  // Plants (cross billboards / carpets / vines) are NON-OCCLUDING: a face behind
+  // a grass tuft must still render, so an in-chunk plant neighbour counts as air.
   const faceVisible = (x: number, y: number, z: number, ox: number, oy: number, oz: number): boolean => {
     const nx = x + ox, ny = y + oy, nz = z + oz;
     if (ny < 0) return false;          // bedrock floor
     if (ny >= H) return true;          // open sky
     if (nx >= 0 && nx < W && nz >= 0 && nz < W) {
-      return idAt(nx, ny, nz) === BLOCK_IDS.air;
+      const nid = idAt(nx, ny, nz);
+      return nid === BLOCK_IDS.air || PLANT_LOOKUP[nid] === 1;
     }
-    return getOutside(nx, ny, nz) === BLOCK_IDS.air; // neighbouring chunk
+    return getOutside(nx, ny, nz) === BLOCK_IDS.air; // neighbouring chunk (apron is solid/air only)
   };
 
   const emitQuad = (dir: number, la: number, p0: number, p1: number, q0: number, q1: number, id: number) => {
@@ -136,7 +166,9 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
   for (let x = 0; x < W; x++) {
     for (let z = 0; z < W; z++) {
       let top = 0;
-      for (let y = H - 1; y >= 0; y--) { if (idAt(x, y, z) !== BLOCK_IDS.air) { top = y; break; } }
+      // Ignore plants (they sit above the surface) so the cube band tracks only
+      // terrain/trees — plants get their own pass with their own y-range.
+      for (let y = H - 1; y >= 0; y--) { const id = idAt(x, y, z); if (id !== BLOCK_IDS.air && PLANT_LOOKUP[id] === 0) { top = y; break; } }
       if (top > chunkMaxTop) chunkMaxTop = top;
       if (top < chunkMinTop) chunkMinTop = top;
     }
@@ -169,7 +201,8 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
         for (let q = qStart; q < qEnd; q++) {
           cell[meta.aAxis] = la; cell[meta.pAxis] = p; cell[meta.qAxis] = q;
           const id = idAt(cell[0], cell[1], cell[2]);
-          mask[p * dimQ + q] = (id !== BLOCK_IDS.air && faceVisible(cell[0], cell[1], cell[2], ox, oy, oz)) ? id + 1 : 0;
+          // Plants aren't cube-meshed (handled by the plant pass below).
+          mask[p * dimQ + q] = (id !== BLOCK_IDS.air && PLANT_LOOKUP[id] === 0 && faceVisible(cell[0], cell[1], cell[2], ox, oy, oz)) ? id + 1 : 0;
         }
       }
 
@@ -202,5 +235,131 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
     }
   }
 
-  return { casters: finalize(casters), nonCasters: finalize(nonCasters) };
+  // ===== PLANT PASS =========================================================
+  // Plants sit above the terrain surface; scan a tight band around it. Crosses
+  // (grass/flowers/fern/dead bush), vines and lily pads are emitted per-cell;
+  // carpets (petals/litter/snow) are greedy-merged per (y, blockId) into sheets.
+  const WHITE: readonly [number, number, number] = [1, 1, 1];
+  // The grass tint depends only on the biome (a handful per chunk), so cache by
+  // biome id — not per column. getBiome is itself a cheap precomputed-map lookup.
+  const tintByBiome = new Map<number, readonly [number, number, number]>();
+  const grassTintAt = (lx: number, lz: number): readonly [number, number, number] => {
+    const biome = getBiome ? getBiome(lx, lz) : -1;
+    let t = tintByBiome.get(biome);
+    if (!t) { t = foliageGrassTint(biome); tintByBiome.set(biome, t); }
+    return t;
+  };
+  const tintFor = (lx: number, lz: number, mode: 'grass' | 'none') =>
+    mode === 'grass' ? grassTintAt(lx, lz) : WHITE;
+
+  // A vine clings to any non-air, non-plant cell (terrain / trunk / cliff).
+  const solidAt = (x: number, y: number, z: number): boolean => {
+    if (y < 0) return true;
+    if (y >= H) return false;
+    const id = (x >= 0 && x < W && z >= 0 && z < W) ? idAt(x, y, z) : getOutside(x, y, z);
+    return id !== BLOCK_IDS.air && PLANT_LOOKUP[id] === 0;
+  };
+
+  const INSET = 0.12;   // keep a cross inside its cell so it never overlaps a neighbour
+  const emitCross = (x: number, y: number, z: number, layer: number, r: number, g: number, b: number) => {
+    const yB = y - 0.5, yT = y + 0.5, lo = -0.5 + INSET, hi = 0.5 - INSET;
+    const quad = (ax: number, az: number, bx: number, bz: number) => {
+      const base = plants.pos.length / 3;
+      pushPlantVert(plants, x + ax, yB, z + az, 0, 0, layer, r, g, b, 0);
+      pushPlantVert(plants, x + bx, yB, z + bz, 1, 0, layer, r, g, b, 0);
+      pushPlantVert(plants, x + bx, yT, z + bz, 1, 1, layer, r, g, b, 1);
+      pushPlantVert(plants, x + ax, yT, z + az, 0, 1, layer, r, g, b, 1);
+      plants.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    };
+    quad(lo, lo, hi, hi);   // main diagonal
+    quad(lo, hi, hi, lo);   // anti-diagonal
+  };
+
+  // Flat horizontal quad over cells [x0..x1]×[z0..z1] at world-Y yTop. The UV
+  // counts (nu/nv) tile the texture once per cell (fract() in the shader).
+  const emitFlat = (x0: number, x1: number, z0: number, z1: number, yTop: number, layer: number,
+    r: number, g: number, b: number) => {
+    const xLo = x0 - 0.5, xHi = x1 + 0.5, zLo = z0 - 0.5, zHi = z1 + 0.5;
+    const nu = x1 - x0 + 1, nv = z1 - z0 + 1;
+    const base = plants.pos.length / 3;
+    pushPlantVert(plants, xLo, yTop, zLo, 0, 0, layer, r, g, b, 0);
+    pushPlantVert(plants, xHi, yTop, zLo, nu, 0, layer, r, g, b, 0);
+    pushPlantVert(plants, xHi, yTop, zHi, nu, nv, layer, r, g, b, 0);
+    pushPlantVert(plants, xLo, yTop, zHi, 0, nv, layer, r, g, b, 0);
+    plants.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  };
+
+  // Vine quad flush against each horizontal face that has a solid backing.
+  const emitVine = (x: number, y: number, z: number, layer: number, r: number, g: number, b: number) => {
+    const yB = y - 0.5, yT = y + 0.5, e = 0.02;
+    const faces: ReadonlyArray<readonly [number, number]> = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    for (const [dx, dz] of faces) {
+      if (!solidAt(x + dx, y, z + dz)) continue;
+      const base = plants.pos.length / 3;
+      if (dx !== 0) {
+        const px = x + dx * (0.5 - e);
+        pushPlantVert(plants, px, yB, z - 0.5, 0, 0, layer, r, g, b, 0.5);
+        pushPlantVert(plants, px, yB, z + 0.5, 1, 0, layer, r, g, b, 0.5);
+        pushPlantVert(plants, px, yT, z + 0.5, 1, 1, layer, r, g, b, 0.15);
+        pushPlantVert(plants, px, yT, z - 0.5, 0, 1, layer, r, g, b, 0.15);
+      } else {
+        const pz = z + dz * (0.5 - e);
+        pushPlantVert(plants, x - 0.5, yB, pz, 0, 0, layer, r, g, b, 0.5);
+        pushPlantVert(plants, x + 0.5, yB, pz, 1, 0, layer, r, g, b, 0.5);
+        pushPlantVert(plants, x + 0.5, yT, pz, 1, 1, layer, r, g, b, 0.15);
+        pushPlantVert(plants, x - 0.5, yT, pz, 0, 1, layer, r, g, b, 0.15);
+      }
+      plants.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  };
+
+  // Cover every plant: surface tufts (top+1/+2), carpets, lily pads at sea, seabed
+  // seagrass, AND vines that hang BELOW the canopy (so this must reach down past
+  // bandLow, not stop at the surface). Bounded by chunk relief, so it's cheap.
+  const plantLo = Math.max(0, bandLow - 1);
+  const plantHi = Math.min(H - 1, bandHigh + 5);
+  const carpetByY = new Map<number, Uint8Array>();   // per y-level carpet masks (keyed by block id)
+  for (let y = plantLo; y <= plantHi; y++) {
+    for (let x = 0; x < W; x++) {
+      for (let z = 0; z < W; z++) {
+        const id = idAt(x, y, z);
+        if (PLANT_LOOKUP[id] === 0) continue;
+        const def = PLANTS[id];
+        if (def.kind === 'carpet') {
+          let m = carpetByY.get(y);
+          if (!m) { m = new Uint8Array(W * W); carpetByY.set(y, m); }
+          m[x * W + z] = id;
+          continue;
+        }
+        const [r, g, b] = tintFor(x, z, def.tint);
+        if (def.kind === 'cross') emitCross(x, y, z, def.layer, r, g, b);
+        else if (def.kind === 'pad') emitFlat(x, x, z, z, y - 0.5 + def.off, def.layer, r, g, b);
+        else if (def.kind === 'vine') emitVine(x, y, z, def.layer, r, g, b);
+      }
+    }
+  }
+  // Greedy-merge each carpet/snow y-level (carpets are untinted, so cells with
+  // the same block id merge freely) — a snowfield collapses to a few quads.
+  for (const [y, m] of carpetByY) {
+    for (let x = 0; x < W; x++) {
+      let z = 0;
+      while (z < W) {
+        const id = m[x * W + z];
+        if (id === 0) { z++; continue; }
+        let w = 1;
+        while (z + w < W && m[x * W + z + w] === id) w++;
+        let h = 1, grow = true;
+        while (x + h < W && grow) {
+          for (let k = 0; k < w; k++) { if (m[(x + h) * W + z + k] !== id) { grow = false; break; } }
+          if (grow) h++;
+        }
+        const def = PLANTS[id];
+        emitFlat(x, x + h - 1, z, z + w - 1, y - 0.5 + def.off, def.layer, 1, 1, 1);
+        for (let dx = 0; dx < h; dx++) for (let dz = 0; dz < w; dz++) m[(x + dx) * W + z + dz] = 0;
+        z += w;
+      }
+    }
+  }
+
+  return { casters: finalize(casters), nonCasters: finalize(nonCasters), plants: finalize(plants) };
 }

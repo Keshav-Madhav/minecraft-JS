@@ -23,6 +23,7 @@ function payloadToArrays(p: GeometryPayload): GeometryArrays | null {
     uvs: new Float32Array(p.uvs),
     layers: new Float32Array(p.layers),
     indices: p.i16 ? new Uint16Array(p.indices) : new Uint32Array(p.indices),
+    colors: p.colors ? new Uint8Array(p.colors) : undefined,
   };
 }
 
@@ -202,6 +203,10 @@ export class World extends Three.Group {
     return BLOCK_IDS.air;
   };
 
+  // Biome id at a world column (deterministic terrain function). Passed into the
+  // local mesher for edit re-meshes so plant tints match the worker's output.
+  getBiomeAt = (worldX: number, worldZ: number): number => this.sampler(worldX, worldZ).biome;
+
   get chunkCount() {
     return this.chunkMap.size;
   }
@@ -257,8 +262,8 @@ export class World extends Three.Group {
       applied++;
     }
     for (const { chunk, msg } of batch) {
-      if (this.hasEditsAround(chunk)) chunk.buildMeshes(this.getWorldBlock);
-      else chunk.applyGeometry(payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters));
+      if (this.hasEditsAround(chunk)) chunk.buildMeshes(this.getWorldBlock, this.getBiomeAt);
+      else chunk.applyGeometry(payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters), payloadToArrays(msg.plants));
     }
 
     // 2) Request more generation (gated by in-flight = sent-but-not-applied).
@@ -283,7 +288,7 @@ export class World extends Three.Group {
       if (builds >= this.maxMeshBuildsPerFrame) break;
       this.meshQueue.delete(chunk);
       if (chunk.hasData && chunk.parent === this) {
-        chunk.buildMeshes(this.getWorldBlock);
+        chunk.buildMeshes(this.getWorldBlock, this.getBiomeAt);
         builds++;
       }
     }
@@ -503,7 +508,7 @@ export class World extends Three.Group {
     const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
 
     if (chunk) {
-      chunk.addBlock(coords.block.x, coords.block.y, coords.block.z, id, this.getWorldBlock);
+      chunk.addBlock(coords.block.x, coords.block.y, coords.block.z, id, this.getWorldBlock, this.getBiomeAt);
       this.remeshAround(x, y, z, chunk);
     }
   }
@@ -513,7 +518,7 @@ export class World extends Three.Group {
     const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
 
     if (chunk) {
-      chunk.removeBlock(coords.block.x, coords.block.y, coords.block.z, this.getWorldBlock);
+      chunk.removeBlock(coords.block.x, coords.block.y, coords.block.z, this.getWorldBlock, this.getBiomeAt);
       this.remeshAround(x, y, z, chunk);
     }
   }

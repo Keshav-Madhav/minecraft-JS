@@ -38,6 +38,27 @@ LAYER_URLS[TEXTURE_LAYER.mushroomRed] = 'textures/biomes/mushroom_red.png';
 LAYER_URLS[TEXTURE_LAYER.mushroomBrown] = 'textures/biomes/mushroom_brown.png';
 LAYER_URLS[TEXTURE_LAYER.mushroomStem] = 'textures/biomes/mushroom_stem.png';
 LAYER_URLS[TEXTURE_LAYER.mushroomPores] = 'textures/biomes/mushroom_pores.png';
+// --- foliage (original procedural RGBA textures with transparency) ---
+LAYER_URLS[TEXTURE_LAYER.shortGrass] = 'textures/foliage/short_grass.png';
+LAYER_URLS[TEXTURE_LAYER.fern] = 'textures/foliage/fern.png';
+LAYER_URLS[TEXTURE_LAYER.tallGrassBottom] = 'textures/foliage/tall_grass_bottom.png';
+LAYER_URLS[TEXTURE_LAYER.tallGrassTop] = 'textures/foliage/tall_grass_top.png';
+LAYER_URLS[TEXTURE_LAYER.vine] = 'textures/foliage/vine.png';
+LAYER_URLS[TEXTURE_LAYER.deadBush] = 'textures/foliage/dead_bush.png';
+LAYER_URLS[TEXTURE_LAYER.lilyPad] = 'textures/foliage/lily_pad.png';
+LAYER_URLS[TEXTURE_LAYER.cherryPetals] = 'textures/foliage/cherry_petals.png';
+LAYER_URLS[TEXTURE_LAYER.leafLitter] = 'textures/foliage/leaf_litter.png';
+LAYER_URLS[TEXTURE_LAYER.flowerDandelion] = 'textures/foliage/flower_dandelion.png';
+LAYER_URLS[TEXTURE_LAYER.flowerPoppy] = 'textures/foliage/flower_poppy.png';
+LAYER_URLS[TEXTURE_LAYER.flowerCornflower] = 'textures/foliage/flower_cornflower.png';
+LAYER_URLS[TEXTURE_LAYER.flowerOxeye] = 'textures/foliage/flower_oxeye.png';
+LAYER_URLS[TEXTURE_LAYER.flowerAllium] = 'textures/foliage/flower_allium.png';
+LAYER_URLS[TEXTURE_LAYER.flowerTulip] = 'textures/foliage/flower_tulip.png';
+LAYER_URLS[TEXTURE_LAYER.seaGrass] = 'textures/foliage/sea_grass.png';
+LAYER_URLS[TEXTURE_LAYER.tallSeagrassBottom] = 'textures/foliage/tall_seagrass_bottom.png';
+LAYER_URLS[TEXTURE_LAYER.tallSeagrassTop] = 'textures/foliage/tall_seagrass_top.png';
+LAYER_URLS[TEXTURE_LAYER.largeFernBottom] = 'textures/foliage/large_fern_bottom.png';
+LAYER_URLS[TEXTURE_LAYER.largeFernTop] = 'textures/foliage/large_fern_top.png';
 
 const TILE = 16;
 
@@ -138,3 +159,82 @@ blockArrayMaterial.onBeforeCompile = (shader) => {
       diffuseColor *= texel;
     `);
 };
+
+// ---------------------------------------------------------------------------
+//  PLANT MATERIAL — for the cross-billboard / carpet / vine "plants" geometry
+//  group. Same DataArrayTexture sampling as blockArrayMaterial, PLUS:
+//   • alphaTest (NOT transparent) so it renders in the OPAQUE pass — no per-frame
+//     transparent-depth re-sort (the single biggest reason this is cheap; see the
+//     water plane, which is the only thing that pays that cost).
+//   • DoubleSide so a billboard is visible from both sides (we emit one winding).
+//   • a per-vertex `plantColor` (rgb = biome tint baked at mesh-build, a = wind
+//     sway weight 0..1) — grayscale grass/fern/vine textures become the biome's
+//     grass colour, MC-style, with zero runtime biome lookup.
+//   • a cheap wind sway in the vertex shader keyed on world position + uTime, so
+//     grass and flowers actually move. Top of a plant sways, base stays planted.
+// ---------------------------------------------------------------------------
+let plantShader: THREE.WebGLProgramParametersWithUniforms | null = null;
+export const plantMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+plantMaterial.alphaTest = 0.5;
+plantMaterial.side = THREE.DoubleSide;
+plantMaterial.onBeforeCompile = (shader) => {
+  shader.uniforms.uArray = { value: arrayTexture };
+  shader.uniforms.uTime = { value: 0 };
+  plantShader = shader;
+
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', /* glsl */`
+      #include <common>
+      attribute vec2 tileUv;
+      attribute float layerIndex;
+      attribute vec4 plantColor;   // rgb = biome tint, a = sway weight
+      uniform float uTime;
+      varying vec2 vTileUv;
+      varying float vLayer;
+      varying vec3 vTint;
+    `)
+    .replace('#include <begin_vertex>', /* glsl */`
+      #include <begin_vertex>
+      vTileUv = tileUv;
+      vLayer = layerIndex;
+      vTint = plantColor.rgb;
+      // Wind: phase from WORLD position (modelMatrix folds in the chunk offset) so
+      // neighbouring plants/chunks sway coherently. Scaled by the per-vertex sway
+      // weight (0 at the rooted base, 1 at the tip).
+      float sway = plantColor.a;
+      vec3 wpos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+      float ph = wpos.x * 0.6 + wpos.z * 0.45;
+      transformed.x += (sin(uTime * 1.6 + ph) + 0.3 * sin(uTime * 3.1 + ph * 1.7)) * 0.07 * sway;
+      transformed.z += cos(uTime * 1.3 + ph * 1.1) * 0.06 * sway;
+    `);
+
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', /* glsl */`
+      #include <common>
+      uniform sampler2DArray uArray;
+      varying vec2 vTileUv;
+      varying float vLayer;
+      varying vec3 vTint;
+    `)
+    // Force the shading normal UP on BOTH faces. These are DoubleSide billboards;
+    // three's normal_fragment_begin flips the normal to point DOWN on back faces
+    // (normal *= faceDirection), which lit them from below → pitch black. An up
+    // normal lights both sides evenly from the sky/sun, like flat vegetation.
+    .replace('#include <normal_fragment_begin>', /* glsl */`
+      #include <normal_fragment_begin>
+      normal = vec3(0.0, 1.0, 0.0);
+    `)
+    .replace('#include <map_fragment>', /* glsl */`
+      vec2 auv = fract(vTileUv);
+      auv.y = 1.0 - auv.y;
+      vec4 texel = textureGrad(uArray, vec3(auv, vLayer), dFdx(vTileUv), dFdy(vTileUv));
+      texel.rgb = pow(texel.rgb, vec3(2.2));
+      texel.rgb *= vTint;          // MC-style biome tint of the (grayscale) plant
+      diffuseColor *= texel;       // diffuseColor.a now carries texel.a -> alphaTest discards
+    `);
+};
+
+// Advance the foliage wind (called once per rendered frame from the draw loop).
+export function updatePlantWind(timeSeconds: number) {
+  if (plantShader) plantShader.uniforms.uTime.value = timeSeconds;
+}

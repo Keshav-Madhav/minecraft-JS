@@ -1,6 +1,7 @@
 import * as Three from 'three';
 import { Player } from './player';
 import { blocks } from './blocks';
+import { isPlant } from './blockTypes';
 import { World } from './world';
 
 type collisionType = {
@@ -113,7 +114,9 @@ export class Physics {
     for(let x = extents.x.min; x <= extents.x.max; x++){
       for(let y = extents.y.min; y <= extents.y.max; y++){
         for(let z = extents.z.min; z <= extents.z.max; z++){
-          if(world.getBlockId(x, y, z) !== blocks.air.id){
+          // Plants (grass/flowers/vines/…) are decorative — walk straight through.
+          const id = world.getBlockId(x, y, z);
+          if(id !== blocks.air.id && !isPlant(id)){
             candidates.push({x, y, z});
           }
         }

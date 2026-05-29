@@ -10,6 +10,7 @@ import { ModelLoader } from './ModelLoader';
 import { Clouds } from './clouds';
 import { WorldMap } from './map';
 import { biomeTint, biomeWaterHex } from './chunkGen';
+import { updatePlantWind } from './blockArrayMaterial';
 
 // Get window size
 let winWidth = window.innerWidth;
@@ -275,6 +276,12 @@ modelLoader.loadModels((models) => {
 const SHADOW_MAP_SIZE = 4096;
 const sun = new THREE.DirectionalLight(0xfff2d8, 2.9);
 const hemi = new THREE.HemisphereLight(0xbcd6ff /* sky */, 0x4d4233 /* ground */, 1.1);
+// A cool, dim MOON directional + a raised ambient floor so night stays navigable
+// instead of pitch black. The moon casts no shadows (cheap) and fades in as the
+// sun sets (intensity ∝ 1 - daylight). Direction is fixed (high, slightly raked).
+const moon = new THREE.DirectionalLight(0xaec6f0, 0);
+const MOON_PEAK = 0.6;
+const MOON_OFFSET = new THREE.Vector3(-120, 240, 90);
 
 // The sun is a DIRECTIONAL light: only its DIRECTION matters, expressed as a
 // compass azimuth + elevation above the horizon. The light is parked at this
@@ -329,6 +336,10 @@ function setUpLights() {
   scene.add(shadowHelper);
 
   scene.add(hemi);
+
+  moon.castShadow = false;
+  scene.add(moon);
+  scene.add(moon.target);
 }
 
 // Park the sun at its directional offset from the player and centre the shadow
@@ -389,9 +400,9 @@ let sunPeak = 2.9;             // midday sun intensity (GUI "Sun Brightness")
 // only dips ~14° below the horizon at midnight, so the dark phase (elev<-6) is a
 // SHORT ~18% of the cycle — most of the day is daylight, with brief night.
 const SUN_BIAS = 34, SUN_AMP = 48;
-const NIGHT_SKY = new THREE.Color(0x0a1024);
+const NIGHT_SKY = new THREE.Color(0x141d33);   // lifted from near-black so the night horizon/fog reads
 const DUSK_SKY = new THREE.Color(0xe07338);
-const NIGHT_HEMI = new THREE.Color(0x26344e);
+const NIGHT_HEMI = new THREE.Color(0x3a4e70);  // brighter moonlit-sky ambient
 const SUN_DAY = new THREE.Color(0xfff2d8);
 const SUN_DUSK = new THREE.Color(0xff7326);
 const _sky = new THREE.Color();
@@ -427,10 +438,15 @@ function updateSky(delta: number) {
   if (scene.fog) (scene.fog as THREE.Fog).color.copy(_sky);
   _hemiC.copy(NIGHT_HEMI).lerp(_tintSky, daylight);
   hemi.color.copy(_hemiC);
-  hemi.groundColor.copy(_tintGround).multiplyScalar(0.3 + 0.7 * daylight);
-  hemi.intensity = baseFill * _bright * (0.12 + 0.88 * daylight);            // night ambient floor 0.12
+  hemi.groundColor.copy(_tintGround).multiplyScalar(0.4 + 0.6 * daylight);
+  hemi.intensity = baseFill * _bright * (0.30 + 0.70 * daylight);            // raised night ambient floor
   sun.intensity = sunPeak * daylight;                                         // sun off at night
   sun.color.copy(SUN_DUSK).lerp(SUN_DAY, Math.min(1, daylight * 1.6));        // warm at the horizon
+
+  // Moon: cool fill that fades in as the sun goes down, so night is navigable.
+  moon.intensity = MOON_PEAK * (1 - daylight);
+  moon.position.copy(player.position).add(MOON_OFFSET);
+  moon.target.position.copy(player.position);
 }
 
 function onMouseDown(event: MouseEvent) {
@@ -463,6 +479,7 @@ function animate() {
   // position the directed sun + its texel-snapped shadow frustum on the player.
   updateSky(delta);
   updateSunShadow();
+  updatePlantWind(currentTime / 1000);   // gentle foliage sway (vertex-shader wind)
 
   worldMap.update();
 

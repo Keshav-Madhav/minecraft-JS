@@ -24,6 +24,7 @@ export type WorkerRequest = ConfigMessage | GenMessage;
 export type GeometryPayload = {
   positions: ArrayBuffer, normals: ArrayBuffer, uvs: ArrayBuffer, layers: ArrayBuffer, indices: ArrayBuffer,
   i16: boolean,   // whether `indices` is a Uint16Array (else Uint32Array) — for reconstruction on the main thread
+  colors?: ArrayBuffer,   // plants group only: vec4/vertex (biome tint rgb + wind sway a)
 } | null;
 
 export type MeshMessage = {
@@ -33,6 +34,7 @@ export type MeshMessage = {
   data: ArrayBuffer,
   casters: GeometryPayload,
   nonCasters: GeometryPayload,
+  plants: GeometryPayload,   // cross-billboard / carpet / vine foliage
 };
 
 let config: ConfigMessage | null = null;
@@ -40,13 +42,13 @@ let sampler: WorldSampler | null = null;
 
 function geometryToPayload(g: GeometryArrays | null): { payload: GeometryPayload, transfer: ArrayBuffer[] } {
   if (!g) return { payload: null, transfer: [] };
-  return {
-    payload: {
-      positions: g.positions.buffer, normals: g.normals.buffer, uvs: g.uvs.buffer,
-      layers: g.layers.buffer, indices: g.indices.buffer, i16: g.indices instanceof Uint16Array,
-    },
-    transfer: [g.positions.buffer, g.normals.buffer, g.uvs.buffer, g.layers.buffer, g.indices.buffer],
+  const payload: GeometryPayload = {
+    positions: g.positions.buffer, normals: g.normals.buffer, uvs: g.uvs.buffer,
+    layers: g.layers.buffer, indices: g.indices.buffer, i16: g.indices instanceof Uint16Array,
   };
+  const transfer = [g.positions.buffer, g.normals.buffer, g.uvs.buffer, g.layers.buffer, g.indices.buffer];
+  if (g.colors) { payload.colors = g.colors.buffer; transfer.push(g.colors.buffer); }
+  return { payload, transfer };
 }
 
 self.onmessage = (event: MessageEvent<WorkerRequest>) => {
@@ -64,7 +66,10 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const sample = sampler;
   const { worldX, worldZ } = msg;
 
-  const data = generateChunkData(cfg.size, cfg.params, worldX, worldZ, cfg.resources);
+  // Capture the per-column biome during generation so plant tinting is a free
+  // array lookup instead of re-sampling columnSurface for every grass-tinted cell.
+  const biomeMap = new Uint8Array(cfg.size.width * cfg.size.width);
+  const data = generateChunkData(cfg.size, cfg.params, worldX, worldZ, cfg.resources, biomeMap);
 
   // Apron: neighbour solidity from the deterministic surface height. Memoised
   // per border column so repeated y queries are O(1). Returns any non-air id for
@@ -77,9 +82,14 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
     return y <= h ? BLOCK_IDS.stone : BLOCK_IDS.air;
   };
 
-  const geometry = buildChunkGeometry(data, cfg.size, getOutside);
+  // Plant tint reads the biome straight from the precomputed map (in-chunk only).
+  const bw = cfg.size.width;
+  const getBiome = (lx: number, lz: number) => biomeMap[lx * bw + lz];
+
+  const geometry = buildChunkGeometry(data, cfg.size, getOutside, getBiome);
   const casters = geometryToPayload(geometry.casters);
   const nonCasters = geometryToPayload(geometry.nonCasters);
+  const plants = geometryToPayload(geometry.plants);
 
   // Transfer the block-data buffer directly (no copy): `data` is freshly
   // allocated per gen, the mesher kept no reference to it, and the worker doesn't
@@ -87,7 +97,8 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   // 64KB alloc+memcpy per chunk.
   const message: MeshMessage = {
     type: 'mesh', version: cfg.version, key: msg.key,
-    data: data.buffer, casters: casters.payload, nonCasters: nonCasters.payload,
+    data: data.buffer, casters: casters.payload, nonCasters: nonCasters.payload, plants: plants.payload,
   };
-  (self as unknown as Worker).postMessage(message, [...casters.transfer, ...nonCasters.transfer, data.buffer]);
+  (self as unknown as Worker).postMessage(message,
+    [...casters.transfer, ...nonCasters.transfer, ...plants.transfer, data.buffer]);
 };
