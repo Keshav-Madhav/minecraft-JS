@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Mojang bedrock-samples used only as visual reference for the original
+# procedural biome textures (EULA: not shipped). Plus texture-gen tooling.
+.texref/

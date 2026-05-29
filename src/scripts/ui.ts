@@ -14,6 +14,9 @@ export type LightingControls = {
   getAzimuth: () => number, setAzimuth: (v: number) => void,
   getElevation: () => number, setElevation: (v: number) => void,
   getBiomeTint: () => boolean, setBiomeTint: (v: boolean) => void,
+  getDayNight: () => boolean, setDayNight: (v: boolean) => void,
+  getTime: () => number, setTime: (v: number) => void,
+  getDayLength: () => number, setDayLength: (v: number) => void,
 };
 
 type GuiOptions = {
@@ -91,10 +94,11 @@ function addToggle(parent: HTMLElement, label: string, get: () => boolean, set: 
 export function createGUI(opts: GuiOptions) {
   const { world, player, settings, lighting, regenerate, onViewDistanceChange, onResolutionChange } = opts;
 
-  const panel = el('div', 'ui-panel');
+  // Start collapsed so the panel stays out of the way until opened.
+  const panel = el('div', 'ui-panel ui-panel--collapsed');
   const header = el('div', 'ui-panel__title');
   header.append(el('span', undefined, '⛏  Settings'));
-  const collapseBtn = el('button', 'ui-panel__collapse', '–');
+  const collapseBtn = el('button', 'ui-panel__collapse', '+');
   header.append(collapseBtn);
   const body = el('div', 'ui-panel__body');
   collapseBtn.addEventListener('click', () => {
@@ -156,8 +160,20 @@ export function createGUI(opts: GuiOptions) {
 
   // --- Lighting (live) ---
   const light = addSection('💡  Lighting');
-  // Sun DIRECTION: azimuth = compass heading the light comes from; elevation =
-  // height above the horizon (low = long dramatic shadows, high = short).
+  // Day/night cycle: when ON, the sun rises/sets automatically and the Sun
+  // Direction/Height sliders are driven by it. Time of Day (0=midnight, 0.25=dawn,
+  // 0.5=noon, 0.75=dusk) lets you scrub; Day Length sets seconds per full cycle.
+  addToggle(light, 'Day/Night Cycle', lighting.getDayNight, lighting.setDayNight);
+  addSlider(light, 'Time of Day', {
+    min: 0, max: 1, step: 0.01, decimals: 2,
+    get: lighting.getTime, set: lighting.setTime,
+  });
+  addSlider(light, 'Day Length (s)', {
+    min: 30, max: 1200, step: 10,
+    get: lighting.getDayLength, set: lighting.setDayLength,
+  });
+  // Sun DIRECTION (manual — used when Day/Night Cycle is OFF): azimuth = compass
+  // heading the light comes from; elevation = height above the horizon.
   addSlider(light, 'Sun Direction (°)', {
     min: 0, max: 360, step: 1,
     get: lighting.getAzimuth, set: lighting.setAzimuth,

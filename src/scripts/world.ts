@@ -22,13 +22,11 @@ function payloadToArrays(p: GeometryPayload): GeometryArrays | null {
     normals: new Float32Array(p.normals),
     uvs: new Float32Array(p.uvs),
     layers: new Float32Array(p.layers),
-    indices: new Uint32Array(p.indices),
+    indices: p.i16 ? new Uint16Array(p.indices) : new Uint32Array(p.indices),
   };
 }
 
 export class World extends Three.Group {
-  seed: number;
-
   // 256-tall world with sea level at 128 (128 below water, 128 above).
   chunkSize = { width: 16, height: 256 };
   params: ChunkParams = {
@@ -100,6 +98,14 @@ export class World extends Three.Group {
   // fed without the worker becoming the bottleneck.
   private workers: Worker[] = [];
   private nextWorker = 0;
+  // chunkKey -> the worker currently generating it, so a worker that dies can have
+  // its in-flight gen slots reclaimed (otherwise `outstanding` saturates and
+  // streaming silently stalls). Cleared per key when its result is applied.
+  private inflightWorker = new Map<string, Worker>();
+
+  // Optional hook fired at the end of generate() — used to re-point the map worker
+  // at the new params (load/regenerate), which the chunk-worker config alone misses.
+  onAfterGenerate?: () => void;
 
   // Chunks that are visible but not yet loaded, rebuilt fresh every update()
   // (nearest first). Rebuilding avoids stale entries accumulating when draw
@@ -120,7 +126,7 @@ export class World extends Three.Group {
 
   constructor(seed = 0) {
     super();
-    this.seed = seed;
+    this.params.seed = seed;
     this.sampler = createWorldSampler(this.params, this.chunkSize);
 
     this.initWorkers();
@@ -143,12 +149,30 @@ export class World extends Three.Group {
       try {
         const w = new Worker(new URL('./chunkWorker.ts', import.meta.url), { type: 'module' });
         w.onmessage = (event: MessageEvent<MeshMessage>) => this.onWorkerMessage(event.data);
-        w.onerror = () => { this.workers = this.workers.filter(x => x !== w); }; // drop a dead worker
+        w.onerror = (e) => this.handleWorkerDeath(w, e);
         this.workers.push(w);
       } catch { /* fall back to fewer / no workers */ }
     }
     // More in-flight with more workers so each stays fed; still bounded.
     this.maxOutstanding = Math.max(16, this.workers.length * 8);
+  }
+
+  // A worker died (e.g. crashed mid-gen). Drop it AND reclaim its in-flight gen
+  // slots, or `outstanding` stays permanently inflated and async streaming halts.
+  // Orphaned (data-less) chunks it was generating are removed and re-requested via
+  // a forced rescan; if every worker dies, processQueues falls back to sync gen.
+  private handleWorkerDeath(w: Worker, e?: unknown) {
+    console.error('chunk worker died, dropping it and reclaiming its work', e);
+    this.workers = this.workers.filter(x => x !== w);
+    let reclaimed = false;
+    for (const [key, worker] of this.inflightWorker) {
+      if (worker !== w) continue;
+      this.inflightWorker.delete(key);
+      this.outstanding = Math.max(0, this.outstanding - 1);
+      const chunk = this.chunkMap.get(key);
+      if (chunk && !chunk.hasData) { chunk.disposeInstance(); this.remove(chunk); this.chunkMap.delete(key); reclaimed = true; }
+    }
+    if (reclaimed) this.lastPlayerChunkX = NaN; // force a rescan → re-request the orphaned chunks
   }
 
   // Push the current generation config to every worker. Sent on each regenerate.
@@ -215,16 +239,26 @@ export class World extends Three.Group {
     // the main-thread cost (BufferGeometry + GPU upload); budgeting it keeps the
     // frame short while chunks stream in. `outstanding` (gen slots) is freed here
     // on apply, so generation is naturally throttled to the apply rate.
+    // Two passes so a batch is internally consistent: adopt ALL the batch's block
+    // data FIRST, then mesh. An edit-driven local rebuild (hasEditsAround) reads
+    // neighbour chunks; if a neighbour was applied later in the same batch it would
+    // otherwise be read as air → an exposed seam never re-fixed in the async path.
+    const batch: { chunk: WorldChunk, msg: MeshMessage }[] = [];
     let applied = 0;
     while (applied < this.maxAppliesPerFrame && this.applyQueue.length > 0) {
       const msg = this.applyQueue.shift()!;
       this.outstanding = Math.max(0, this.outstanding - 1);
+      this.inflightWorker.delete(msg.key);
       const chunk = this.chunkMap.get(msg.key);
-      if (!chunk) continue; // unloaded before we got to it
+      if (!chunk) continue;        // unloaded before we got to it
+      if (chunk.loaded) continue;  // duplicate/stale reply for a chunk re-created at the same coords
       chunk.setData(new Uint8Array(msg.data));
+      batch.push({ chunk, msg });
+      applied++;
+    }
+    for (const { chunk, msg } of batch) {
       if (this.hasEditsAround(chunk)) chunk.buildMeshes(this.getWorldBlock);
       else chunk.applyGeometry(payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters));
-      applied++;
     }
 
     // 2) Request more generation (gated by in-flight = sent-but-not-applied).
@@ -326,8 +360,11 @@ export class World extends Three.Group {
         worldX: chunk.position.x,
         worldZ: chunk.position.z,
       };
-      this.workers[this.nextWorker++ % this.workers.length].postMessage(request);
+      const w = this.workers[this.nextWorker++ % this.workers.length];
+      w.postMessage(request);
       this.outstanding++;
+      this.inflightWorker.set(this.chunkKey(x, z), w); // track for worker-death reclaim
+
     } else {
       // Synchronous fallback: generate data now, defer (local) meshing to the
       // budgeted queue so a no-worker environment doesn't freeze either.
@@ -402,12 +439,15 @@ export class World extends Three.Group {
     this.meshQueue.clear();
     this.applyQueue.length = 0;
     this.outstanding = 0; // in-flight results from the old world are version-rejected
+    this.inflightWorker.clear(); // their (now version-stale) replies won't reach processQueues
     this.lastPlayerChunkX = NaN; // force a visibility rescan next update()
     this.sampler = createWorldSampler(this.params, this.chunkSize);
     this.lastGenSignature = this.genSignature();
     // Push fresh config (and reset the worker's chunk cache) for this version.
     // Chunks then stream back in via update()/processQueues().
     this.sendWorkerConfig();
+    // Re-point dependents (e.g. the map worker) at the new params/seed.
+    this.onAfterGenerate?.();
   }
 
   getBlock(x: number, y: number, z: number) {
@@ -479,17 +519,19 @@ export class World extends Three.Group {
   }
 
   // After a single-block edit, re-mesh any neighbouring chunk that borders the
-  // edited block so its border faces are revealed/hidden correctly.
+  // edited block so its border faces are revealed/hidden correctly. The edited
+  // chunk itself was rebuilt synchronously (instant-edit feel) by addBlock/
+  // removeBlock; neighbours are routed through the budgeted meshQueue so rapid
+  // seam-digging can't hitch the click thread with several rebuilds at once (the
+  // momentarily-stale border self-heals within a frame or two).
   private remeshAround(x: number, y: number, z: number, edited: WorldChunk) {
-    const affected = new Set<WorldChunk>();
     for (const [dx, dy, dz] of FACE_NEIGHBOURS) {
       const coords = this.worldToChunkCoords(x + dx, y + dy, z + dz);
       const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
       if (chunk && chunk !== edited && chunk.loaded) {
-        affected.add(chunk);
+        this.meshQueue.add(chunk);
       }
     }
-    affected.forEach(chunk => chunk.buildMeshes(this.getWorldBlock));
   }
 
   disposeChunks() {
@@ -509,13 +551,31 @@ export class World extends Three.Group {
   }
 
   load() {
-    this.params = localStorage.getItem('minecraft_world') ? JSON.parse(localStorage.getItem('minecraft_world')!) : this.params;
-    this.dataStore.data = localStorage.getItem('minecraft_data') ? JSON.parse(localStorage.getItem('minecraft_data')!) : this.dataStore.data;
     const status = document.getElementById('status');
-    if (status) {
-      status.innerHTML = 'WORLD LOADED';
-      setTimeout(() => { status.innerHTML = ''; }, 3000);
+    const flash = (msg: string) => { if (status) { status.innerHTML = msg; setTimeout(() => { status.innerHTML = ''; }, 3000); } };
+    const rawParams = localStorage.getItem('minecraft_world');
+    if (!rawParams) { flash('No saved world'); return; }
+    try {
+      // Validate BEFORE committing: a corrupt/edited save must not half-mutate
+      // params (a NaN waterOffset would then corrupt the render loop every frame).
+      const params = JSON.parse(rawParams) as ChunkParams;
+      const t = params?.terrain;
+      const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
+      if (!t || !finite(t.scale) || !finite(t.magnitude) || !finite(t.offset) || !finite(t.waterOffset)) {
+        throw new Error('invalid terrain params');
+      }
+      const rawData = localStorage.getItem('minecraft_data');
+      const data = rawData ? JSON.parse(rawData) : {};
+      // Commit only after both parse+validate succeed.
+      this.params = params;
+      this.dataStore.data = data;
+      this.dataStore.rebuildIndex(); // data was assigned directly (bypassing set()) — resync the edit index
+    } catch (e) {
+      console.error('world load failed (bad save)', e);
+      flash('LOAD FAILED (bad save)');
+      return;
     }
+    flash('WORLD LOADED');
     this.generate();
   }
 }

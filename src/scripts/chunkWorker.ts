@@ -23,6 +23,7 @@ export type WorkerRequest = ConfigMessage | GenMessage;
 
 export type GeometryPayload = {
   positions: ArrayBuffer, normals: ArrayBuffer, uvs: ArrayBuffer, layers: ArrayBuffer, indices: ArrayBuffer,
+  i16: boolean,   // whether `indices` is a Uint16Array (else Uint32Array) — for reconstruction on the main thread
 } | null;
 
 export type MeshMessage = {
@@ -42,7 +43,7 @@ function geometryToPayload(g: GeometryArrays | null): { payload: GeometryPayload
   return {
     payload: {
       positions: g.positions.buffer, normals: g.normals.buffer, uvs: g.uvs.buffer,
-      layers: g.layers.buffer, indices: g.indices.buffer,
+      layers: g.layers.buffer, indices: g.indices.buffer, i16: g.indices instanceof Uint16Array,
     },
     transfer: [g.positions.buffer, g.normals.buffer, g.uvs.buffer, g.layers.buffer, g.indices.buffer],
   };
@@ -80,10 +81,13 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const casters = geometryToPayload(geometry.casters);
   const nonCasters = geometryToPayload(geometry.nonCasters);
 
-  const dataCopy = data.slice(); // keep a transferable copy of the block data
+  // Transfer the block-data buffer directly (no copy): `data` is freshly
+  // allocated per gen, the mesher kept no reference to it, and the worker doesn't
+  // touch it after posting — so the previous defensive `.slice()` was a wasted
+  // 64KB alloc+memcpy per chunk.
   const message: MeshMessage = {
     type: 'mesh', version: cfg.version, key: msg.key,
-    data: dataCopy.buffer, casters: casters.payload, nonCasters: nonCasters.payload,
+    data: data.buffer, casters: casters.payload, nonCasters: nonCasters.payload,
   };
-  (self as unknown as Worker).postMessage(message, [...casters.transfer, ...nonCasters.transfer, dataCopy.buffer]);
+  (self as unknown as Worker).postMessage(message, [...casters.transfer, ...nonCasters.transfer, data.buffer]);
 };

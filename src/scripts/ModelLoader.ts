@@ -13,6 +13,10 @@ export class ModelLoader {
       this.models.pickaxe = mesh;
 
       onLoad(this.models);
+    }, undefined, (err) => {
+      // The pickaxe model failed to load — log it instead of failing silently.
+      // Tool.setMesh is never called, but the game still runs (Tool guards undefined).
+      console.warn('failed to load pickaxe model', err);
     })
   }
 }

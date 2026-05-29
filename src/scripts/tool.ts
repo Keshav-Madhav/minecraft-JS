@@ -4,7 +4,7 @@ export class Tool extends THREE.Group {
   animate = false;
   animationStart = 0;
   animationSpeed = 0.025;
-  animation = undefined;
+  animation: ReturnType<typeof setTimeout> | undefined = undefined;
   animationAmplitude = 0.5;
   animationDuration = 0.5;
   toolMesh: THREE.Mesh | undefined = undefined;
@@ -31,10 +31,8 @@ export class Tool extends THREE.Group {
     if(this.animate) return;
     this.animate = true;
     this.animationStart = performance.now();
-    
-    // @ts-ignore
-    clearTimeout(this.animate);
-    // @ts-ignore
+
+    clearTimeout(this.animation); // was clearing `this.animate` (the bool) — a no-op
     this.animation = setTimeout(()=>{
       this.animate = false;
       if(this.toolMesh) this.toolMesh.rotation.y = 0;

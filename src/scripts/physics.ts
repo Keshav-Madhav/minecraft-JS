@@ -3,11 +3,6 @@ import { Player } from './player';
 import { blocks } from './blocks';
 import { World } from './world';
 
-const collisionMaterial = new Three.MeshBasicMaterial({ color: 0xff0000, transparent: true, opacity:0.2 });
-const collisionGeometry = new Three.BoxGeometry(1.0001, 1.001, 1.001);
-const contactMaterial = new Three.MeshBasicMaterial({ color: 0x00ff00, wireframe: true });
-const contactGeometry = new Three.SphereGeometry(0.05, 6, 6);
-
 type collisionType = {
   block: {x: number, y: number, z: number},
   contactPoint: {x: number, y: number, z: number},
@@ -16,17 +11,14 @@ type collisionType = {
 }
 
 export class Physics {
-  helpers: Three.Group;
-
   simRate = 200;
   timeStep = 1 / this.simRate;
   accumulator = 0;
 
   gravity = 32;
 
-  constructor(scene: Three.Scene){
-    this.helpers = new Three.Group();
-    scene.add(this.helpers);
+  constructor(_scene: Three.Scene){
+    // (debug collision-helper rendering was removed — it was never enabled)
   }
 
   update(delta: number, player: Player, world: World){
@@ -39,13 +31,27 @@ export class Physics {
       return;
     }
 
+    const sea = world.params.terrain.waterOffset;
+
     while(this.accumulator >= this.timeStep){
-      this.helpers.clear();
       player.velocity.y -= this.gravity * this.timeStep;
-  
+
+      // Water: float/swim at the surface instead of sinking to the seabed. In
+      // water when the body centre is below sea level AND the column there is open
+      // water (block at sea level is air over a sub-sea floor — not a land hill).
+      // A buoyancy spring toward the surface + weak gravity + drag settles the
+      // player bobbing with their head right at the waterline.
+      const depth = sea - (player.position.y - player.height * 0.5);
+      if (depth > 0 &&
+          world.getBlockId(Math.floor(player.position.x), sea, Math.floor(player.position.z)) === blocks.air.id) {
+        player.velocity.y += this.gravity * this.timeStep * 0.82;     // weak gravity in water
+        player.velocity.y += Math.min(depth, 3) * 8 * this.timeStep;  // buoyancy toward the surface
+        player.velocity.y *= Math.exp(-4 * this.timeStep);            // water drag (settles the bob)
+      }
+
       player.applyInputs(this.timeStep);
       player.updateBounds();
-  
+
       this.detectCollisions(player, world);
 
       this.accumulator -= this.timeStep;
@@ -66,16 +72,23 @@ export class Physics {
     collisions.sort((a, b) => a.overlap - b.overlap);
 
     for(const collision of collisions){
-      if(!this.pointInPlaayerBoundingCylinder(collision.contactPoint, player)) continue;
+      if(!this.pointInPlayerBoundingCylinder(collision.contactPoint, player)) continue;
 
       let deltaPos = collision.normal.clone()
       deltaPos.multiplyScalar(collision.overlap);
       player.position.add(deltaPos);
 
-      let magnitude = player.worldVelocity.dot(collision.normal);
-      let velocityAdjustment = collision.normal.clone().multiplyScalar(magnitude);
-
-      player.applyWorldDeltaVelocity(velocityAdjustment.negate());
+      // Only cancel the velocity component driving INTO the surface. Without this
+      // guard, a floor contact that lingers for a substep after a jump impulse
+      // (very common when jumping while pressed against a block) subtracts the
+      // upward jump velocity and "eats" the jump. Velocity moving AWAY from the
+      // surface (a fresh jump) is left intact; the position correction above
+      // still separates the bodies.
+      const magnitude = player.worldVelocity.dot(collision.normal);
+      if (magnitude < 0) {
+        const velocityAdjustment = collision.normal.clone().multiplyScalar(magnitude);
+        player.applyWorldDeltaVelocity(velocityAdjustment.negate());
+      }
     }
   }
 
@@ -125,7 +138,7 @@ export class Physics {
       const dy = closestPoint.y - (p.y - (player.height / 2));
       const dz = closestPoint.z - p.z;
 
-      if(this.pointInPlaayerBoundingCylinder(closestPoint, player)){
+      if(this.pointInPlayerBoundingCylinder(closestPoint, player)){
         const overlapY = (player.height / 2) - Math.abs(dy);
         const overlapXZ = player.radius - Math.sqrt(dx * dx + dz * dz);
 
@@ -140,37 +153,23 @@ export class Physics {
         }
 
         collisions.push({
-          block: candidate, 
+          block: candidate,
           contactPoint: closestPoint,
           normal,
           overlap,
         })
-
-        // this.addContactHelper(closestPoint);
       }
     }
 
     return collisions;
   }
 
-  pointInPlaayerBoundingCylinder(point: {x: number, y: number, z: number}, player: Player){
+  pointInPlayerBoundingCylinder(point: {x: number, y: number, z: number}, player: Player){
     const dx = point.x - player.position.x;
     const dy = point.y - (player.position.y - (player.height / 2));
     const dz = point.z - player.position.z;
     const r_sq = dx * dx + dz * dz;
 
     return (Math.abs(dy) < player.height / 2) && (r_sq < player.radius * player.radius);
-  }
-
-  addCollisonHelper(block: {x: number, y: number, z: number}){
-    const helper = new Three.Mesh(collisionGeometry, collisionMaterial);
-    helper.position.copy(block);
-    this.helpers.add(helper);
-  }
-
-  addContactHelper(contactPoint: {x: number, y: number, z: number}){
-    const helper = new Three.Mesh(contactGeometry, contactMaterial);
-    helper.position.copy(contactPoint);
-    this.helpers.add(helper);
   }
 }

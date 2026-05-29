@@ -17,6 +17,27 @@ LAYER_URLS[TEXTURE_LAYER.treeTop] = 'textures/tree_top.png';
 LAYER_URLS[TEXTURE_LAYER.leaves] = 'textures/leaves.png';
 LAYER_URLS[TEXTURE_LAYER.snow] = 'textures/snow.png';
 LAYER_URLS[TEXTURE_LAYER.white] = null; // generated solid white (clouds)
+// --- biome expansion: textures live in the separate public/textures/biomes dir ---
+LAYER_URLS[TEXTURE_LAYER.cherryLogSide] = 'textures/biomes/cherry_log_side.png';
+LAYER_URLS[TEXTURE_LAYER.cherryLogTop] = 'textures/biomes/cherry_log_top.png';
+LAYER_URLS[TEXTURE_LAYER.cherryLeaves] = 'textures/biomes/cherry_leaves.png';
+LAYER_URLS[TEXTURE_LAYER.myceliumTop] = 'textures/biomes/mycelium_top.png';
+LAYER_URLS[TEXTURE_LAYER.myceliumSide] = 'textures/biomes/mycelium_side.png';
+LAYER_URLS[TEXTURE_LAYER.redSand] = 'textures/biomes/red_sand.png';
+LAYER_URLS[TEXTURE_LAYER.terracottaOrange] = 'textures/biomes/terracotta_orange.png';
+LAYER_URLS[TEXTURE_LAYER.terracottaWhite] = 'textures/biomes/terracotta_white.png';
+LAYER_URLS[TEXTURE_LAYER.terracottaYellow] = 'textures/biomes/terracotta_yellow.png';
+LAYER_URLS[TEXTURE_LAYER.terracottaRed] = 'textures/biomes/terracotta_red.png';
+LAYER_URLS[TEXTURE_LAYER.terracottaBrown] = 'textures/biomes/terracotta_brown.png';
+LAYER_URLS[TEXTURE_LAYER.terracottaLightGray] = 'textures/biomes/terracotta_light_gray.png';
+LAYER_URLS[TEXTURE_LAYER.mud] = 'textures/biomes/mud.png';
+LAYER_URLS[TEXTURE_LAYER.cactusTop] = 'textures/biomes/cactus_top.png';
+LAYER_URLS[TEXTURE_LAYER.cactusBottom] = 'textures/biomes/cactus_bottom.png';
+LAYER_URLS[TEXTURE_LAYER.cactusSide] = 'textures/biomes/cactus_side.png';
+LAYER_URLS[TEXTURE_LAYER.mushroomRed] = 'textures/biomes/mushroom_red.png';
+LAYER_URLS[TEXTURE_LAYER.mushroomBrown] = 'textures/biomes/mushroom_brown.png';
+LAYER_URLS[TEXTURE_LAYER.mushroomStem] = 'textures/biomes/mushroom_stem.png';
+LAYER_URLS[TEXTURE_LAYER.mushroomPores] = 'textures/biomes/mushroom_pores.png';
 
 const TILE = 16;
 
@@ -47,6 +68,9 @@ function createArrayTexture(): THREE.DataArrayTexture {
   const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
 
   let pending = 0;
+  // Flag a single GPU re-upload (+ mipmap regen) once the LAST layer decodes,
+  // instead of once per layer — collapses ~30 full-array re-uploads into one.
+  const done = () => { if (--pending === 0) texture.needsUpdate = true; };
   LAYER_URLS.forEach((url, layer) => {
     if (!url) return;
     pending++;
@@ -56,8 +80,15 @@ function createArrayTexture(): THREE.DataArrayTexture {
       ctx.drawImage(img, 0, 0, TILE, TILE);
       const pixels = ctx.getImageData(0, 0, TILE, TILE).data;
       data.set(pixels, layer * TILE * TILE * 4);
-      pending--;
-      texture.needsUpdate = true; // re-upload (+ regenerate mipmaps) as layers arrive
+      done();
+    };
+    img.onerror = () => {
+      // A missing/broken texture would otherwise render as silent black; fill the
+      // layer magenta so the failure is obvious, and log which URL failed.
+      console.warn(`block texture failed to load: ${url}`);
+      const off = layer * TILE * TILE * 4;
+      for (let i = 0; i < TILE * TILE; i++) { data[off + i * 4] = 255; data[off + i * 4 + 1] = 0; data[off + i * 4 + 2] = 255; data[off + i * 4 + 3] = 255; }
+      done();
     };
     img.src = url;
   });

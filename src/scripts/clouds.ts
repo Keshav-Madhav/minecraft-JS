@@ -20,12 +20,13 @@ type LayerStyle = {
   minR: number, maxR: number,
 };
 
-// Three light, sparse layers: low cumulus, mid clumps, high thin cirrus. Kept
-// faint + sparse so three stacked layers don't wash the sky out white.
+// Three layers: low cumulus, mid clumps, high thin cirrus. Opacity/coverage kept
+// in check so three stacked layers read as full, fluffy clouds without washing
+// the sky out solid white.
 const LAYERS: LayerStyle[] = [
-  { height: 236, planeSize: 4000, repeat: 7,  opacity: 0.30, speed: 0.004,  color: 0xffffff, puffs: 12, minR: 14, maxR: 30 },
-  { height: 292, planeSize: 4500, repeat: 4,  opacity: 0.20, speed: 0.0026, color: 0xeef2ff, puffs: 7,  minR: 24, maxR: 52 },
-  { height: 352, planeSize: 5000, repeat: 11, opacity: 0.13, speed: 0.0065, color: 0xffffff, puffs: 22, minR: 6,  maxR: 14 },
+  { height: 236, planeSize: 4000, repeat: 7,  opacity: 0.62, speed: 0.004,  color: 0xffffff, puffs: 16, minR: 16, maxR: 34 },
+  { height: 292, planeSize: 4500, repeat: 4,  opacity: 0.46, speed: 0.0026, color: 0xeef2ff, puffs: 10, minR: 26, maxR: 56 },
+  { height: 352, planeSize: 5000, repeat: 11, opacity: 0.26, speed: 0.0065, color: 0xffffff, puffs: 26, minR: 7,  maxR: 16 },
 ];
 
 // Cloud puff texture (white blobs on transparent, mostly empty), tiled.
@@ -39,7 +40,8 @@ function createCloudTexture(style: LayerStyle): THREE.CanvasTexture {
     for (const ox of [-TEX_SIZE, 0, TEX_SIZE]) {       // wrap-around copies => seamless tiling
       for (const oy of [-TEX_SIZE, 0, TEX_SIZE]) {
         const g = ctx.createRadialGradient(x + ox, y + oy, 0, x + ox, y + oy, r);
-        g.addColorStop(0, 'rgba(255,255,255,0.7)');
+        g.addColorStop(0, 'rgba(255,255,255,0.92)');   // denser core
+        g.addColorStop(0.55, 'rgba(255,255,255,0.55)');
         g.addColorStop(1, 'rgba(255,255,255,0)');
         ctx.fillStyle = g;
         ctx.beginPath();

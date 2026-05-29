@@ -251,7 +251,7 @@ export class WorldMap {
     const p = this.opts.getPlayer();
     this.want.length = 0;
 
-    this.miniMarker.style.transform = `translate(-50%, -50%) rotate(${-p.yaw}rad)`;
+    this.miniMarker.style.transform = `translate(-50%, -50%) rotate(${p.yaw}rad)`;
     this.composite(this.mini, p.x, p.z, this.miniWpp);
 
     if (this.open) {

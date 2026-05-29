@@ -9,6 +9,7 @@ import { blocks } from './blocks';
 import { ModelLoader } from './ModelLoader';
 import { Clouds } from './clouds';
 import { WorldMap } from './map';
+import { biomeTint, biomeWaterHex } from './chunkGen';
 
 // Get window size
 let winWidth = window.innerWidth;
@@ -27,10 +28,12 @@ window.addEventListener('resize', () => {
 })
 
 let previousTime = performance.now();
-let frustumTick = 0;
+let hudTick = 0; // counts rendered frames; throttles the debug HUD refresh
 
-// Settings surfaced in the GUI.
-const settings = { uncapFPS: true, fog: false, resolutionScale: 1, biomeLighting: true };
+// Settings surfaced in the GUI. Real-play defaults: vsync on (uncapFPS off), fog
+// on (hides the streamed edge + carries the day/night colour), biome tint + the
+// day/night cycle on.
+const settings = { uncapFPS: false, fog: true, resolutionScale: 1, biomeLighting: true, dayNight: true };
 const SKY_COLOR = 0x80a0e0;
 
 // Frame scheduler. requestAnimationFrame is hard-locked to the display refresh
@@ -54,10 +57,33 @@ const stats = new Stats();
 document.body.appendChild(stats.dom);
 const renderStatsEl = document.getElementById('render-stats');
 
-// Setup for renderer. logarithmicDepthBuffer fixes z-fighting at distance (e.g.
-// the thin layer just above water flickering when zoomed out). Antialias is off
-// — MSAA over this many triangles tanked the frame rate.
-const renderer = new THREE.WebGLRenderer({ logarithmicDepthBuffer: true });
+// logarithmicDepthBuffer fixed z-fighting at distance (the thin sliver above
+// water flickering) but forces a per-fragment gl_FragDepth write that disables
+// hardware early-Z — costly in this overdraw-heavy scene. We instead reclaim
+// depth precision cheaply: a higher camera NEAR plane (the hyperbolic depth
+// buffer wastes most of its range in [0.1, ~10]; near=0.5 is ~5× better) plus a
+// polygonOffset on the water plane. Default OFF (the perf path). If the water
+// flicker returns over the ocean from the orbit cam, flip this back to `true`.
+const LOG_DEPTH = false;
+// 0.3 (not 0.1) reclaims most depth-buffer precision without clipping the held
+// tool (attached to the player camera at ~0.5 units). OrbitCam has no tool.
+const CAMERA_NEAR = 0.3;
+// Antialias is off — MSAA over this many triangles tanked the frame rate.
+function createRenderer(): THREE.WebGLRenderer {
+  try {
+    return new THREE.WebGLRenderer({ logarithmicDepthBuffer: LOG_DEPTH });
+  } catch (e) {
+    // No WebGL (old browser / disabled / blacklisted GPU): show a message instead
+    // of a blank page with a cryptic console error.
+    const msg = document.createElement('div');
+    msg.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;'
+      + 'background:#80a0e0;color:#fff;font:600 18px/1.5 sans-serif;text-align:center;padding:24px';
+    msg.textContent = 'This game needs WebGL, which your browser/GPU did not provide.';
+    document.body.appendChild(msg);
+    throw e;
+  }
+}
+const renderer = createRenderer();
 // Cap native ratio at 2 (a 3×+ display would otherwise shade 9× the fragments
 // for no visible gain) and scale by the user's resolution setting.
 function applyResolution() {
@@ -80,7 +106,7 @@ renderer.toneMappingExposure = 1.2;
 document.body.appendChild(renderer.domElement);
 
 // Setup for OrbitCam
-const OrbitCam = new THREE.PerspectiveCamera(70, winWidth / winHeight, 0.1, 4000);
+const OrbitCam = new THREE.PerspectiveCamera(70, winWidth / winHeight, CAMERA_NEAR, 4000);
 OrbitCam.position.set(-48, 190, -48); // above the terrain (sea level is 128)
 OrbitCam.layers.enable(1);
 OrbitCam.lookAt(8, 130, 8);
@@ -94,7 +120,7 @@ controls.update();
 const scene = new THREE.Scene();
 const world = new World();
 world.params.seed = Math.floor(Math.random() * 10000);
-world.drawDistance = 32; // temporary: large draw distance for testing
+world.drawDistance = 16; // real-play draw distance (smooth + plenty of view)
 world.generate();
 scene.add(world);
 
@@ -106,9 +132,11 @@ function updateViewDistance() {
   player.camera.updateProjectionMatrix();
   scene.fog = settings.fog ? new THREE.Fog(SKY_COLOR, span * 0.4, span) : null;
   clouds.setViewDistance(player.camera.far);
-  // Cover the whole visible area (plus margin) so the ocean reaches the horizon.
-  const waterSpan = (span + 48) * 2;
-  waterMesh.scale.set(waterSpan, waterSpan, 1);
+  // Cover the whole visible area + the snap-lag margin (the plane only re-centres
+  // every WATER_SNAP blocks) so the ocean always reaches the horizon.
+  waterSpanCur = (span + 48 + WATER_SNAP) * 2;
+  waterMesh.scale.set(waterSpanCur, 1, waterSpanCur);   // horizontal XZ grid
+  waterSnapX = NaN;                                     // force a colour recompute next frame
 }
 
 
@@ -116,25 +144,70 @@ function updateViewDistance() {
 const clouds = new Clouds();
 scene.add(clouds);
 
-// A SINGLE sea-level water plane that follows the player, instead of one
-// transparent plane per chunk. Land (which is above sea level) occludes it via
-// the depth buffer, so it only shows in oceans/holes — visually identical to
-// the old per-chunk planes, but it's one draw call and one entry in the
-// per-frame transparent depth-sort instead of thousands.
-const waterMesh = new THREE.Mesh(
-  new THREE.PlaneGeometry(1, 1),
-  // Phong (not Lambert) so the sun glints off the surface — gives the otherwise
-  // flat plane some life. Deeper blue + a touch more opaque reads more like water.
-  new THREE.MeshPhongMaterial({
-    color: 0x2f6aa6, transparent: true, opacity: 0.62,
-    side: THREE.DoubleSide, depthWrite: false,
-    specular: 0xbfe0ff, shininess: 96,
-  }),
-);
-waterMesh.rotation.x = -Math.PI / 2;
+// A single sea-level water plane that follows the player (still ONE draw call /
+// one transparent-sort entry — not per-chunk). But it's now a SUBDIVIDED grid
+// whose vertices are COLOURED by water depth + ocean type, sampled in world space
+// — so in-game the water reads shallow-teal over shelves, dark over deep basins,
+// and tinted per ocean type (warm→teal, frozen→pale), instead of one flat colour.
+// Land above sea still occludes it via the depth buffer, so it only shows in water.
+const WATER_SEG = 48;                 // grid resolution (49² sampled vertices)
+const WATER_SNAP = 24;                // re-centre + recolour the plane every 24 blocks of movement
+let waterSpanCur = 64;                // world-units the plane covers (set by updateViewDistance)
+let waterSnapX = NaN, waterSnapZ = NaN;
+function buildWaterGeometry(seg: number): THREE.BufferGeometry {
+  const n = seg + 1, verts = n * n;
+  const pos = new Float32Array(verts * 3), col = new Float32Array(verts * 3), nrm = new Float32Array(verts * 3);
+  for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+    const k = (j * n + i) * 3;
+    pos[k] = i / seg - 0.5; pos[k + 1] = 0; pos[k + 2] = j / seg - 0.5;  // horizontal XZ grid, local [-0.5,0.5]
+    nrm[k + 1] = 1;                                                      // flat up normal (for the sun glint)
+  }
+  const idx = new Uint32Array(seg * seg * 6); let o = 0;
+  for (let j = 0; j < seg; j++) for (let i = 0; i < seg; i++) {
+    const a = j * n + i, b = a + 1, c = a + n, d = c + 1;
+    idx[o++] = a; idx[o++] = c; idx[o++] = b; idx[o++] = b; idx[o++] = c; idx[o++] = d;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  return g;
+}
+const waterGeo = buildWaterGeometry(WATER_SEG);
+const waterMesh = new THREE.Mesh(waterGeo, new THREE.MeshPhongMaterial({
+  vertexColors: true, color: 0xffffff, transparent: true, opacity: 0.72,
+  side: THREE.DoubleSide, depthWrite: false, specular: 0xbfe0ff, shininess: 96,
+  // Bias toward the camera in depth so the thin shoreline band doesn't z-fight
+  // (this + the higher near plane replaces logarithmicDepthBuffer).
+  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+}));
 waterMesh.layers.set(1);
 waterMesh.frustumCulled = false;
 scene.add(waterMesh);
+
+// Sample water colour at each grid vertex (world space): shallow shelves read a
+// light tint, deep basins darken, and the hue follows the ocean TYPE under that
+// vertex. Recomputed only when the snapped plane centre moves (see animate), so
+// colours stay aligned with the mesh and the cost is paid only while moving.
+const _W_SHALLOW = new THREE.Color(0x86d0d8);
+const _wcDeep = new THREE.Color(), _wcShallow = new THREE.Color(), _wcOut = new THREE.Color();
+function updateWaterColors(cx: number, cz: number) {
+  const seaY = world.params.terrain.waterOffset;
+  const col = waterGeo.attributes.color.array as Float32Array;
+  const n = WATER_SEG + 1, span = waterSpanCur;
+  for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+    const wx = cx + (i / WATER_SEG - 0.5) * span, wz = cz + (j / WATER_SEG - 0.5) * span;
+    const s = world.sampler(Math.floor(wx), Math.floor(wz));
+    _wcDeep.setHex(biomeWaterHex(s.biome));
+    _wcShallow.copy(_wcDeep).lerp(_W_SHALLOW, 0.55);
+    const t = Math.min(1, Math.max(0, seaY - s.height) / 36);     // 0 shallow → 1 deep
+    _wcOut.copy(_wcShallow).lerp(_wcDeep, t).multiplyScalar(1 - 0.32 * t); // darken with depth
+    const k = (j * n + i) * 3;
+    col[k] = _wcOut.r; col[k + 1] = _wcOut.g; col[k + 2] = _wcOut.b;
+  }
+  waterGeo.attributes.color.needsUpdate = true;
+}
 
 // Setup for player
 const player = new Player(scene);
@@ -144,8 +217,15 @@ const physics = new Physics(scene);
 // Minimap + fullscreen 2D world map. Tiles are rendered off-thread (map worker)
 // from the same terrain noise as the world and cached, so what you see is what
 // generates and panning/zooming stays smooth.
+const _camDir = new THREE.Vector3();
 const worldMap = new WorldMap({
-  getPlayer: () => ({ x: player.position.x, z: player.position.z, yaw: player.camera.rotation.y }),
+  getPlayer: () => {
+    // Heading from the camera's actual forward vector (reliable regardless of the
+    // PointerLockControls euler order). `yaw` is the CSS rotation that turns the
+    // minimap arrow (which points up = north = −Z at 0) to face the look direction.
+    player.camera.getWorldDirection(_camDir);
+    return { x: player.position.x, z: player.position.z, yaw: Math.atan2(_camDir.x, -_camDir.z) };
+  },
   onTeleport: (x, z) => {
     const surface = world.sampler(Math.floor(x), Math.floor(z));
     player.position.set(x, surface.height + 3, z);
@@ -165,6 +245,10 @@ function configureMap() {
   worldMap.configure(world.params, world.chunkSize, world.params.terrain.waterOffset);
 }
 configureMap();
+// Re-point the map worker at the new params whenever the world regenerates
+// (GUI Apply, or loading a saved world via 'm') — otherwise the map silently
+// keeps rendering the old seed's terrain.
+world.onAfterGenerate = configureMap;
 
 // 'G' toggles the world map.
 document.addEventListener('keydown', (event) => {
@@ -185,6 +269,10 @@ modelLoader.loadModels((models) => {
 // sun ≈ 3.0. The directional sun gives shape/shadows; a HemisphereLight provides
 // bright sky-vs-ground ambient fill so faces turned away from the sun aren't
 // crushed to near-black.
+// Shadow-map resolution. Shared by the map allocation AND the texel-snap maths
+// (updateSunShadow) — they MUST agree or the snap quantises to the wrong grid and
+// shadows shimmer while moving.
+const SHADOW_MAP_SIZE = 4096;
 const sun = new THREE.DirectionalLight(0xfff2d8, 2.9);
 const hemi = new THREE.HemisphereLight(0xbcd6ff /* sky */, 0x4d4233 /* ground */, 1.1);
 
@@ -210,7 +298,7 @@ function applySunDirection(azimuthDeg: number, elevationDeg: number) {
 // Half-width of the shadow frustum (world units). Bigger = shadows cover more
 // of the scene (the "spotlight" is larger) but the same shadow map is spread
 // thinner and more casters are drawn in the shadow pass. User-tunable.
-let shadowRange = 140;
+let shadowRange = 320;
 function applyShadowRange(r: number) {
   shadowRange = r;
   const cam = sun.shadow.camera;
@@ -230,7 +318,7 @@ function setUpLights() {
   sun.shadow.camera.near = 1;
   sun.shadow.bias = -0.00008;
   sun.shadow.normalBias = 0.02;
-  sun.shadow.mapSize.set(4096, 4096);
+  sun.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
   applyShadowRange(shadowRange);
   applySunDirection(sunAzimuth, sunElevation);
   scene.add(sun);
@@ -249,7 +337,6 @@ function setUpLights() {
 // continuously under the geometry as you move, so shadow edges crawl/shimmer
 // ("swimming"). Snapping makes the grid jump one texel at a time, which is
 // imperceptible and rock-steady.
-const SHADOW_MAP_SIZE = 4096;
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _up = new THREE.Vector3();
@@ -274,53 +361,76 @@ function updateSunShadow() {
 }
 
 // --- Biome-aware ambient tint ---------------------------------------------
-// Shift the sky/ground fill + sky clear colour AND a brightness multiplier
-// toward the biome the player is in. `bright` multiplies the user's Sky/Fill
-// base (so that slider stays authoritative for the overall level, while biomes
-// read brighter/darker relative to it). Everything is lerped so biome borders
-// cross smoothly.
-type Tint = { sky: number, ground: number, clear: number, bright: number };
-const BIOME_TINT: Record<number, Tint> = {
-  8:  { sky: 0xffe7c2, ground: 0xb59055, clear: 0xcdc6ac, bright: 1.05 }, // sand  → desert: warmer
-  10: { sky: 0xd2e2ff, ground: 0xa6bad6, clear: 0xc4d8f4, bright: 1.22 }, // snow  → colder + bright
-  3:  { sky: 0xd8e4f6, ground: 0x808a9c, clear: 0xb2caec, bright: 1.18 }, // stone → mountains: brighter + colder
-  1:  { sky: 0xbcd6ff, ground: 0x4d4233, clear: 0x80a0e0, bright: 1.0  }, // grass → plains (neutral)
-};
-const FOREST_TINT: Tint = { sky: 0xa6c0da, ground: 0x2e3b23, clear: 0x6d8ebc, bright: 0.82 }; // darker + colder
-const OCEAN_TINT:  Tint = { sky: 0xfff2dc, ground: 0x8fbccd, clear: 0xcadef2, bright: 1.38 }; // warmer + much brighter
-let baseFill = 1.1; // user's Sky/Fill level (the biome `bright` multiplies this)
+// Each biome carries an ambient tint (sky/ground fill + clear colour + a
+// brightness multiplier) in the chunkGen registry. We sample the biome under the
+// player and ease the lights toward its tint; the per-frame lerp makes crossing a
+// border a smooth fade (and biome regions are large, so it never strobes). This
+// is fully data-driven — a new biome's tint comes with its registry entry, no
+// edits here. `bright` multiplies the user's Sky/Fill base (slider stays boss).
+let baseFill = 1.1;
 const _tintSky = new THREE.Color(0xbcd6ff);
 const _tintGround = new THREE.Color(0x4d4233);
 const _tintClear = new THREE.Color(SKY_COLOR);
-const _targetSky = new THREE.Color();
-const _targetGround = new THREE.Color();
-const _targetClear = new THREE.Color();
+const _targetSky = new THREE.Color(0xbcd6ff);
+const _targetGround = new THREE.Color(0x4d4233);
+const _targetClear = new THREE.Color(SKY_COLOR);
 let _bright = 1, _targetBright = 1;
 let biomeTintTick = 0;
-function updateBiomeLighting() {
-  if (!settings.biomeLighting) return;
-  // Throttle the surface sample (a noise eval) to a few times a second.
-  if ((biomeTintTick++ % 8) === 0) {
-    const s = world.sampler(Math.floor(player.position.x), Math.floor(player.position.z));
-    let t: Tint;
-    if (s.height < world.params.terrain.waterOffset) {
-      t = OCEAN_TINT;                                      // standing over/under water
-    } else if (s.surfaceId === 1 && s.forest > 0.6) {
-      t = FOREST_TINT;                                     // dense woods
-    } else {
-      t = BIOME_TINT[s.surfaceId] ?? BIOME_TINT[1];
-    }
-    _targetSky.setHex(t.sky); _targetGround.setHex(t.ground); _targetClear.setHex(t.clear);
-    _targetBright = t.bright;
+
+// --- Day/night cycle -------------------------------------------------------
+// The sun rises in the east, arcs across the sky, and sets; the sky goes blue by
+// day → orange at dawn/dusk → dark navy at night, the directional sun fades out
+// at night (a low hemisphere "moonlight" floor keeps things visible), and fog +
+// clear colour follow the sky. Biome tint still shades the DAYTIME hue.
+let timeOfDay = 0.30;          // 0 midnight · 0.25 sunrise · 0.5 noon · 0.75 sunset
+let dayLength = 480;           // real seconds per full cycle
+let sunPeak = 2.9;             // midday sun intensity (GUI "Sun Brightness")
+// Sun elevation = BIAS + AMP·sin(...). The raised baseline (34) means the sun
+// only dips ~14° below the horizon at midnight, so the dark phase (elev<-6) is a
+// SHORT ~18% of the cycle — most of the day is daylight, with brief night.
+const SUN_BIAS = 34, SUN_AMP = 48;
+const NIGHT_SKY = new THREE.Color(0x0a1024);
+const DUSK_SKY = new THREE.Color(0xe07338);
+const NIGHT_HEMI = new THREE.Color(0x26344e);
+const SUN_DAY = new THREE.Color(0xfff2d8);
+const SUN_DUSK = new THREE.Color(0xff7326);
+const _sky = new THREE.Color();
+const _hemiC = new THREE.Color();
+const sstep = THREE.MathUtils.smoothstep;
+
+function updateSky(delta: number) {
+  // 1) Place the sun. Day/night drives azimuth+elevation from `timeOfDay`; else
+  // the manual GUI sliders (sunAzimuth/sunElevation) hold.
+  let elevReal = sunElevation;
+  if (settings.dayNight) {
+    timeOfDay = (timeOfDay + delta / Math.max(20, dayLength)) % 1;
+    elevReal = SUN_BIAS + SUN_AMP * Math.sin((timeOfDay - 0.25) * Math.PI * 2); // ~-14..+82
+    applySunDirection((timeOfDay * 360 + 60) % 360, elevReal);               // clamps elev for the light vector
   }
-  _tintSky.lerp(_targetSky, 0.05);
-  _tintGround.lerp(_targetGround, 0.05);
-  _tintClear.lerp(_targetClear, 0.05);
-  _bright += (_targetBright - _bright) * 0.05;
-  hemi.color.copy(_tintSky);
-  hemi.groundColor.copy(_tintGround);
-  hemi.intensity = baseFill * _bright;
-  renderer.setClearColor(_tintClear);
+  const daylight = THREE.MathUtils.clamp((elevReal + 6) / 18, 0, 1);         // 0 night → 1 day (twilight band)
+  const glow = sstep(elevReal, -8, 3) * (1 - sstep(elevReal, 3, 16));        // warm dawn/dusk near the horizon
+
+  // 2) Biome tint target (throttled sample) — the DAYTIME hue.
+  if (settings.biomeLighting && (biomeTintTick++ % 8) === 0) {
+    const s = world.sampler(Math.floor(player.position.x), Math.floor(player.position.z));
+    const t = biomeTint(s.biome);
+    _targetSky.setHex(t.sky); _targetGround.setHex(t.ground); _targetClear.setHex(t.clear); _targetBright = t.bright;
+  }
+  _tintSky.lerp(_targetSky, 0.04);
+  _tintGround.lerp(_targetGround, 0.04);
+  _tintClear.lerp(_targetClear, 0.04);
+  _bright += (_targetBright - _bright) * 0.04;
+
+  // 3) Compose day/night over the biome tint.
+  _sky.copy(NIGHT_SKY).lerp(_tintClear, daylight).lerp(DUSK_SKY, glow * 0.6);  // sky/fog colour
+  renderer.setClearColor(_sky);
+  if (scene.fog) (scene.fog as THREE.Fog).color.copy(_sky);
+  _hemiC.copy(NIGHT_HEMI).lerp(_tintSky, daylight);
+  hemi.color.copy(_hemiC);
+  hemi.groundColor.copy(_tintGround).multiplyScalar(0.3 + 0.7 * daylight);
+  hemi.intensity = baseFill * _bright * (0.12 + 0.88 * daylight);            // night ambient floor 0.12
+  sun.intensity = sunPeak * daylight;                                         // sun off at night
+  sun.color.copy(SUN_DUSK).lerp(SUN_DAY, Math.min(1, daylight * 1.6));        // warm at the horizon
 }
 
 function onMouseDown(event: MouseEvent) {
@@ -349,10 +459,10 @@ function animate() {
     physics.update(delta, player, world);
   }
 
-  // Sun + shadow frustum follow the player every frame (texel-snapped), not just
-  // when locked, so the orbit/spawn view is lit and shadowed too.
+  // Advance the day/night cycle (places + colours the sun, sets sky/fog), then
+  // position the directed sun + its texel-snapped shadow frustum on the player.
+  updateSky(delta);
   updateSunShadow();
-  updateBiomeLighting();
 
   worldMap.update();
 
@@ -365,27 +475,40 @@ function animate() {
     world.processQueues();
 
     clouds.update(player.position.x, player.position.z, currentTime / 1000);
-    waterMesh.position.set(player.position.x, world.params.terrain.waterOffset + 0.45, player.position.z);
+    // Snap the water plane to a coarse grid and recolour its vertices only when
+    // that snapped centre changes — colours stay aligned with the (snapped) mesh,
+    // and the per-vertex world-sampling cost is paid only while crossing water.
+    const wsx = Math.round(player.position.x / WATER_SNAP) * WATER_SNAP;
+    const wsz = Math.round(player.position.z / WATER_SNAP) * WATER_SNAP;
+    waterMesh.position.set(wsx, world.params.terrain.waterOffset + 0.45, wsz);
+    if (wsx !== waterSnapX || wsz !== waterSnapZ) {
+      waterSnapX = wsx; waterSnapZ = wsz;
+      updateWaterColors(wsx, wsz);
+    }
 
+    // Orbit view on spawn (free look at the world); locking the pointer (press a
+    // movement key) switches to first-person play.
     const activeCamera = player.controls.isLocked ? player.camera : OrbitCam;
     // No manual frustum culling: three.js culls each chunk mesh automatically and
     // PER PASS (main camera for colour, the sun's shadow camera for shadows), so
     // an off-screen mountain still casts its shadow onto the player. Hiding
     // chunks with .visible=false would have removed them from the shadow pass.
-    frustumTick++;
+    hudTick++;
     renderer.render(scene, activeCamera);
   }
   stats.update();
 
   // Refresh the debug HUD a few times a second, not every frame — building the
   // string (toLocaleString etc.) and writing innerText every frame is needless.
-  if (renderStatsEl && (frustumTick & 15) === 0) {
-    const info = renderer.info.render;
+  if (renderStatsEl && (hudTick & 15) === 0) {
+    const r = renderer.info.render, m = renderer.info.memory;
     // Draw calls already reflect what survives three's per-pass frustum cull, so
     // it's the meaningful "what's actually drawn" number (chunks = total loaded).
+    // geom/tex (live GPU resources) are a cheap leak guard-rail — they should
+    // track chunkCount, not climb without bound.
     renderStatsEl.innerText =
-      `draw calls: ${info.calls}  |  triangles: ${info.triangles.toLocaleString()}\n` +
-      `chunks loaded: ${world.chunkCount}`;
+      `draw calls: ${r.calls}  |  triangles: ${r.triangles.toLocaleString()}\n` +
+      `chunks loaded: ${world.chunkCount}  |  geom: ${m.geometries}  tex: ${m.textures}`;
   }
 
   previousTime = currentTime;
@@ -398,20 +521,24 @@ createGUI({
   world,
   player,
   settings,
-  regenerate: () => { world.generate(false); configureMap(); }, // preserve edits; refresh map worker
+  regenerate: () => { world.generate(false); }, // preserve edits; generate() refreshes the map via onAfterGenerate
   onViewDistanceChange: updateViewDistance,
   onResolutionChange: applyResolution,
   lighting: {
-    getSun: () => sun.intensity, setSun: (v) => { sun.intensity = v; },
-    getFill: () => baseFill, setFill: (v) => { baseFill = v; hemi.intensity = v; },
+    getSun: () => sunPeak, setSun: (v) => { sunPeak = v; },   // midday peak; day/night scales it
+    getFill: () => baseFill, setFill: (v) => { baseFill = v; },
     getExposure: () => renderer.toneMappingExposure, setExposure: (v) => { renderer.toneMappingExposure = v; },
     getShadowRange: () => shadowRange, setShadowRange: applyShadowRange,
     getShadows: () => sun.castShadow, setShadows: (v) => { sun.castShadow = v; },
+    // Sun direction (manual). Used when the Day/Night cycle is OFF; otherwise the
+    // cycle overwrites it each frame.
     getAzimuth: () => sunAzimuth, setAzimuth: (v) => applySunDirection(v, sunElevation),
     getElevation: () => sunElevation, setElevation: (v) => applySunDirection(sunAzimuth, v),
-    // Turning the tint off restores the plain user fill level (the per-biome
-    // brightness multiplier no longer applies).
-    getBiomeTint: () => settings.biomeLighting, setBiomeTint: (v) => { settings.biomeLighting = v; if (!v) hemi.intensity = baseFill; },
+    getBiomeTint: () => settings.biomeLighting, setBiomeTint: (v) => { settings.biomeLighting = v; },
+    // Day/night cycle.
+    getDayNight: () => settings.dayNight, setDayNight: (v) => { settings.dayNight = v; },
+    getTime: () => timeOfDay, setTime: (v) => { timeOfDay = v; },
+    getDayLength: () => dayLength, setDayLength: (v) => { dayLength = v; },
   },
 });
 animate();

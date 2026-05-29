@@ -16,7 +16,11 @@ export type GeometryArrays = {
   normals: Float32Array,
   uvs: Float32Array,
   layers: Float32Array,
-  indices: Uint32Array,
+  // Uint16 when the group's vertex count fits (the common case for a single
+  // heightmap chunk split into casters/non-casters) — half the index VRAM and
+  // upload bandwidth vs Uint32 across thousands of streamed chunks. Falls back to
+  // Uint32 for a pathological fully-exposed chunk (> 65535 verts).
+  indices: Uint16Array | Uint32Array,
 };
 
 export type ChunkGeometry = {
@@ -51,13 +55,35 @@ const newAccumulator = (): Accumulator => ({ pos: [], norm: [], uv: [], layer: [
 
 function finalize(acc: Accumulator): GeometryArrays | null {
   if (acc.idx.length === 0) return null;
+  const vtx = acc.pos.length / 3;
   return {
     positions: new Float32Array(acc.pos),
     normals: new Float32Array(acc.norm),
     uvs: new Float32Array(acc.uv),
     layers: new Float32Array(acc.layer),
-    indices: new Uint32Array(acc.idx),
+    indices: vtx > 65535 ? new Uint32Array(acc.idx) : new Uint16Array(acc.idx),
   };
+}
+
+// Append one vertex to `acc` from a quad corner, WITHOUT allocating (the old
+// emitQuad built a `corners` array + a `vert[3]` per corner — thousands of
+// short-lived arrays per chunk mesh). aAxis/pAxis/qAxis are a permutation of
+// {0,1,2}, so each of aCoord/pc/qc maps to exactly one of x/y/z. Module-scope so
+// no closure is allocated per quad either.
+function pushVert(acc: Accumulator, meta: DirMeta, aCoord: number, pc: number, qc: number, layer: number) {
+  let x = 0, y = 0, z = 0;
+  switch (meta.aAxis) { case 0: x = aCoord; break; case 1: y = aCoord; break; default: z = aCoord; }
+  switch (meta.pAxis) { case 0: x = pc; break; case 1: y = pc; break; default: z = pc; }
+  switch (meta.qAxis) { case 0: x = qc; break; case 1: y = qc; break; default: z = qc; }
+  acc.pos.push(x, y, z);
+  acc.norm.push(meta.normal[0], meta.normal[1], meta.normal[2]);
+  // +0.5 aligns texture tile boundaries to block edges; the shader fract()s this
+  // so merged quads tile the texture once per block.
+  acc.uv.push(
+    (meta.uAxis === 0 ? x : meta.uAxis === 1 ? y : z) + 0.5,
+    (meta.vAxis === 0 ? x : meta.vAxis === 1 ? y : z) + 0.5,
+  );
+  acc.layer.push(layer);
 }
 
 export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside: OutsideBlockGetter): ChunkGeometry {
@@ -69,8 +95,9 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
   const idAt = (x: number, y: number, z: number) =>
     data[blockIndex(x, y, z, size)];
 
-  const faceVisible = (x: number, y: number, z: number, dir: number): boolean => {
-    const [ox, oy, oz] = FACE_OFFSETS[dir];
+  // ox/oy/oz are the face offset for `dir`, hoisted by the caller (constant
+  // across the per-cell loops) so it isn't re-read from FACE_OFFSETS per cell.
+  const faceVisible = (x: number, y: number, z: number, ox: number, oy: number, oz: number): boolean => {
     const nx = x + ox, ny = y + oy, nz = z + oz;
     if (ny < 0) return false;          // bedrock floor
     if (ny >= H) return true;          // open sky
@@ -81,27 +108,20 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
   };
 
   const emitQuad = (dir: number, la: number, p0: number, p1: number, q0: number, q1: number, id: number) => {
+    const faces = BLOCK_FACE_LAYERS[id];
+    if (!faces) return; // unmapped/tampered block id — skip rather than crash the (main-thread) remesh
     const meta = DIR_META[dir];
     const acc = NON_SHADOW_CASTER_IDS.has(id) ? nonCasters : casters;
-    const layer = BLOCK_FACE_LAYERS[id][dir];
+    const layer = faces[dir];
 
     const aCoord = la + meta.sign * 0.5;
     const pLo = p0 - 0.5, pHi = p1 - 0.5;
     const qLo = q0 - 0.5, qHi = q1 - 0.5;
-    const corners = [[pLo, qLo], [pHi, qLo], [pHi, qHi], [pLo, qHi]];
     const base = acc.pos.length / 3;
-    for (const [pc, qc] of corners) {
-      const vert = [0, 0, 0];
-      vert[meta.aAxis] = aCoord;
-      vert[meta.pAxis] = pc;
-      vert[meta.qAxis] = qc;
-      acc.pos.push(vert[0], vert[1], vert[2]);
-      acc.norm.push(meta.normal[0], meta.normal[1], meta.normal[2]);
-      // +0.5 aligns texture tile boundaries to block edges; the shader fract()s
-      // this so merged quads tile the texture once per block.
-      acc.uv.push(vert[meta.uAxis] + 0.5, vert[meta.vAxis] + 0.5);
-      acc.layer.push(layer);
-    }
+    pushVert(acc, meta, aCoord, pLo, qLo, layer);
+    pushVert(acc, meta, aCoord, pHi, qLo, layer);
+    pushVert(acc, meta, aCoord, pHi, qHi, layer);
+    pushVert(acc, meta, aCoord, pLo, qHi, layer);
     acc.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
   };
 
@@ -134,6 +154,7 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
 
   for (let dir = 0; dir < 6; dir++) {
     const meta = DIR_META[dir];
+    const [ox, oy, oz] = FACE_OFFSETS[dir];   // hoisted: constant across the cell loops
     const dimA = dim[meta.aAxis], dimP = dim[meta.pAxis], dimQ = dim[meta.qAxis];
     const mask = new Int32Array(dimP * dimQ);
     const cell = [0, 0, 0];
@@ -148,7 +169,7 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
         for (let q = qStart; q < qEnd; q++) {
           cell[meta.aAxis] = la; cell[meta.pAxis] = p; cell[meta.qAxis] = q;
           const id = idAt(cell[0], cell[1], cell[2]);
-          mask[p * dimQ + q] = (id !== BLOCK_IDS.air && faceVisible(cell[0], cell[1], cell[2], dir)) ? id + 1 : 0;
+          mask[p * dimQ + q] = (id !== BLOCK_IDS.air && faceVisible(cell[0], cell[1], cell[2], ox, oy, oz)) ? id + 1 : 0;
         }
       }
 

@@ -11,11 +11,30 @@ const SPAWN = new Three.Vector3(0, 200, 0);
 // Scratch objects reused every frame to avoid per-frame allocations.
 const _hitInside = new Three.Vector3();
 const _hitOutside = new Three.Vector3();
-const _euler = new Three.Euler();
 const _selected = new Three.Vector3();
 
+// ---- movement tuning -------------------------------------------------------
+const SPRINT_MULT = 1.35;        // sprint speed = maxSpeed × this
+const GROUND_ACCEL = 70;         // m/s² ramp toward target speed on the ground
+const AIR_ACCEL = 26;            // limited air control (steer, don't fully redirect)
+const GROUND_FRICTION = 13;      // exponential decel coeff when stopping on the ground
+const COYOTE_TIME = 0.10;        // s after walking off an edge you can still jump
+const JUMP_BUFFER = 0.16;        // s a jump press is remembered (fires the instant you land)
+const SPRINT_JUMP_BOOST = 1.18;  // forward-speed multiplier kicked in on a sprint-jump
+const DOUBLE_TAP_MS = 280;       // double-tap-forward window to start sprinting
+const BASE_FOV = 70, SPRINT_FOV = 78;
+// move cur toward target by at most maxStep (per-substep linear acceleration).
+const approach = (cur: number, target: number, maxStep: number) => {
+  const d = target - cur;
+  return Math.abs(d) <= maxStep ? target : cur + Math.sign(d) * maxStep;
+};
+
 export class Player {
-  camera = new Three.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 200);
+  // near=0.3 (not 0.1) reclaims most of the depth buffer's precision — the
+  // hyperbolic distribution wastes ~90% of its range in the first few units —
+  // which is what lets us drop logarithmicDepthBuffer (see main.ts) without
+  // z-fighting. Kept at 0.3 (not higher) so it doesn't clip the held tool.
+  camera = new Three.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.3, 200);
   controls = new PointerLockControls(this.camera, document.body);
   boundsHelper: Three.Mesh;
 
@@ -25,11 +44,25 @@ export class Player {
   jumpSpeed = 10;
   onGround = false;
 
-  maxSpeed = 8;
+  maxSpeed = 8;   // walking speed (GUI "Speed" slider); sprint scales from this
+  // velocity is camera-local: x = strafe/right, z = forward, y = vertical. The
+  // collision system maps it to world space via #right/#fwd (the camera's own
+  // horizontal basis), so wall contacts cancel the matching component exactly.
   velocity = new Three.Vector3();
   #worldVelocity = new Three.Vector3();
+  #fwd = new Three.Vector3(0, 0, -1);   // camera horizontal forward (world), refreshed per substep
+  #right = new Three.Vector3(1, 0, 0);  // camera horizontal right  (world)
 
-  input = new Three.Vector3();
+  // movement input + state
+  #kW = false; #kS = false; #kA = false; #kD = false;  // held direction keys
+  sprintKey = false;             // sprint modifier (Shift) held
+  #doubleTapSprint = false;      // double-tap-forward sprint, sticky until forward released
+  #lastTapW = 0;
+  sprinting = false;             // resolved sprint state (drives the FOV kick)
+  #coyote = COYOTE_TIME;         // time since last grounded (coyote window)
+  #jumpBuffer = 0;               // remaining validity of a buffered jump press
+  #fov = BASE_FOV;
+
   cameraHelper = new Three.CameraHelper(this.camera);
 
   raycaster = new Three.Raycaster(undefined, undefined, 0, 4);
@@ -75,6 +108,19 @@ export class Player {
     this.updateRayCast(world)
     this.tool.update();
     this.updateHud();
+    this.#updateFov();
+  }
+
+  // Subtle FOV widen while sprinting (sense of speed). Per-frame lerp; only
+  // touches the projection matrix while actually changing.
+  #updateFov() {
+    const target = (this.sprinting && this.controls.isLocked) ? SPRINT_FOV : BASE_FOV;
+    const next = this.#fov + (target - this.#fov) * 0.18;
+    if (Math.abs(next - this.#fov) > 0.01) {
+      this.#fov = next;
+      this.camera.fov = next;
+      this.camera.updateProjectionMatrix();
+    }
   }
 
   updateRayCast(world: World) {
@@ -114,22 +160,74 @@ export class Player {
     return this.camera.position;
   }
 
+  // Camera-local velocity (x=right, z=forward, y=up) → world, using the camera's
+  // own horizontal basis. This matches how moveRight/moveForward translate the
+  // player, so a wall contact cancels exactly the component pushing into it.
   get worldVelocity() {
-    this.#worldVelocity.copy(this.velocity);
-    this.#worldVelocity.applyEuler(_euler.set(0, this.camera.rotation.y, 0));
+    this.#worldVelocity.set(0, this.velocity.y, 0)
+      .addScaledVector(this.#right, this.velocity.x)
+      .addScaledVector(this.#fwd, this.velocity.z);
     return this.#worldVelocity;
   }
 
+  // Refresh the camera's horizontal forward/right (world). Cheap; called once
+  // per physics substep before any worldVelocity read.
+  #updateBasis() {
+    this.camera.getWorldDirection(this.#fwd);
+    this.#fwd.y = 0;
+    if (this.#fwd.lengthSq() < 1e-6) return;  // looking straight up/down: keep last basis
+    this.#fwd.normalize();
+    this.#right.crossVectors(this.#fwd, this.camera.up).normalize();
+  }
+
   applyInputs(delta: number) {
+    this.#updateBasis();
     if(this.controls.isLocked) {
-      this.velocity.x = this.velocity.x;
-      this.velocity.z = this.velocity.z;
-
-      this.controls.moveRight(this.input.x * delta);
-      this.controls.moveForward(this.input.y * delta);
-
+      this.#updateMovement(delta);
+      // velocity is camera-local: x drives strafe, z drives forward, y is vertical.
+      this.controls.moveRight(this.velocity.x * delta);
+      this.controls.moveForward(this.velocity.z * delta);
       this.position.y += this.velocity.y * delta;
     }
+  }
+
+  // Per-substep horizontal acceleration with friction, sprint, limited air
+  // control, and a buffered/coyote-time jump. Gives movement momentum: you ramp
+  // up and coast down instead of snapping between full speed and a dead stop.
+  #updateMovement(delta: number) {
+    // --- jump assist: coyote time + input buffer ---
+    this.#coyote = this.onGround ? 0 : this.#coyote + delta;
+    if (this.#jumpBuffer > 0) this.#jumpBuffer -= delta;
+    if (this.#jumpBuffer > 0 && this.#coyote <= COYOTE_TIME) {
+      this.velocity.y = this.jumpSpeed;
+      this.#jumpBuffer = 0;
+      this.#coyote = COYOTE_TIME + 1;        // don't re-fire until grounded again
+      if (this.sprinting && this.velocity.z > 0) this.velocity.z *= SPRINT_JUMP_BOOST;  // sprint-jump hop
+    }
+
+    // --- wish direction (camera-local), normalized so diagonals aren't faster ---
+    let wx = (this.#kD ? 1 : 0) - (this.#kA ? 1 : 0);
+    let wf = (this.#kW ? 1 : 0) - (this.#kS ? 1 : 0);
+    const wl = Math.hypot(wx, wf);
+    if (wl > 0) { wx /= wl; wf /= wl; }
+
+    // sprint only counts while actually pushing forward
+    this.sprinting = (this.sprintKey || this.#doubleTapSprint) && wf > 0.1;
+    const speed = this.sprinting ? this.maxSpeed * SPRINT_MULT : this.maxSpeed;
+
+    if (wl > 0) {
+      const accel = (this.onGround ? GROUND_ACCEL : AIR_ACCEL) * delta;
+      this.velocity.x = approach(this.velocity.x, wx * speed, accel);
+      this.velocity.z = approach(this.velocity.z, wf * speed, accel);
+    } else if (this.onGround) {
+      // no input on the ground: friction eases to a stop (snappy, not instant)
+      const damp = Math.exp(-GROUND_FRICTION * delta);
+      this.velocity.x *= damp;
+      this.velocity.z *= damp;
+      if (Math.abs(this.velocity.x) < 0.05) this.velocity.x = 0;
+      if (Math.abs(this.velocity.z) < 0.05) this.velocity.z = 0;
+    }
+    // airborne with no input → momentum preserved (no friction): sprint-jumps glide
   }
 
   // Refresh the position HUD. Called once per rendered frame — NOT from the
@@ -174,7 +272,10 @@ export class Player {
       this.controls.lock();
     }
 
-    switch(event.key) {
+    // Letters lowercased so Shift/CapsLock combos (e.g. Shift+W while sprinting,
+    // which fires as 'W') still match; named keys like 'Shift'/' ' pass through.
+    const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+    switch(key) {
       case '0':
       case '1':
       case '2':
@@ -185,50 +286,53 @@ export class Player {
       case '7':
       case '8':
         document.getElementById(`toolbar-${this.activeBlockId}`)?.classList.remove('selected')
-        this.activeBlockId = parseInt(event.key);
+        this.activeBlockId = parseInt(key);
         document.getElementById(`toolbar-${this.activeBlockId}`)?.classList.add('selected')
         this.tool.visible = this.activeBlockId === blocks.air.id;
         break;
       case 'w':
-        this.input.y = this.maxSpeed;
+        // double-tap forward starts sprinting (sticky until forward is released)
+        if (!event.repeat) {
+          const now = performance.now();
+          if (now - this.#lastTapW < DOUBLE_TAP_MS) this.#doubleTapSprint = true;
+          this.#lastTapW = now;
+        }
+        this.#kW = true;
         break;
-      case 's':
-        this.input.y = -this.maxSpeed;
-        break;
-      case 'a':
-        this.input.x = -this.maxSpeed;
-        break;
-      case 'd':
-        this.input.x = this.maxSpeed;
-        break;
+      case 's': this.#kS = true; break;
+      case 'a': this.#kA = true; break;
+      case 'd': this.#kD = true; break;
+      case 'Shift': this.sprintKey = true; break;
       case 'r':
         this.camera.position.copy(SPAWN);
         this.velocity.set(0, 0, 0);
-        break
+        this.onGround = false;
+        this.#coyote = COYOTE_TIME + 1;
+        break;
       case ' ':
-        if(this.onGround) {
-          this.velocity.y += this.jumpSpeed;
-        }
+        // buffer the jump; #updateMovement fires it the moment it's valid (so a
+        // press a hair early, or while pressed against a block, still jumps).
+        this.#jumpBuffer = JUMP_BUFFER;
         break;
     }
   }
 
   onkeyup(event: KeyboardEvent) {
-    switch(event.key) {
-      case 'w':
-      case 's':
-        this.input.y = 0;
-        break;
-      case 'a':
-      case 'd':
-        this.input.x = 0;
-        break;
+    const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+    switch(key) {
+      case 'w': this.#kW = false; this.#doubleTapSprint = false; break;
+      case 's': this.#kS = false; break;
+      case 'a': this.#kA = false; break;
+      case 'd': this.#kD = false; break;
+      case 'Shift': this.sprintKey = false; break;
     }
   }
 
   applyWorldDeltaVelocity(dv: Three.Vector3){
-    dv.applyEuler(_euler.set(0, -this.camera.rotation.y, 0));
-    this.velocity.add(dv)
+    // world delta → camera-local (inverse of the worldVelocity getter)
+    this.velocity.x += dv.dot(this.#right);
+    this.velocity.z += dv.dot(this.#fwd);
+    this.velocity.y += dv.y;
   }
 
   toString(){

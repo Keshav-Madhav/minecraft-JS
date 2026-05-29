@@ -1,5 +1,4 @@
-import { createWorldSampler, WorldSampler, ChunkParams, ChunkSize, ColumnSurface } from './chunkGen';
-import { BLOCK_IDS } from './blockTypes';
+import { createWorldSampler, WorldSampler, ChunkParams, ChunkSize, ColumnSurface, surfaceMapColor } from './chunkGen';
 
 // Renders top-down map TILES off the main thread (the map used to sample terrain
 // on the main thread, which was very laggy). Each tile is a fixed-resolution
@@ -18,28 +17,19 @@ let sea = 64;
 const clamp = (v: number, a: number, b: number) => v < a ? a : v > b ? b : v;
 
 function colour(s: ColumnSurface, slope: number, out: Uint8ClampedArray, di: number) {
-  let r: number, g: number, b: number;
-  if (s.height <= sea) {
-    const depth = clamp((sea - s.height) / 28, 0, 1);
-    r = 38 - 18 * depth; g = 96 - 44 * depth; b = 168 - 58 * depth;   // water
+  // Colour from the ACTUAL rendered top block / water type (snow caps & rock are
+  // baked into surfaceId; grass is tinted per-biome; badlands reproduces its
+  // terracotta band; oceans/rivers/lakes return per-type water hues) → the map
+  // matches what you see in-world.
+  const mc = surfaceMapColor(s.surfaceId, s.biome, s.height, sea);
+  let r = mc[0], g = mc[1], b = mc[2];
+  if (s.height < sea) {
+    const depth = clamp((sea - s.height) / 40, 0, 1);   // darken deep water → basins read as deep
+    const f = 1 - 0.45 * depth;
+    r *= f; g *= f; b *= f;
   } else {
-    switch (s.surfaceId) {
-      case BLOCK_IDS.grass: {
-        // Plains -> forest: blend toward a darker, bluer green by forest density
-        // so wooded regions read distinctly on the map.
-        const t = s.forest;
-        r = 92 + (38 - 92) * t;
-        g = 150 + (92 - 150) * t;
-        b = 64 + (46 - 64) * t;
-        break;
-      }
-      case BLOCK_IDS.sand:  r = 214; g = 203; b = 146; break;
-      case BLOCK_IDS.snow:  r = 236; g = 240; b = 246; break;
-      case BLOCK_IDS.stone: r = 124; g = 120; b = 116; break;
-      default:              r = 120; g = 120; b = 120;
-    }
     const elev = clamp((s.height - sea) / 80, 0, 1);
-    const f = 0.82 + elev * 0.32;
+    const f = 0.92 + elev * 0.16;
     r *= f; g *= f; b *= f;
   }
   const sh = clamp(1 + slope * 0.07, 0.55, 1.45); // hillshade
