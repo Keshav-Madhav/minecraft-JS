@@ -32,6 +32,13 @@ export class Physics {
   update(delta: number, player: Player, world: World){
     this.accumulator += delta;
 
+    // If the chunk under the player hasn't streamed in yet (e.g. right after a
+    // teleport), hold position instead of falling through it into the void.
+    if(!world.isLoadedAt(player.position.x, player.position.z)){
+      this.accumulator = 0;
+      return;
+    }
+
     while(this.accumulator >= this.timeStep){
       this.helpers.clear();
       player.velocity.y -= this.gravity * this.timeStep;
@@ -93,11 +100,8 @@ export class Physics {
     for(let x = extents.x.min; x <= extents.x.max; x++){
       for(let y = extents.y.min; y <= extents.y.max; y++){
         for(let z = extents.z.min; z <= extents.z.max; z++){
-          const block = world.getBlock(x, y, z);
-          if(block && block.id !== blocks.air.id){
-            const blockPos = {x, y, z};
-            candidates.push(blockPos);
-            // this.addCollisonHelper(blockPos);
+          if(world.getBlockId(x, y, z) !== blocks.air.id){
+            candidates.push({x, y, z});
           }
         }
       }
