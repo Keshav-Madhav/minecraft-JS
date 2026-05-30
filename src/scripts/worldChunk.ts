@@ -3,7 +3,7 @@ import { Object3D } from 'three';
 import { DataStore } from './dataStore';
 import { ChunkParams, ChunkSize, blockIndex, generateChunkData } from './chunkGen';
 import { ResourceGenInfo, BLOCK_IDS } from './blockTypes';
-import { blockArrayMaterial, leafArrayMaterial, plantMaterial } from './blockArrayMaterial';
+import { blockArrayMaterial, leafArrayMaterial, plantMaterial, cutoutDepthMaterial, getFoliageShadows } from './blockArrayMaterial';
 import { buildChunkGeometry, buildChunkMapTile, scanEmitters, GeometryArrays } from './chunkMesh';
 
 // Returns the block id at a world position, or 0 (air) when unknown. Used so a
@@ -27,8 +27,10 @@ export class WorldChunk extends THREE.Group {
   // Lazily wrapped in a tiny canvas the minimap can blit directly (fast path).
   mapTile: Uint8Array | null = null;
   private mapTileCanvas: HTMLCanvasElement | null = null;
-  // The plant (foliage) mesh, tracked so the world can distance-cull it cheaply.
+  // The plant (foliage) + leaf meshes, tracked so the world can distance-cull
+  // foliage cheaply and toggle ultra cutout shadows on them.
   plantMesh: THREE.Mesh | null = null;
+  leafMesh: THREE.Mesh | null = null;
 
   constructor(size: ChunkSize, params: ChunkParams, dataStore: DataStore) {
     super();
@@ -111,12 +113,12 @@ export class WorldChunk extends THREE.Group {
     this.addGeometryMesh(casters, true, blockArrayMaterial);
     // Leaves + clouds (the "non-caster" group) use the ALPHA-TESTED leaf material
     // so the cutout holes in the leaf textures show through (transparent fancy
-    // leaves); clouds are opaque so alphaTest keeps them. Still cast shadows.
+    // leaves); clouds are opaque so alphaTest keeps them. Cast shadows (cutout in ultra).
     this.addGeometryMesh(nonCasters, true, leafArrayMaterial);
     // Foliage: alpha-tested cross billboards / carpets / vines on their own
-    // material. They don't cast shadows (cheap, and avoids shadow-acne on thin
-    // geometry) and carry a per-vertex biome tint (plantColor, vec4).
-    this.addGeometryMesh(plants, false, plantMaterial);
+    // material, biome-tinted (plantColor). They cast cutout shadows only in ultra
+    // (getFoliageShadows) — off by default to avoid shadow-acne + cost on thin geo.
+    this.addGeometryMesh(plants, getFoliageShadows(), plantMaterial);
     this.loaded = true;
   }
 
@@ -143,8 +145,27 @@ export class WorldChunk extends THREE.Group {
     mesh.userData.chunkGeometry = true;
     mesh.matrixAutoUpdate = false; // static — never moves
     mesh.updateMatrix();
-    if (material === plantMaterial) this.plantMesh = mesh;   // tracked for distance culling
+    // Alpha-tested cutout shadows (ultra) need a depth material that honours the
+    // texture alpha; assigned to the leaf + plant meshes when foliage shadows are on.
+    if (material === plantMaterial) {
+      this.plantMesh = mesh;   // tracked for distance culling
+      if (castShadow) mesh.customDepthMaterial = cutoutDepthMaterial;
+    } else if (material === leafArrayMaterial) {
+      this.leafMesh = mesh;
+      if (getFoliageShadows()) mesh.customDepthMaterial = cutoutDepthMaterial;
+    }
     this.add(mesh);
+  }
+
+  // Toggle ultra foliage shadows on this chunk's existing meshes (no rebuild).
+  applyFoliageShadows(on: boolean) {
+    if (this.plantMesh) {
+      this.plantMesh.castShadow = on;
+      this.plantMesh.customDepthMaterial = on ? cutoutDepthMaterial : (undefined as unknown as THREE.Material);
+    }
+    if (this.leafMesh) {
+      this.leafMesh.customDepthMaterial = on ? cutoutDepthMaterial : (undefined as unknown as THREE.Material);
+    }
   }
 
   getBlockId(x: number, y: number, z: number) {
@@ -209,6 +230,7 @@ export class WorldChunk extends THREE.Group {
     this.disposeMeshGeometries();
     this.clear();
     this.plantMesh = null;
+    this.leafMesh = null;
     this.loaded = false;
   }
 

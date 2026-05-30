@@ -249,8 +249,23 @@ const arrayTexture = createArrayTexture();
 // Shared shader injection for the cube materials: sample the array texture by a
 // per-vertex layer index (textureGrad with un-fract'd derivatives → clean tiling
 // on greedy-merged quads) and multiply by the baked per-vertex biome tint.
+// Shared uniforms for the cube/leaf shaders, updated each frame: uTime drives the
+// caustic ripple, uCaustics/uSea gate fake underwater caustics (ultra graphics).
+const cubeShaders: THREE.WebGLProgramParametersWithUniforms[] = [];
+export function updateCubeUniforms(timeSeconds: number, sea: number, caustics: boolean) {
+  for (const s of cubeShaders) {
+    if (s.uniforms.uTime) s.uniforms.uTime.value = timeSeconds;
+    if (s.uniforms.uSea) s.uniforms.uSea.value = sea;
+    if (s.uniforms.uCaustics) s.uniforms.uCaustics.value = caustics ? 1 : 0;
+  }
+}
+
 function injectCubeShader(shader: THREE.WebGLProgramParametersWithUniforms) {
   shader.uniforms.uArray = { value: arrayTexture };
+  shader.uniforms.uTime = { value: 0 };
+  shader.uniforms.uSea = { value: 128 };
+  shader.uniforms.uCaustics = { value: 0 };
+  cubeShaders.push(shader);
   shader.vertexShader = shader.vertexShader
     .replace('#include <common>', /* glsl */`
       #include <common>
@@ -261,6 +276,7 @@ function injectCubeShader(shader: THREE.WebGLProgramParametersWithUniforms) {
       varying float vLayer;
       varying vec3 vTintCol;
       varying float vEmis;
+      varying vec3 vWorldPos;
     `)
     .replace('#include <begin_vertex>', /* glsl */`
       #include <begin_vertex>
@@ -268,15 +284,20 @@ function injectCubeShader(shader: THREE.WebGLProgramParametersWithUniforms) {
       vLayer = layerIndex;
       vTintCol = tintColor.rgb;
       vEmis = tintColor.a;
+      vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
     `);
   shader.fragmentShader = shader.fragmentShader
     .replace('#include <common>', /* glsl */`
       #include <common>
       uniform sampler2DArray uArray;
+      uniform float uTime;
+      uniform float uSea;
+      uniform float uCaustics;
       varying vec2 vTileUv;
       varying float vLayer;
       varying vec3 vTintCol;
       varying float vEmis;
+      varying vec3 vWorldPos;
     `)
     .replace('#include <map_fragment>', /* glsl */`
       // Flip V: DataArrayTexture stores image rows top-to-bottom, but world V
@@ -291,9 +312,21 @@ function injectCubeShader(shader: THREE.WebGLProgramParametersWithUniforms) {
     `)
     // Emitter blocks (torch/lantern/glowstone/…) glow their own texture colour
     // regardless of scene light — vEmis (=tintColor.a) is 0 for normal blocks.
+    // ULTRA: fake caustics — rippling refracted-sunlight bands added to submerged
+    // surfaces (terrain/seabed below sea level), strongest near the surface.
     .replace('#include <emissivemap_fragment>', /* glsl */`
       #include <emissivemap_fragment>
       totalEmissiveRadiance += texel.rgb * vEmis;
+      if (uCaustics > 0.5 && vWorldPos.y < uSea) {
+        vec2 cp = vWorldPos.xz * 0.35;
+        float t = uTime * 0.7;
+        float c = sin(cp.x * 1.7 + t) * sin(cp.y * 1.5 - t * 1.1)
+                + sin((cp.x + cp.y) * 1.1 + t * 1.3) * 0.7
+                + sin((cp.x - cp.y) * 2.3 - t * 0.6) * 0.5;
+        c = pow(max(c * 0.35 + 0.5, 0.0), 4.0);
+        float fade = clamp((uSea - vWorldPos.y) / 22.0, 0.0, 1.0);   // 0 at surface → 1 deep
+        totalEmissiveRadiance += vec3(0.45, 0.8, 1.0) * c * 0.6 * (1.0 - fade);
+      }
     `);
 }
 
@@ -394,6 +427,31 @@ plantMaterial.onBeforeCompile = (shader) => {
 export function updatePlantWind(timeSeconds: number) {
   if (plantShader) plantShader.uniforms.uTime.value = timeSeconds;
 }
+
+// ---------------------------------------------------------------------------
+//  ULTRA shadows: a custom DEPTH material for the leaf + plant meshes that honours
+//  the texture's ALPHA — so the sun's shadow map carries the cutout HOLES, giving
+//  dappled leaf shadows and real grass/flower silhouettes instead of solid blobs.
+//  Assigned as `mesh.customDepthMaterial` only in ultra (see WorldChunk). DoubleSide
+//  so a single-winding billboard still casts from both faces.
+// ---------------------------------------------------------------------------
+export const cutoutDepthMaterial = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+cutoutDepthMaterial.side = THREE.DoubleSide;
+cutoutDepthMaterial.onBeforeCompile = (shader) => {
+  shader.uniforms.uArray = { value: arrayTexture };
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nattribute vec2 tileUv;\nattribute float layerIndex;\nvarying vec2 vTileUv;\nvarying float vLayer;')
+    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvTileUv = tileUv;\nvLayer = layerIndex;');
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', '#include <common>\nuniform sampler2DArray uArray;\nvarying vec2 vTileUv;\nvarying float vLayer;')
+    .replace('#include <clipping_planes_fragment>', '#include <clipping_planes_fragment>\nvec2 _auv = fract(vTileUv); _auv.y = 1.0 - _auv.y;\nif (textureGrad(uArray, vec3(_auv, vLayer), dFdx(vTileUv), dFdy(vTileUv)).a < 0.5) discard;');
+};
+
+// Whether foliage (plants) cast shadows + leaves cast cutout shadows. Toggled by
+// the ultra-graphics setting; WorldChunk reads it when (re)building chunk meshes.
+let _foliageShadows = false;
+export function setFoliageShadows(v: boolean) { _foliageShadows = v; }
+export function getFoliageShadows() { return _foliageShadows; }
 
 // ---------------------------------------------------------------------------
 //  DEV-ONLY texture toggle — swap the live DataArrayTexture between OUR textures

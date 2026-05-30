@@ -223,12 +223,28 @@ export const BIOME = {
   // temperature-typed oceans (ocean=0 is the normal/temperate one)
   frozenOcean: 19, coldOcean: 20, lukewarmOcean: 21, warmOcean: 22,
   iceSpikes: 23,   // rare very-cold special: snow surface studded with packed-ice spires
+  // --- expansion: distinct-wood forests + varied vegetation (existing wood palette) ---
+  jungle: 24,        // hot+wet: tall jungle trees (some giant), vines, dense ferns
+  darkForest: 25,    // temperate+wet: thick 2×2 dark-oak, dim, mushrooms + roses
+  birchForest: 26,   // temperate: slender birch, tall grass, alliums
+  flowerForest: 27,  // weird forest variant: oak/birch + dense mixed flowers
+  meadow: 28,        // cool grassland: flowers + tall grass, very sparse trees
+  redwoodForest: 29, // cold+wet old-growth: GIANT spruce (redwood) + spruce, podzol floor
+  mangroveSwamp: 30, // warm swamp: mangrove trees with prop roots
 } as const;
 
 type SurfCtx = { aboveSea: number, tempEff: number, humid: number, erosion: number, wx: number, wz: number };
 type Tint = { sky: number, ground: number, clear: number, bright: number };
 // Declarative feature recipe — generateFeatures reads this; no per-biome code.
-type FeatureSpec = { oak?: number, cactus?: number, cherry?: number, giantMushroom?: number, swampOak?: number, iceSpike?: number };
+// Each tree key maps to a distinct generator (conical spruce, giant redwood,
+// jungle, 2×2 dark-oak, slanted acacia, slender birch, mangrove-on-stilts).
+type FeatureSpec = {
+  oak?: number, cactus?: number, cherry?: number, giantMushroom?: number, swampOak?: number, iceSpike?: number,
+  spruce?: number, redwood?: number, jungleTree?: number, darkOak?: number, acacia?: number, birch?: number, mangrove?: number,
+  // decorations (ground scatter) — bushes, fallen logs, mossy boulders, dark-forest huge mushrooms
+  bush?: number, fallenLog?: number, boulder?: number, hugeMushroom?: number,
+  flowers?: number,   // dense-flower flag (0..1) read by the foliage pass for this biome
+};
 
 type BiomeDef = {
   name: string,
@@ -286,20 +302,20 @@ BIOMES[BIOME.coldPlains] = {
   mapColor: [150, 170, 120], tint: { sky: 0xc6d6ec, ground: 0x6a7558, clear: 0x9fb6da, bright: 1.05 },
 };
 BIOMES[BIOME.taiga] = {
-  // grass with smooth podzol patches (applied as a noise overlay in columnSurface).
-  name: 'taiga', surface: grassSurf, features: { oak: 0.5 },
+  // pine forest: conical spruce trees, grass with smooth podzol patches.
+  name: 'taiga', surface: grassSurf, features: { spruce: 0.5, boulder: 0.02, fallenLog: 0.02 },
   mapColor: [70, 96, 68], tint: { sky: 0xaec6dc, ground: 0x3f4f38, clear: 0x86a2c2, bright: 0.94 },
 };
 BIOMES[BIOME.plains] = {
-  name: 'plains', surface: grassSurf, features: { oak: 0.12 },
+  name: 'plains', surface: grassSurf, features: { oak: 0.1, bush: 0.04 },
   mapColor: [120, 154, 80], tint: { sky: 0xbcd6ff, ground: 0x4d4233, clear: 0x80a0e0, bright: 1.0 },
 };
 BIOMES[BIOME.forest] = {
-  name: 'forest', surface: grassSurf, features: { oak: 0.6 },
+  name: 'forest', surface: grassSurf, features: { oak: 0.6, bush: 0.05, fallenLog: 0.02 },
   mapColor: [56, 96, 54], tint: { sky: 0xb0cdea, ground: 0x35452a, clear: 0x7796c4, bright: 0.9 },
 };
 BIOMES[BIOME.savanna] = {
-  name: 'savanna', surface: grassSurf, features: { oak: 0.05, cactus: 0.02 },
+  name: 'savanna', surface: grassSurf, features: { acacia: 0.07, cactus: 0.02 },
   mapColor: [170, 158, 96], tint: { sky: 0xe6e0bc, ground: 0x8a7a40, clear: 0xc4c29a, bright: 1.08 },
 };
 BIOMES[BIOME.scrub] = {
@@ -316,7 +332,7 @@ BIOMES[BIOME.desert] = {
   mapColor: [214, 203, 146], tint: { sky: 0xffe7c2, ground: 0xb59055, clear: 0xcdc6ac, bright: 1.08 },
 };
 BIOMES[BIOME.warmForest] = {
-  name: 'warmForest', surface: grassSurf, features: { oak: 0.6 },
+  name: 'warmForest', surface: grassSurf, features: { oak: 0.55, bush: 0.06 },
   mapColor: [60, 110, 72], tint: { sky: 0xb6d2c0, ground: 0x2e4226, clear: 0x84aa8c, bright: 0.95 },
 };
 BIOMES[BIOME.badlands] = {
@@ -389,6 +405,47 @@ BIOMES[BIOME.iceSpikes] = {
   name: 'iceSpikes', surface: snowSurf, features: { iceSpike: 0.6 },
   mapColor: [200, 220, 240], tint: { sky: 0xd6e8ff, ground: 0xa6bad6, clear: 0xcfe4fb, bright: 1.24 },
 };
+// --- expansion biomes (distinct wood + vegetation; selected by the grid/gates) ---
+BIOMES[BIOME.jungle] = {
+  // dense canopy: tall jungle trees (some giant 2×2) + leafy bushes + vines + ferns.
+  name: 'jungle', surface: grassSurf, features: { jungleTree: 0.82, bush: 0.12 },
+  mapColor: [44, 110, 40], tint: { sky: 0xb8d8b0, ground: 0x274d22, clear: 0x86b48c, bright: 0.9 },
+};
+BIOMES[BIOME.darkForest] = {
+  // roofed forest: very dense 2×2 dark-oak (overlapping canopies) + huge mushrooms,
+  // bushes, fallen logs; mushroom + rose-bush + leaf-litter floor (foliage pass).
+  name: 'darkForest', surface: grassSurf, features: { darkOak: 0.86, hugeMushroom: 0.04, bush: 0.05, fallenLog: 0.03 },
+  mapColor: [40, 74, 38], tint: { sky: 0xa6bcc4, ground: 0x283820, clear: 0x6e8478, bright: 0.8 },
+};
+BIOMES[BIOME.birchForest] = {
+  name: 'birchForest', surface: grassSurf, features: { birch: 0.55, bush: 0.05, fallenLog: 0.02, flowers: 0.04 },
+  mapColor: [104, 148, 78], tint: { sky: 0xc8dce6, ground: 0x4a5a36, clear: 0x9fb6c8, bright: 0.98 },
+};
+BIOMES[BIOME.flowerForest] = {
+  // wooded WITH flowers — denser tree cover than before so it reads as a forest,
+  // not just a flowery field (the foliage pass lays the dense flower patches).
+  name: 'flowerForest', surface: grassSurf, features: { oak: 0.22, birch: 0.14, bush: 0.06, flowers: 0.42 },
+  mapColor: [96, 150, 72], tint: { sky: 0xc6dcf0, ground: 0x44542e, clear: 0x96b6dc, bright: 1.0 },
+};
+BIOMES[BIOME.meadow] = {
+  // open grassland: very rare lone tree, wildflower gradients (foliage pass).
+  name: 'meadow', surface: grassSurf, features: { oak: 0.012, bush: 0.02, flowers: 0.22 },
+  mapColor: [128, 172, 96], tint: { sky: 0xc8e0f4, ground: 0x5a6a3e, clear: 0x9ec0e8, bright: 1.06 },
+};
+BIOMES[BIOME.redwoodForest] = {
+  // old-growth: giant spruce (redwood) + regular spruce over a podzol floor, with
+  // mossy-cobble boulders + fallen logs. One feature per cell, but the cumulative
+  // dispatch means BOTH redwood (0.3) and spruce (0.42) appear across the biome at
+  // their declared rates (the old elif-chain starved the second one).
+  name: 'redwoodForest', surface: grassSurf, features: { redwood: 0.3, spruce: 0.42, boulder: 0.05, fallenLog: 0.04 },
+  mapColor: [62, 84, 54], tint: { sky: 0xa4c0c0, ground: 0x2c3a28, clear: 0x7a9690, bright: 0.86 },
+};
+BIOMES[BIOME.mangroveSwamp] = {
+  name: 'mangroveSwamp',
+  surface: (c) => hash01(c.wx, c.wz) < 0.4 ? { surfaceId: BLOCK_IDS.mud, subId: BLOCK_IDS.dirt } : grassSurf(),
+  features: { mangrove: 0.5, bush: 0.05 },
+  mapColor: [70, 102, 74], tint: { sky: 0x9fb89a, ground: 0x35422c, clear: 0x6e8268, bright: 0.86 },
+};
 
 // --- Minecraft-style discrete climate grid -------------------------------
 // Bucket temperature & humidity into 5 levels each (verbatim MC 1.18 boundaries)
@@ -416,16 +473,17 @@ const BORDER_DITHER = 0.022;
 const SHELL_DITHER = 0.03;
 
 const _S = BIOME;
-// MIDDLE[tempLevel][humidLevel] → biome id. Cold→snowy/taiga, temperate→plains/
-// forest, warm→savanna/forest, hot-dry→desert (overridden by the badlands nest),
-// hot-wet→warmForest (our jungle substitute). MC dark-forest/birch/jungle/mangrove
-// are folded into forest/warmForest (no palette for distinct wood).
+// MIDDLE[tempLevel][humidLevel] → biome id. Now uses the full wood palette for
+// distinct forests: cold→snowy/taiga(spruce)/redwoodForest(giant spruce);
+// cool/temperate→meadow/birchForest/forest/darkForest(dark-oak); warm→savanna
+// (acacia)/warmForest/jungle; hot→desert/jungle. Weird flips add flowerForest
+// (rare) and meadow variants; the swamp gate splits cold→swamp / warm→mangrove.
 const MIDDLE: number[][] = [
-  /*T0 cold */ [_S.snowy,      _S.snowy,      _S.snowy,  _S.taiga,      _S.taiga],
-  /*T1      */ [_S.coldPlains, _S.coldPlains, _S.forest, _S.taiga,      _S.taiga],
-  /*T2 temp */ [_S.plains,     _S.plains,     _S.forest, _S.forest,     _S.forest],
-  /*T3 warm */ [_S.savanna,    _S.savanna,    _S.plains, _S.warmForest, _S.warmForest],
-  /*T4 hot  */ [_S.desert,     _S.desert,     _S.desert, _S.desert,     _S.warmForest],
+  /*T0 cold */ [_S.snowy,      _S.snowy,   _S.snowy,       _S.taiga,      _S.redwoodForest],
+  /*T1      */ [_S.coldPlains, _S.meadow,  _S.birchForest, _S.taiga,      _S.redwoodForest],
+  /*T2 temp */ [_S.plains,     _S.meadow,  _S.birchForest, _S.forest,     _S.darkForest],
+  /*T3 warm */ [_S.savanna,    _S.savanna, _S.plains,      _S.warmForest, _S.jungle],
+  /*T4 hot  */ [_S.desert,     _S.desert,  _S.savanna,     _S.jungle,     _S.jungle],
 ];
 
 // Ocean biome by temperature level (reuses tempLevel — MC types oceans by the
@@ -435,9 +493,10 @@ const OCEAN_BY_LEVEL = [BIOME.frozenOcean, BIOME.coldOcean, BIOME.ocean, BIOME.l
 function selectClimate(temp: number, humid: number, weird: number): number {
   const tl = tempLevel(temp), hl = humidLevel(humid);
   let id = MIDDLE[tl][hl];
-  // Weirdness-sign variants where MC's grid differs by it.
-  if ((tl === 2 || tl === 3) && hl === 2) id = weird < 0 ? _S.forest : _S.plains;
-  if (tl === 4 && hl === 3) id = weird < 0 ? _S.desert : _S.warmForest;
+  // Weirdness variants for extra variety (rare positive-weird tail, ~top 13%):
+  // a forest/birch becomes a flower-forest; flat plains occasionally a meadow.
+  if ((id === _S.forest || id === _S.birchForest) && weird > 0.5) id = _S.flowerForest;
+  else if (id === _S.plains && weird > 0.58) id = _S.meadow;
   // Desert edge feather → scrub (sand↔grass dither) so desert dissolves into
   // grassland rather than hard-cutting. A THIN fringe only: just inside the cool
   // (T4 starts 0.40) or wet (H2 top 0.10) edge — NOT the cell interior.
@@ -470,6 +529,11 @@ const GRASS_TINT: Record<number, readonly [number, number, number]> = {
   [BIOME.forest]: [56, 96, 54], [BIOME.warmForest]: [60, 110, 72],
   [BIOME.taiga]: [70, 96, 68], [BIOME.savanna]: [170, 158, 96],
   [BIOME.scrub]: [150, 160, 96], [BIOME.cherry]: [196, 150, 186], [BIOME.swamp]: [90, 116, 86],
+  // expansion biomes
+  [BIOME.jungle]: [44, 122, 40], [BIOME.darkForest]: [40, 78, 38],
+  [BIOME.birchForest]: [108, 152, 78], [BIOME.flowerForest]: [96, 150, 72],
+  [BIOME.meadow]: [128, 172, 96], [BIOME.redwoodForest]: [62, 88, 54],
+  [BIOME.mangroveSwamp]: [78, 110, 78],
 };
 // Per-biome grass tint for FOLIAGE, normalised to 0..1 (and lifted a touch so the
 // near-grayscale plant textures read as lush vegetation that matches the ground,
@@ -781,7 +845,7 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   // via the snow/rock overlay below, not a biome reassignment).
   let biome: number;
   if (islandMem > 0.3 && aboveSea > -10) biome = BIOME.mushroom;
-  else if (swampMem > 0.5) biome = BIOME.swamp;
+  else if (swampMem > 0.5) biome = c.temp > 0.20 ? BIOME.mangroveSwamp : BIOME.swamp;   // warm swamp → mangrove
   // Badlands shells only ABOVE sea — so a river/coast that carved one of these
   // columns below sea reads as water, not red sand bleeding into the river/ocean.
   else if (badlandsMem > 0.5 && aboveSea > 0) biome = BIOME.badlands;
@@ -815,17 +879,20 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   // killing the old grass-vs-stone seam. Keyed on ABSOLUTE height so caps survive
   // any climate; tempEff lets cold regions get snow lower down (a wavy snowline).
   const coloured = biome === BIOME.badlands || biome === BIOME.redDesert
-    || biome === BIOME.mushroom || biome === BIOME.swamp;
+    || biome === BIOME.mushroom || biome === BIOME.swamp || biome === BIOME.mangroveSwamp;
   if (!coloured && biome !== BIOME.ocean && biome !== BIOME.beach) {
     if (aboveSea > 48) { surfaceId = BLOCK_IDS.stone; subId = BLOCK_IDS.stone; }   // exposed rock
     if (aboveSea > 66 || tempEff < -0.46) surfaceId = BLOCK_IDS.snow;             // alpine / frozen cap
   }
 
   // Taiga floor: smooth podzol patches (low-freq noise — coherent blobs, not the
-  // per-column speckle the old hash dither produced).
-  if (biome === BIOME.taiga && surfaceId === BLOCK_IDS.grass
-      && fbm(simplex, wx + 8800, wz + 8800, 18, 2) > 0.34) {
-    surfaceId = BLOCK_IDS.podzol; subId = BLOCK_IDS.dirt;
+  // per-column speckle the old hash dither produced). The old-growth redwood
+  // forest is mostly podzol (lower threshold → near-full coverage).
+  if (surfaceId === BLOCK_IDS.grass) {
+    const pf = fbm(simplex, wx + 8800, wz + 8800, 18, 2);
+    if ((biome === BIOME.taiga && pf > 0.34) || (biome === BIOME.redwoodForest && pf > -0.15)) {
+      surfaceId = BLOCK_IDS.podzol; subId = BLOCK_IDS.dirt;
+    }
   }
   // Seabed / riverbed variety: break the sandy/rocky bed up with clay, gravel,
   // dirt and exposed stone patches (low-freq noise). Underwater only.
@@ -944,6 +1011,10 @@ const SWAMP_ROOT = [BLOCK_IDS.mud, BLOCK_IDS.grass] as const;
 const SANDY_ROOT = [BLOCK_IDS.sand, BLOCK_IDS.redSand] as const;
 const MYC_ROOT = [BLOCK_IDS.mycelium] as const;
 const SNOW_ROOT = [BLOCK_IDS.snow] as const;
+// spruce / redwood floor — INCLUDES snow + dirt so cold (snow-capped) taiga still
+// grows its spruce forest instead of being bald (snow overlay replaces the grass).
+const CONIFER_ROOT = [BLOCK_IDS.grass, BLOCK_IDS.podzol, BLOCK_IDS.snow, BLOCK_IDS.dirt] as const;
+const MANGROVE_ROOT = [BLOCK_IDS.mud, BLOCK_IDS.grass, BLOCK_IDS.dirt] as const;
 
 function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number, get: GetFn, set: SetFn) {
   const surfaceYOf = (x: number, z: number, roots: readonly number[]): number => {
@@ -989,8 +1060,8 @@ function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, 
     const h = 2 + Math.floor(rng.random() * 3);
     for (let i = 1; i <= h; i++) { if (get(x, y0 + i, z) !== BLOCK_IDS.air) break; set(x, y0 + i, z, BLOCK_IDS.cactus); }
   };
-  const buildGiantMushroom = (x: number, z: number) => {
-    const y0 = surfaceYOf(x, z, MYC_ROOT);
+  const buildGiantMushroom = (x: number, z: number, roots: readonly number[] = MYC_ROOT) => {
+    const y0 = surfaceYOf(x, z, roots);
     if (y0 < 0) return;
     const h = 4 + Math.floor(rng.random() * 3);
     for (let i = 1; i <= h; i++) set(x, y0 + i, z, BLOCK_IDS.mushroomStem);
@@ -1023,8 +1094,192 @@ function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, 
     }
   };
 
+  // --- distinct tree shapes (use the existing biome wood palette) -----------
+  // Conical conifer: straight trunk + diamond leaf rings widening downward from a
+  // pointed tip → reads as a pine/spruce, not a round oak blob.
+  const conifer = (x: number, z: number, roots: readonly number[], logId: number, leafId: number, minH: number, maxH: number) => {
+    const y0 = surfaceYOf(x, z, roots);
+    if (y0 < 0) return;
+    const h = Math.round(minH + (maxH - minH) * rng.random());
+    for (let ty = y0 + 1; ty <= y0 + h; ty++) set(x, ty, z, logId);
+    const top = y0 + h;
+    let ring = 0;
+    for (let ty = top + 1; ty >= y0 + Math.floor(h * 0.45); ty--) {
+      const r = Math.min(3, Math.floor(ring / 2));
+      for (let i = -r; i <= r; i++) for (let k = -r; k <= r; k++) {
+        if (Math.abs(i) + Math.abs(k) > r) continue;                 // diamond ring
+        setIfAir(x + i, ty, z + k, leafId);
+      }
+      ring++;
+    }
+  };
+  const spruce = (x: number, z: number) => conifer(x, z, CONIFER_ROOT, BLOCK_IDS.spruceLog, BLOCK_IDS.spruceLeaves, 6, 11);
+
+  // GIANT redwood: 2×2 spruce trunk, podzol skirt, big conical crown. The
+  // centrepiece of the redwood forest.
+  const redwood = (x: number, z: number) => {
+    // No room for the 2×2 trunk + radius-4 crown near a chunk edge → plant a regular
+    // spruce instead, so borders stay forested without a half-clipped giant crown.
+    if (x < 4 || x > size.width - 6 || z < 4 || z > size.width - 6) { spruce(x, z); return; }
+    const y0 = surfaceYOf(x, z, CONIFER_ROOT);
+    if (y0 < 0) return;
+    const h = 14 + Math.floor(rng.random() * 11);                    // 14..24 tall
+    const QUAD = [[0, 0], [1, 0], [0, 1], [1, 1]] as const;
+    for (let ty = y0 + 1; ty <= y0 + h; ty++) for (const [dx, dz] of QUAD) set(x + dx, ty, z + dz, BLOCK_IDS.spruceLog);
+    for (let i = -2; i <= 3; i++) for (let k = -2; k <= 3; k++) {     // podzol skirt at the roots
+      const py = surfaceYOf(x + i, z + k, CONIFER_ROOT);
+      if (py >= 0 && get(x + i, py, z + k) === BLOCK_IDS.grass) set(x + i, py, z + k, BLOCK_IDS.podzol);
+    }
+    const top = y0 + h;
+    let ring = 0;
+    for (let ty = top + 2; ty >= y0 + Math.floor(h * 0.5); ty--) {    // conical crown on the 2×2
+      const r = Math.min(4, 1 + Math.floor(ring / 2));
+      for (let i = -r; i <= r + 1; i++) for (let k = -r; k <= r + 1; k++) {
+        const di = Math.min(Math.abs(i), Math.abs(i - 1)), dk = Math.min(Math.abs(k), Math.abs(k - 1));
+        if (di + dk > r) continue;
+        setIfAir(x + i, ty, z + k, BLOCK_IDS.spruceLeaves);
+      }
+      ring++;
+    }
+  };
+
+  // Jungle: tall vine-draped trees, ~18% giant 2×2 with a layered crown. The giant
+  // form only spawns with room for its big crown (else a small jungle tree fills
+  // the spot) so chunk-edge crowns aren't clipped to a flat half.
+  const jungleTree = (x: number, z: number) => {
+    const giant = rng.random() < 0.18;   // always drawn (keeps the rng sequence stable)
+    const canGiant = x >= 4 && x <= size.width - 6 && z >= 4 && z <= size.width - 6;
+    if (giant && canGiant) {
+      const y0 = surfaceYOf(x, z, GRASS_ROOT);
+      if (y0 < 0) return;
+      const h = 12 + Math.floor(rng.random() * 8);                   // 12..19
+      const QUAD = [[0, 0], [1, 0], [0, 1], [1, 1]] as const;
+      for (let ty = y0 + 1; ty <= y0 + h; ty++) for (const [dx, dz] of QUAD) set(x + dx, ty, z + dz, BLOCK_IDS.jungleLog);
+      buildCanopy(x, y0 + h + 1, z, 4, 0.7, BLOCK_IDS.jungleLeaves);
+      buildCanopy(x + 1, y0 + h - 1, z + 1, 3, 0.6, BLOCK_IDS.jungleLeaves);
+      for (const [dx, dz] of [[-1, 0], [2, 1], [1, -1], [0, 2]] as const) {     // vines off the trunk faces
+        const len = 3 + Math.floor(rng.random() * Math.max(1, h - 4));
+        for (let i = 0; i < len; i++) { const ty = y0 + h - 2 - i; if (ty <= y0) break; setIfAir(x + dx, ty, z + dz, BLOCK_IDS.vine); }
+      }
+    } else {
+      buildTree(x, z, GRASS_ROOT, BLOCK_IDS.jungleLog, BLOCK_IDS.jungleLeaves, 8, 14, 2, 3, 0.62, 0.6);
+    }
+  };
+
+  // Dark oak: thick 2×2 trunk + a wide, flat 2-thick canopy (dim roofed forest).
+  const darkOak = (x: number, z: number) => {
+    const y0 = surfaceYOf(x, z, GRASS_ROOT);
+    if (y0 < 0) return;
+    const h = 5 + Math.floor(rng.random() * 4);                      // 5..8
+    const QUAD = [[0, 0], [1, 0], [0, 1], [1, 1]] as const;
+    for (let ty = y0 + 1; ty <= y0 + h; ty++) for (const [dx, dz] of QUAD) set(x + dx, ty, z + dz, BLOCK_IDS.darkOakLog);
+    for (let layer = 0; layer < 2; layer++) {
+      const r = layer === 0 ? 3 : 2, cy = y0 + h + layer;
+      for (let i = -r; i <= r + 1; i++) for (let k = -r; k <= r + 1; k++) {
+        const di = Math.min(Math.abs(i), Math.abs(i - 1)), dk = Math.min(Math.abs(k), Math.abs(k - 1));
+        if (di * di + dk * dk > (r + 0.5) * (r + 0.5)) continue;
+        setIfAir(x + i, cy, z + k, BLOCK_IDS.darkOakLeaves);
+      }
+    }
+  };
+
+  // Acacia: a short trunk that kinks diagonally, topped by a flat umbrella canopy.
+  const acacia = (x: number, z: number) => {
+    const y0 = surfaceYOf(x, z, GRASS_ROOT);
+    if (y0 < 0) return;
+    const lower = 2 + Math.floor(rng.random() * 2);                  // 2..3 straight
+    let cx = x, cz = z, ty = y0 + 1;
+    for (let i = 0; i < lower; i++, ty++) set(cx, ty, cz, BLOCK_IDS.acaciaLog);
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
+    const [dx, dz] = dirs[Math.floor(rng.random() * 4)];
+    const slant = 2 + Math.floor(rng.random() * 2);
+    // Walk the kink, but stop before the canopy anchor would leave the chunk —
+    // otherwise the trunk-top + its whole umbrella fell out of bounds (no canopy).
+    for (let i = 0; i < slant; i++) {
+      const nx = cx + dx, nz = cz + dz;
+      if (nx < 3 || nx > size.width - 4 || nz < 3 || nz > size.width - 4) break;
+      cx = nx; cz = nz; set(cx, ty, cz, BLOCK_IDS.acaciaLog); ty++;
+    }
+    for (let i = -3; i <= 3; i++) for (let k = -3; k <= 3; k++) {     // flat umbrella
+      const d2 = i * i + k * k;
+      if (d2 > 9) continue;
+      setIfAir(cx + i, ty, cz + k, BLOCK_IDS.acaciaLeaves);
+      if (d2 <= 4) setIfAir(cx + i, ty - 1, cz + k, BLOCK_IDS.acaciaLeaves);
+    }
+  };
+  const birch = (x: number, z: number) => buildTree(x, z, GRASS_ROOT, BLOCK_IDS.birchLog, BLOCK_IDS.birchLeaves, 6, 9, 2, 3, 0.7);
+
+  // Mangrove: trunk RAISED on splaying prop-roots (you can walk under it), with a
+  // round canopy and hanging vines/propagules — for warm swamps.
+  const mangrove = (x: number, z: number) => {
+    const y0 = surfaceYOf(x, z, MANGROVE_ROOT);
+    if (y0 < 0) return;
+    const LIFT = 2;                                                  // trunk lifted onto stilts
+    // 4 arching prop-roots: ground (y0) → up to the raised trunk base (y0+LIFT).
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+      setIfAir(x + dx, y0, z + dz, BLOCK_IDS.mangroveLog);
+      setIfAir(x + dx, y0 + 1, z + dz, BLOCK_IDS.mangroveLog);
+      setIfAir(x + dx, y0 + LIFT, z + dz, BLOCK_IDS.mangroveLog);    // ties into the trunk base
+    }
+    const h = 6 + Math.floor(rng.random() * 5);                      // 6..10 above the lift
+    for (let ty = y0 + LIFT; ty <= y0 + LIFT + h; ty++) set(x, ty, z, BLOCK_IDS.mangroveLog);
+    const top = y0 + LIFT + h;
+    buildCanopy(x, top, z, 3, 0.72, BLOCK_IDS.mangroveLeaves);
+    // hanging propagules/vines from the canopy underside + trunk
+    for (const [dx, dz] of [[2, 0], [-2, 0], [0, 2], [0, -2], [1, 1], [-1, -1]] as const) {
+      if (rng.random() > 0.55) continue;
+      const len = 2 + Math.floor(rng.random() * 4);
+      for (let i = 0; i < len; i++) { const ty = top - 1 - i; if (ty <= y0 + LIFT) break; setIfAir(x + dx, ty, z + dz, BLOCK_IDS.vine); }
+    }
+  };
+
+  // --- ground decorations (bushes, fallen logs, mossy boulders) -------------
+  const DECO_ROOT = [BLOCK_IDS.grass, BLOCK_IDS.podzol, BLOCK_IDS.dirt, BLOCK_IDS.mud] as const;
+  const ROCK_ROOT = [BLOCK_IDS.grass, BLOCK_IDS.podzol, BLOCK_IDS.dirt, BLOCK_IDS.stone, BLOCK_IDS.gravel] as const;
+
+  // Small leafy bush: a low dome of (biome-tinted) leaves, no trunk.
+  const bush = (x: number, z: number, leafId: number) => {
+    const y0 = surfaceYOf(x, z, DECO_ROOT);
+    if (y0 < 0) return;
+    setIfAir(x, y0 + 1, z, leafId);
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const)
+      if (rng.random() < 0.7) setIfAir(x + dx, y0 + 1, z + dz, leafId);
+    if (rng.random() < 0.45) setIfAir(x, y0 + 2, z, leafId);
+  };
+
+  // Fallen log: upright stump + a short horizontal trunk on the ground, sometimes
+  // mossed with small mushrooms. Each segment follows its own surface height.
+  const fallenLog = (x: number, z: number, logId: number) => {
+    const y0 = surfaceYOf(x, z, DECO_ROOT);
+    if (y0 < 0) return;
+    setIfAir(x, y0 + 1, z, logId);                                   // stump
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
+    const [dx, dz] = dirs[Math.floor(rng.random() * 4)];
+    const len = 3 + Math.floor(rng.random() * 3);                    // 3..5
+    for (let i = 1; i <= len; i++) {
+      const lx = x + dx * i, lz = z + dz * i;
+      const ly = surfaceYOf(lx, lz, DECO_ROOT);
+      if (ly < 0) break;
+      setIfAir(lx, ly + 1, lz, logId);
+      if (rng.random() < 0.22) setIfAir(lx, ly + 2, lz, rng.random() < 0.5 ? BLOCK_IDS.smallMushroomRed : BLOCK_IDS.smallMushroomBrown);
+    }
+  };
+
+  // Mossy-cobble boulder: a small blob sitting on the ground (taiga / old-growth).
+  const mossyBoulder = (x: number, z: number) => {
+    const y0 = surfaceYOf(x, z, ROCK_ROOT);
+    if (y0 < 0) return;
+    const r = rng.random() < 0.4 ? 2 : 1;
+    for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) for (let dy = 1; dy <= r + 1; dy++) {
+      if (dx * dx + dz * dz + (dy - 1) * (dy - 1) > (r + 0.4) * (r + 0.4)) continue;
+      setIfAir(x + dx, y0 + dy, z + dz, rng.random() < 0.55 ? BLOCK_IDS.mossyCobblestone : BLOCK_IDS.cobblestone);
+    }
+  };
+
   const cfg = makeSurfaceConfig(params, size);
-  const CELL = 6;
+  // CELL 4 (was 6) → ~16 feature cells per chunk, so dense biomes (forest, jungle,
+  // dark/redwood forest) reach MC-like tree counts (forest ≈ oak0.6×16 ≈ 10/chunk).
+  const CELL = 4;
   for (let gx = 0; gx < size.width; gx += CELL) {
     for (let gz = 0; gz < size.width; gz += CELL) {
       const x = gx + Math.floor(rng.random() * CELL);
@@ -1034,21 +1289,46 @@ function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, 
       const { biome } = columnSurface(simplex, cfg, worldX + x, worldZ + z);
       const f = BIOMES[biome].features;
       if (!f) continue;
-      const r = rng.random();
-      if (f.cherry && r < f.cherry) buildTree(x, z, GRASS_ROOT, BLOCK_IDS.cherryLog, BLOCK_IDS.cherryLeaves, 4, 6, 2, 3, 0.72);
-      else if (f.giantMushroom && r < f.giantMushroom) buildGiantMushroom(x, z);
-      else if (f.swampOak && r < f.swampOak) oak(x, z, SWAMP_ROOT, 0.65, 0.6);
-      else if (f.oak && r < f.oak) {
-        // wood variant by biome: jungle in warm forest, birch in cold plains & some
-        // forest, oak elsewhere (dark oak is reserved for structures).
-        const jungle = biome === BIOME.warmForest;
-        const birch = biome === BIOME.coldPlains || (biome === BIOME.forest && hash01(worldX + x, worldZ + z) < 0.4);
-        const logId = jungle ? BLOCK_IDS.jungleLog : birch ? BLOCK_IDS.birchLog : BLOCK_IDS.tree;
-        const leafId = jungle ? BLOCK_IDS.jungleLeaves : birch ? BLOCK_IDS.birchLeaves : BLOCK_IDS.leaves;
-        oak(x, z, GRASS_ROOT, params.trees.canopy.density, jungle ? 0.45 : 0, logId, leafId);
-      }
-      else if (f.cactus && r < f.cactus) buildCactus(x, z);
-      else if (f.iceSpike && r < f.iceSpike) buildIceSpike(x, z);
+      // CUMULATIVE single-pick dispatch: each feature's probability is a slice of
+      // [0,1); we walk the list subtracting slices so a biome with two features
+      // (e.g. redwoodForest redwood0.3 + spruce0.42) gets BOTH at their declared
+      // rates (the old elif-chain compared each against the SAME r, so the later
+      // feature could never reach its full share → biomes were under-forested).
+      // Exactly one feature lands per cell (no overlapping trunks); `flowers` is
+      // NOT here — it's a foliage-pass flag.
+      let r = rng.random();
+      const pick = (prob: number | undefined, place: () => void): boolean => {
+        if (prob === undefined) return false;
+        if (r < prob) { place(); return true; }
+        r -= prob; return false;
+      };
+      void (
+        pick(f.cherry, () => buildTree(x, z, GRASS_ROOT, BLOCK_IDS.cherryLog, BLOCK_IDS.cherryLeaves, 4, 6, 2, 3, 0.72)) ||
+        pick(f.giantMushroom, () => buildGiantMushroom(x, z)) ||
+        pick(f.redwood, () => redwood(x, z)) ||
+        pick(f.spruce, () => spruce(x, z)) ||
+        pick(f.jungleTree, () => jungleTree(x, z)) ||
+        pick(f.darkOak, () => darkOak(x, z)) ||
+        pick(f.acacia, () => acacia(x, z)) ||
+        pick(f.birch, () => birch(x, z)) ||
+        pick(f.mangrove, () => mangrove(x, z)) ||
+        pick(f.swampOak, () => oak(x, z, SWAMP_ROOT, 0.65, 0.6)) ||
+        pick(f.oak, () => {
+          // plain oak, with a light birch mix in temperate forest for variety.
+          const useBirch = biome === BIOME.forest && hash01(worldX + x, worldZ + z) < 0.22;
+          oak(x, z, GRASS_ROOT, params.trees.canopy.density, 0,
+            useBirch ? BLOCK_IDS.birchLog : BLOCK_IDS.tree,
+            useBirch ? BLOCK_IDS.birchLeaves : BLOCK_IDS.leaves);
+        }) ||
+        pick(f.hugeMushroom, () => buildGiantMushroom(x, z, GRASS_ROOT)) ||
+        pick(f.bush, () => bush(x, z, biome === BIOME.jungle ? BLOCK_IDS.jungleLeaves : BLOCK_IDS.leaves)) ||
+        pick(f.fallenLog, () => fallenLog(x, z, biome === BIOME.redwoodForest || biome === BIOME.taiga ? BLOCK_IDS.spruceLog
+          : biome === BIOME.birchForest ? BLOCK_IDS.birchLog
+          : biome === BIOME.darkForest ? BLOCK_IDS.darkOakLog : BLOCK_IDS.tree)) ||
+        pick(f.boulder, () => mossyBoulder(x, z)) ||
+        pick(f.cactus, () => buildCactus(x, z)) ||
+        pick(f.iceSpike, () => buildIceSpike(x, z))
+      );
     }
   }
 }
@@ -1085,7 +1365,7 @@ function generateFoliage(simplex: SimplexNoise, params: ChunkParams, size: Chunk
         const depth = sea - h;
         let placed = false;
         // Lily pads only on shallow LAKE / SWAMP water (rivers excluded per request).
-        if ((biome === BIOME.lake || biome === BIOME.swamp) && depth <= 5 && get(x, sea, z) === BLOCK_IDS.air
+        if ((biome === BIOME.lake || biome === BIOME.swamp || biome === BIOME.mangroveSwamp) && depth <= 5 && get(x, sea, z) === BLOCK_IDS.air
             && fbm(simplex, wx + 33000, wz + 33000, 22, 2) > 0.34 && hash01(wx + 5, wz + 9) < 0.55) {
           set(x, sea, z, BLOCK_IDS.lilyPad);
           placed = true;
@@ -1159,30 +1439,55 @@ function generateFoliage(simplex: SimplexNoise, params: ChunkParams, size: Chunk
 
       if (top !== BLOCK_IDS.grass) continue;       // mud/dirt/stone → no ground cover
 
+      // --- dark forest: dim undergrowth — clustered mushrooms + heavy litter ---
+      if (biome === BIOME.darkForest) {
+        if (r < 0.09) { set(x, h + 1, z, hash01(wx + 9, wz + 4) < 0.5 ? BLOCK_IDS.smallMushroomRed : BLOCK_IDS.smallMushroomBrown); continue; }
+        if (fbm(simplex, wx + 4000, wz + 4000, 20, 2) > 0.1 && hash01(wx + 13, wz + 91) < 0.6) { set(x, h + 1, z, BLOCK_IDS.leafLitter); continue; }
+      }
+
       // --- forest litter & cherry petals (carpets) — claim the cell first ---
       if (biome === BIOME.cherry && hash01(wx + 71, wz + 17) < 0.6) {   // denser blossom carpet
         set(x, h + 1, z, BLOCK_IDS.cherryPetals); continue;
       }
-      if ((biome === BIOME.forest || biome === BIOME.warmForest || biome === BIOME.taiga)
+      if ((biome === BIOME.forest || biome === BIOME.warmForest || biome === BIOME.taiga
+           || biome === BIOME.redwoodForest || biome === BIOME.birchForest || biome === BIOME.jungle)
           && fbm(simplex, wx + 4000, wz + 4000, 20, 2) > 0.35 && hash01(wx + 13, wz + 91) < 0.5) {
         set(x, h + 1, z, BLOCK_IDS.leafLitter); continue;
       }
 
-      // --- grass / fern / tall grass (patchy meadows) -----------------------
+      // --- flower-heavy biomes (flower forest / meadow / birch): flowers FIRST,
+      //     densely, so the ground reads as a wildflower field -----------------
+      const flowerBoost = BIOMES[biome].features?.flowers ?? 0;
+      if (flowerBoost > 0) {
+        const ff0 = fbm(simplex, wx + 60000, wz + 60000, 16, 2);
+        const fp = clamp((ff0 + 0.25) * flowerBoost, 0, flowerBoost);
+        if (hash01(wx + 7, wz + 3) < fp) {
+          const sp = (Math.abs(Math.floor(fbm(simplex, wx + 90000, wz + 90000, 40, 1) * 11))) % FLOWERS.length;
+          set(x, h + 1, z, FLOWERS[sp]); continue;
+        }
+      }
+
+      // --- grass / fern / tall grass (patchy meadows; lush in jungle/redwood) --
       const dens = fbm(simplex, wx + 200, wz + 200, 30, 2);
-      const grassProb = clamp(0.34 + dens * 0.55, 0.05, 0.9);
+      const lush = biome === BIOME.jungle || biome === BIOME.redwoodForest;
+      let grassProb = clamp(0.34 + dens * 0.55, 0.05, 0.9);
+      if (lush) grassProb = clamp(grassProb + 0.35, 0.05, 0.96);
       if (r < grassProb) {
         const r2 = hash01(wx + 41, wz + 67);
-        const wooded = biome === BIOME.taiga || biome === BIOME.forest || biome === BIOME.warmForest;
+        const wooded = biome === BIOME.taiga || biome === BIOME.forest || biome === BIOME.warmForest
+          || biome === BIOME.jungle || biome === BIOME.redwoodForest || biome === BIOME.darkForest
+          || biome === BIOME.birchForest || biome === BIOME.mangroveSwamp;
+        const tallOk = biome === BIOME.plains || biome === BIOME.savanna || biome === BIOME.warmForest
+          || biome === BIOME.meadow || biome === BIOME.flowerForest || biome === BIOME.birchForest
+          || biome === BIOME.jungle || dens > 0.3;
         const twoCell = h + 2 < size.height && get(x, h + 2, z) === BLOCK_IDS.air;
-        if (r2 < 0.16 && twoCell &&
-            (biome === BIOME.plains || biome === BIOME.savanna || biome === BIOME.warmForest || dens > 0.3)) {
+        if (r2 < (lush ? 0.28 : 0.16) && twoCell && tallOk) {
           set(x, h + 1, z, BLOCK_IDS.tallGrassLower);
           set(x, h + 2, z, BLOCK_IDS.tallGrassUpper);
-        } else if (r2 < 0.24 && twoCell && wooded) {
+        } else if (r2 < (lush ? 0.55 : 0.24) && twoCell && wooded) {
           set(x, h + 1, z, BLOCK_IDS.largeFernLower);   // 2-block fern in woods
           set(x, h + 2, z, BLOCK_IDS.largeFernUpper);
-        } else if (r2 < 0.34 && wooded) {
+        } else if (r2 < (lush ? 0.72 : 0.34) && wooded) {
           set(x, h + 1, z, BLOCK_IDS.fern);
         } else {
           set(x, h + 1, z, BLOCK_IDS.shortGrass);
@@ -1195,7 +1500,7 @@ function generateFoliage(simplex: SimplexNoise, params: ChunkParams, size: Chunk
       const flowerProb = clamp((ff - 0.1) * 0.5, 0, 0.22);
       if (hash01(wx + 7, wz + 3) < flowerProb) {
         const species = (Math.abs(Math.floor(fbm(simplex, wx + 90000, wz + 90000, 40, 1) * 11))) % FLOWERS.length;
-        set(x, h + 1, z, biome === BIOME.swamp ? BLOCK_IDS.flowerBlueOrchid : FLOWERS[species]);
+        set(x, h + 1, z, (biome === BIOME.swamp || biome === BIOME.mangroveSwamp) ? BLOCK_IDS.flowerBlueOrchid : FLOWERS[species]);
       }
     }
   }
@@ -1228,8 +1533,10 @@ const WELL_SHAFT = 8;       // a well's centre column is carved this many blocks
 // Does a structure of `kind` build in `biome`? Shared by the generator AND the map
 // (so map markers only appear where a structure actually generates).
 const structGrassy = (b: number) => b === BIOME.plains || b === BIOME.forest || b === BIOME.savanna
-  || b === BIOME.coldPlains || b === BIOME.warmForest || b === BIOME.taiga || b === BIOME.cherry || b === BIOME.scrub;
-const structCold = (b: number) => b === BIOME.snowy || b === BIOME.iceSpikes || b === BIOME.coldPlains || b === BIOME.taiga;
+  || b === BIOME.coldPlains || b === BIOME.warmForest || b === BIOME.taiga || b === BIOME.cherry || b === BIOME.scrub
+  || b === BIOME.meadow || b === BIOME.birchForest || b === BIOME.flowerForest;
+const structCold = (b: number) => b === BIOME.snowy || b === BIOME.iceSpikes || b === BIOME.coldPlains
+  || b === BIOME.taiga || b === BIOME.redwoodForest;
 const structDryLand = (b: number) => b === BIOME.plains || b === BIOME.savanna || b === BIOME.scrub
   || b === BIOME.coldPlains || b === BIOME.desert || b === BIOME.redDesert;
 const structAnyLand = (b: number) => b !== BIOME.ocean && b !== BIOME.frozenOcean && b !== BIOME.coldOcean
@@ -1239,13 +1546,14 @@ export function structureFitsBiome(kind: number, biome: number): boolean {
   switch (kind) {
     case ST_PYRAMID: return biome === BIOME.desert || biome === BIOME.redDesert;
     case ST_VILLAGE: case ST_HOUSE: return structGrassy(biome);
-    case ST_MANSION: return biome === BIOME.forest || biome === BIOME.warmForest || biome === BIOME.taiga;
+    case ST_MANSION: return biome === BIOME.forest || biome === BIOME.warmForest || biome === BIOME.taiga
+      || biome === BIOME.darkForest || biome === BIOME.redwoodForest;
     case ST_IGLOO: return structCold(biome);
     case ST_CAMPSITE: return structGrassy(biome) || structCold(biome);
     case ST_RUINS: return structAnyLand(biome) && biome !== BIOME.mushroom && biome !== BIOME.beach;
     case ST_OUTPOST: return structDryLand(biome);
     case ST_LIGHTHOUSE: return biome === BIOME.beach;
-    case ST_WITCH_HUT: return biome === BIOME.swamp;
+    case ST_WITCH_HUT: return biome === BIOME.swamp || biome === BIOME.mangroveSwamp;
     default: return true;   // well / tower on any land (platform null-check excludes water)
   }
 }

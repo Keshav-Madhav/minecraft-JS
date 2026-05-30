@@ -19,8 +19,8 @@ export type LightingControls = {
   getDayLength: () => number, setDayLength: (v: number) => void,
 };
 
-export type ShadowQuality = 'off' | 'low' | 'medium' | 'high';
-export type QualityPreset = 'fast' | 'balanced' | 'fancy' | 'custom';
+export type ShadowQuality = 'off' | 'low' | 'medium' | 'high' | 'ultra';
+export type QualityPreset = 'fast' | 'balanced' | 'fancy' | 'ultra' | 'custom';
 
 // Quality / optimization handles. Presets set everything at once; the advanced
 // rows tune individual knobs (which flips the preset to 'custom').
@@ -35,6 +35,7 @@ export type QualityControls = {
   getBlockLights: () => boolean, setBlockLights: (v: boolean) => void,
   getClouds: () => boolean, setClouds: (v: boolean) => void,
   getStatsOverlay: () => boolean, setStatsOverlay: (v: boolean) => void,
+  getUltraGraphics: () => boolean, setUltraGraphics: (v: boolean) => void,
 };
 
 export type StatsSnapshot = {
@@ -293,7 +294,7 @@ export function createMenu(opts: MenuOptions): MenuController {
   // --- Quality (presets + advanced) ---
   const q = addSection(setBody, '⚡  Quality');
   remember(addSegmented<QualityPreset>(q, 'Preset',
-    [{ value: 'fast', label: 'Fast' }, { value: 'balanced', label: 'Balanced' }, { value: 'fancy', label: 'Fancy' }],
+    [{ value: 'fast', label: 'Fast' }, { value: 'balanced', label: 'Balanced' }, { value: 'fancy', label: 'Fancy' }, { value: 'ultra', label: 'Ultra' }],
     quality.getPreset,   // returns 'custom' when knobs were tuned → no preset highlighted
     (v) => { quality.applyPreset(v); syncSettings(); opts.onViewDistanceChange(); }));
 
@@ -309,8 +310,11 @@ export function createMenu(opts: MenuOptions): MenuController {
     get: quality.getFoliageDistance, set: quality.setFoliageDistance,
   }));
   remember(addSegmented<ShadowQuality>(adv, 'Shadows',
-    [{ value: 'off', label: 'Off' }, { value: 'low', label: 'Low' }, { value: 'medium', label: 'Med' }, { value: 'high', label: 'High' }],
+    [{ value: 'off', label: 'Off' }, { value: 'low', label: 'Low' }, { value: 'medium', label: 'Med' }, { value: 'high', label: 'High' }, { value: 'ultra', label: 'Ultra' }],
     quality.getShadowQuality, quality.setShadowQuality));
+  // Ultra graphics: post-processing (bloom + god rays), soft hi-res shadows incl.
+  // foliage/leaf cutout shadows, fake water caustics + reflections. Heavy — opt-in.
+  remember(addToggle(adv, 'Ultra Graphics ✨', quality.getUltraGraphics, quality.setUltraGraphics));
   remember(addSlider(adv, 'Shadow Range', {
     min: 32, max: 360, step: 2,
     get: quality.getShadowRange, set: quality.setShadowRange,

@@ -25,8 +25,8 @@ const TILE_LEVELS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384];
 const MAX_CACHE = 1200;       // LRU cap on in-memory tile canvases (touch-on-use)
 // The minimap no longer uses the worker pool, and the game's chunk workers are
 // idle while the fullscreen map is open (the voxel world isn't rendered then), so
-// we can afford a wider pool for snappier map loads.
-const MAP_WORKERS = Math.max(3, Math.min(6, (navigator.hardwareConcurrency || 4) - 1));
+// we use a WIDE pool (≈ all cores) for snappy map loads.
+const MAP_WORKERS = Math.max(3, Math.min(8, navigator.hardwareConcurrency || 4));
 const MAX_TILE_OUTSTANDING = MAP_WORKERS * 6;   // queue a few per worker so none idles
 
 // Choose the world-size whose pixels are at-or-finer than the screen, so tiles
@@ -329,8 +329,34 @@ export class WorldMap {
     if (this.open) {
       this.want.length = 0;
       this.composite(this.big, this.centerX, this.centerZ, this.wpp);
+      this.overlayLoadedChunks(p.x, p.z);   // instant + in-sync over the (slower) worker tiles
       this.drawPlayerOnMap(p.x, p.z);
       this.pumpRequests();
+    }
+  }
+
+  // Overlay the game's already-generated chunk tiles onto the fullscreen map.
+  // The area around the player is loaded, so its tiles draw instantly and exactly
+  // match the world (no worker round-trip / regeneration) — the map opens crisp at
+  // the centre while distant/panned tiles stream in behind. Only when zoomed in
+  // enough that a chunk is a couple of pixels, and bounded to the loaded radius.
+  private overlayLoadedChunks(px: number, pz: number) {
+    if (this.wpp > 8) return;
+    const ctx = this.big.getContext('2d')!;
+    ctx.imageSmoothingEnabled = false;
+    const W = this.chunkW, wpp = this.wpp, ss = W / wpp;
+    const leftW = this.centerX - this.big.width / 2 * wpp;
+    const topW = this.centerZ - this.big.height / 2 * wpp;
+    const pcx = Math.floor(px / W), pcz = Math.floor(pz / W), RAD = 20;   // > max draw distance
+    const cx0 = Math.max(Math.floor(leftW / W), pcx - RAD);
+    const cx1 = Math.min(Math.floor((leftW + this.big.width * wpp) / W), pcx + RAD);
+    const cz0 = Math.max(Math.floor(topW / W), pcz - RAD);
+    const cz1 = Math.min(Math.floor((topW + this.big.height * wpp) / W), pcz + RAD);
+    for (let chz = cz0; chz <= cz1; chz++) {
+      for (let chx = cx0; chx <= cx1; chx++) {
+        const tile = this.opts.getChunkTile(chx, chz);
+        if (tile) ctx.drawImage(tile, (chx * W - leftW) / wpp, (chz * W - topW) / wpp, ss, ss);
+      }
     }
   }
 

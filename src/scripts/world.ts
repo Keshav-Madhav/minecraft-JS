@@ -333,6 +333,10 @@ export class World extends Three.Group {
   refreshFoliageVisibility() {
     for (const chunk of this.chunkMap.values()) this.applyFoliageVisibility(chunk);
   }
+  // Toggle ultra foliage/leaf cutout shadows on every loaded chunk (no rebuild).
+  refreshFoliageShadows(on: boolean) {
+    for (const chunk of this.chunkMap.values()) chunk.applyFoliageShadows(on);
+  }
   setFoliage(enabled: boolean, distance: number) {
     this.foliageEnabled = enabled;
     this.foliageDistance = distance;

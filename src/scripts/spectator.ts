@@ -25,12 +25,19 @@ export class Spectator {
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.12;
     this.controls.enablePan = false;        // WASD handles translation; reserve drag for orbit
+    this.controls.enableZoom = false;       // scroll adjusts FLY SPEED instead of dollying
     this.controls.minDistance = 1;
     this.controls.maxDistance = 600;
     this.controls.enabled = false;          // off until spectator mode activates
 
     window.addEventListener('keydown', (e) => this.onKey(e, true));
     window.addEventListener('keyup', (e) => this.onKey(e, false));
+    // Scroll = fly-speed (faster up, slower down), exponential so it ranges widely.
+    dom.addEventListener('wheel', (e) => {
+      if (!this.enabled) return;
+      e.preventDefault();
+      this.speed = Math.min(240, Math.max(4, this.speed * Math.exp(-e.deltaY * 0.0015)));
+    }, { passive: false });
   }
 
   private onKey(e: KeyboardEvent, down: boolean) {

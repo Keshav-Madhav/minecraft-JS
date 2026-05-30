@@ -10,8 +10,9 @@ import { Clouds } from './clouds';
 import { WorldMap } from './map';
 import { Spectator } from './spectator';
 import { biomeTint, biomeWaterHex } from './chunkGen';
-import { updatePlantWind, toggleReferenceTextures } from './blockArrayMaterial';
+import { updatePlantWind, toggleReferenceTextures, updateCubeUniforms, setFoliageShadows } from './blockArrayMaterial';
 import { LightManager } from './lightManager';
+import { PostFX } from './ultraGraphics';
 
 // Get window size
 let winWidth = window.innerWidth;
@@ -27,6 +28,7 @@ window.addEventListener('resize', () => {
   player.camera.updateProjectionMatrix();
 
   renderer.setSize(winWidth, winHeight);
+  postfx?.setSize(winWidth, winHeight);
 })
 
 let previousTime = performance.now();
@@ -60,7 +62,10 @@ const LOG_DEPTH = false;
 const CAMERA_NEAR = 0.3;
 function createRenderer(): THREE.WebGLRenderer {
   try {
-    return new THREE.WebGLRenderer({ logarithmicDepthBuffer: LOG_DEPTH });
+    // antialias: MSAA on the default framebuffer — smooths the jaggy voxel edges
+    // in the normal (non-ultra) render path. The ultra composer does its own MSAA
+    // (multisampled render target) since post-processing bypasses this buffer.
+    return new THREE.WebGLRenderer({ logarithmicDepthBuffer: LOG_DEPTH, antialias: true });
   } catch (e) {
     const msg = document.createElement('div');
     msg.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;'
@@ -78,7 +83,11 @@ applyResolution();
 renderer.setSize(winWidth, winHeight);
 renderer.setClearColor(0x80a0e0);
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFShadowMap; // cheaper than soft; blocky shadows read fine
+renderer.shadowMap.type = THREE.PCFSoftShadowMap; // soft shadow edges (set before any material compiles)
+// Accumulate render-info across ALL passes in a frame (reset manually each frame),
+// so the stats overlay shows the true scene draw count even in ultra mode where
+// the EffectComposer issues several post-process passes after the scene render.
+renderer.info.autoReset = false;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.2;
 document.body.appendChild(renderer.domElement);
@@ -114,8 +123,17 @@ function updateViewDistance() {
   player.camera.updateProjectionMatrix();
   spectator.camera.far = span + 48;
   spectator.camera.updateProjectionMatrix();
-  scene.fog = settings.fog ? new THREE.Fog(SKY_COLOR, span * 0.4, span) : null;
+  // Lighter fog: clear out to ~70% of the view, fading only the far edge (was
+  // span*0.4 → fully opaque well before the draw edge, which made even a long
+  // render distance look short). The fade ends slightly past the edge so the very
+  // last ring isn't a hard wall.
+  scene.fog = settings.fog ? new THREE.Fog(SKY_COLOR, span * 0.7, span * 1.08) : null;
   clouds.setViewDistance(player.camera.far);
+  // Scale the per-frame streaming budget with distance so a big view actually
+  // FILLS quickly instead of slowly creeping out (the other half of why high
+  // distances felt capped). Bounded so low distances stay light.
+  world.maxAppliesPerFrame = Math.max(8, Math.min(18, Math.round(world.drawDistance / 1.8)));
+  world.maxMeshBuildsPerFrame = Math.max(3, Math.min(7, Math.round(world.drawDistance / 5)));
   waterSpanCur = (span + 48 + WATER_SNAP) * 2;
   waterMesh.scale.set(waterSpanCur, 1, waterSpanCur);
   waterSnapX = NaN;
@@ -152,11 +170,32 @@ function buildWaterGeometry(seg: number): THREE.BufferGeometry {
   return g;
 }
 const waterGeo = buildWaterGeometry(WATER_SEG);
-const waterMesh = new THREE.Mesh(waterGeo, new THREE.MeshPhongMaterial({
+const waterMaterial = new THREE.MeshPhongMaterial({
   vertexColors: true, color: 0xffffff, transparent: true, opacity: 0.72,
   side: THREE.DoubleSide, depthWrite: false, specular: 0xbfe0ff, shininess: 96,
   polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
-}));
+});
+// ULTRA water reflection: a fresnel sky-reflection — at grazing angles the surface
+// mirrors the (day/night) sky colour, giving a glossy reflective sheen. Gated by
+// uReflect (0 off / 1 ultra); uSkyRefl tracks the live sky colour each frame. The
+// plane is horizontal so the world normal is simply +Y → fresnel = pow(1-viewDir.y,3).
+let waterShader: THREE.WebGLProgramParametersWithUniforms | null = null;
+waterMaterial.onBeforeCompile = (shader) => {
+  shader.uniforms.uReflect = { value: 0 };
+  shader.uniforms.uSkyRefl = { value: new THREE.Color(0xbcd6ff) };
+  shader.uniforms.uWaterTime = { value: 0 };
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nvarying vec3 vWaterPos;')
+    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvWaterPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', '#include <common>\nuniform float uReflect;\nuniform vec3 uSkyRefl;\nuniform float uWaterTime;\nvarying vec3 vWaterPos;')
+    // Animate the surface normal with crossing ripples → the Phong sun glint and
+    // the fresnel sky-reflection shimmer like real moving water (ultra only).
+    .replace('#include <normal_fragment_begin>', '#include <normal_fragment_begin>\n  if (uReflect > 0.5) {\n    float wt = uWaterTime; vec2 wp = vWaterPos.xz;\n    float nx = 0.14 * (sin(wp.x * 0.55 + wt * 1.1) + 0.6 * sin(wp.x * 1.7 - wt * 1.7 + wp.y * 0.4));\n    float nz = 0.14 * (cos(wp.y * 0.5 + wt * 0.9) + 0.6 * sin(wp.y * 1.6 + wt * 1.3 + wp.x * 0.4));\n    normal = normalize(normal + vec3(nx, 0.0, nz));\n  }')
+    .replace('#include <dithering_fragment>', '#include <dithering_fragment>\n  if (uReflect > 0.5) {\n    vec3 vd = normalize(cameraPosition - vWaterPos);\n    float fres = pow(1.0 - clamp(dot(vd, normalize(normal)), 0.0, 1.0), 3.0);\n    gl_FragColor.rgb = mix(gl_FragColor.rgb, uSkyRefl, fres * 0.6);\n    gl_FragColor.a = clamp(gl_FragColor.a + fres * 0.25, 0.0, 1.0);\n  }');
+  waterShader = shader;
+};
+const waterMesh = new THREE.Mesh(waterGeo, waterMaterial);
 waterMesh.layers.set(1);
 waterMesh.frustumCulled = false;
 scene.add(waterMesh);
@@ -307,6 +346,14 @@ renderer.domElement.addEventListener('mousedown', () => {
   if (isFPS() && !paused && !worldMap.isOpen() && !player.controls.isLocked) player.controls.lock();
 });
 
+// Scroll adjusts FLIGHT SPEED while flying in Creative / Survival-flight (spectator
+// has its own wheel handler). Exponential, clamped — scroll up = faster.
+renderer.domElement.addEventListener('wheel', (e) => {
+  if (mode === 'spectator' || !player.flying || !player.controls.isLocked) return;
+  e.preventDefault();
+  player.flySpeedScale = Math.min(8, Math.max(0.25, player.flySpeedScale * Math.exp(-e.deltaY * 0.0015)));
+}, { passive: false });
+
 document.addEventListener('keydown', (event) => {
   const k = event.key;
   if (k === 'm' || k === 'M') {
@@ -381,13 +428,15 @@ function applyShadowQuality(q: ShadowQuality) {
   shadowQuality = q;
   if (q === 'off') { sun.castShadow = false; return; }
   sun.castShadow = true;
-  const size = q === 'low' ? 1024 : q === 'medium' ? 2048 : 4096;
+  // ultra = an 8192 map over a wide range → ~0.1-block texels (razor-crisp), with
+  // the foliage/leaf cutout shadows + soft PCF reading as real dappled light.
+  const size = q === 'low' ? 1024 : q === 'medium' ? 2048 : q === 'high' ? 4096 : 8192;
   if (sun.shadow.mapSize.x !== size) {
     sun.shadow.mapSize.set(size, size);
     // Drop the old render target so three reallocates it at the new resolution.
     if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
   }
-  applyShadowRange(q === 'low' ? 110 : q === 'medium' ? 200 : 320);
+  applyShadowRange(q === 'low' ? 110 : q === 'medium' ? 200 : q === 'high' ? 320 : 440);
 }
 
 function setUpLights() {
@@ -445,6 +494,7 @@ let _bright = 1, _targetBright = 1;
 let biomeTintTick = 0;
 
 // --- Day/night cycle -------------------------------------------------------
+let currentDaylight = 1;   // 0 night → 1 day; drives the god-ray intensity
 let timeOfDay = 0.30;
 let dayLength = 480;
 let sunPeak = 2.9;
@@ -466,6 +516,7 @@ function updateSky(delta: number) {
     applySunDirection((timeOfDay * 360 + 60) % 360, elevReal);
   }
   const daylight = THREE.MathUtils.clamp((elevReal + 6) / 18, 0, 1);
+  currentDaylight = daylight;
   const glow = sstep(elevReal, -8, 3) * (1 - sstep(elevReal, 3, 16));
 
   if (settings.biomeLighting && (biomeTintTick++ % 8) === 0) {
@@ -537,18 +588,38 @@ function applyQualityPreset(p: QualityPreset) {
     // NO cloud overdraw, downscaled render — the cheapest the engine goes.
     world.drawDistance = 6; world.setFoliage(true, 3);
     applyShadowQuality('off'); lightInterval = 4; lightManager.setEnabled(false);
-    settings.resolutionScale = 0.7; clouds.visible = false;
+    settings.resolutionScale = 0.7; clouds.visible = false; setUltraGraphics(false);
   } else if (p === 'balanced') {
     world.drawDistance = 12; world.setFoliage(true, 7);
     applyShadowQuality('medium'); lightInterval = 2; lightManager.setEnabled(true);
-    settings.resolutionScale = 1; clouds.visible = true;
+    settings.resolutionScale = 1; clouds.visible = true; setUltraGraphics(false);
   } else if (p === 'fancy') {
     world.drawDistance = 16; world.setFoliage(true, 14);
     applyShadowQuality('high'); lightInterval = 1; lightManager.setEnabled(true);
-    settings.resolutionScale = 1; clouds.visible = true;
+    settings.resolutionScale = 1; clouds.visible = true; setUltraGraphics(false);
+  } else if (p === 'ultra') {
+    // Max it out: 32-chunk view, foliage everywhere, 8192 soft shadows incl.
+    // foliage/leaf cutout shadows, full post-FX (bloom + god rays), caustics +
+    // water reflections. "Explore your PC."
+    world.drawDistance = 32; world.setFoliage(true, 32);
+    applyShadowQuality('ultra'); lightInterval = 1; lightManager.setEnabled(true);
+    settings.resolutionScale = 1; clouds.visible = true; setUltraGraphics(true);
   }
   applyResolution();
   updateViewDistance();
+}
+
+// Ultra graphics: post-processing (bloom + god rays), foliage/leaf cutout shadows,
+// underwater caustics, and a glossy fresnel water reflection. Heavy — opt-in.
+let ultraGraphics = false;
+let postfx: PostFX | null = null;
+function setUltraGraphics(on: boolean) {
+  ultraGraphics = on;
+  setFoliageShadows(on);            // new chunk meshes pick this up...
+  world.refreshFoliageShadows(on);  // ...and existing ones are updated in place
+  // (water uReflect is driven every frame in the render loop from `ultraGraphics`)
+  if (on && !postfx) postfx = new PostFX(renderer, scene, mode === 'spectator' ? spectator.camera : player.camera);
+  else if (!on && postfx) { postfx.dispose(); postfx = null; }   // free the HDR buffers when ultra is off
 }
 
 setUpLights();
@@ -607,6 +678,8 @@ const menu = createMenu({
     setClouds: (v) => { clouds.visible = v; qualityPreset = 'custom'; },
     getStatsOverlay: () => settings.statsOverlay,
     setStatsOverlay: (v) => { settings.statsOverlay = v; updateHudVisibility(); },
+    getUltraGraphics: () => ultraGraphics,
+    setUltraGraphics: (v) => { setUltraGraphics(v); qualityPreset = 'custom'; },
   },
 });
 
@@ -619,6 +692,7 @@ updateHudVisibility();
 // draw loop
 function animate() {
   const currentTime = performance.now();
+  renderer.info.reset();   // start-of-frame; render-info then accumulates all passes
   // Clamp the step so a backgrounded tab (huge dt) can't spiral the physics
   // accumulator into thousands of substeps on refocus.
   const delta = Math.min((currentTime - previousTime) / 1000, 0.1);
@@ -654,8 +728,25 @@ function animate() {
       updateWaterColors(wsx, wsz);
     }
 
+    // Caustics ripple + the live sky colour for the water reflection (cheap; the
+    // shaders gate the effects off when ultra is disabled).
+    updateCubeUniforms(currentTime / 1000, world.params.terrain.waterOffset, ultraGraphics);
+    if (waterShader) {
+      // Drive the water uniforms every frame so they're always in sync regardless
+      // of when the material first compiled (the shader exists only after the first
+      // render, which can be after setUltraGraphics ran).
+      waterShader.uniforms.uReflect.value = ultraGraphics ? 1 : 0;
+      waterShader.uniforms.uSkyRefl.value.copy(_sky);
+      waterShader.uniforms.uWaterTime.value = currentTime / 1000;
+    }
+
     const activeCamera = mode === 'spectator' ? spectator.camera : player.camera;
-    renderer.render(scene, activeCamera);
+    if (ultraGraphics && postfx) {
+      postfx.update(activeCamera, sunSprite.position, currentDaylight);   // active camera + god-ray source
+      postfx.render();
+    } else {
+      renderer.render(scene, activeCamera);
+    }
   }
 
   // Live FPS (rolling, ~4×/s) for the debug menu + the always-on overlay.

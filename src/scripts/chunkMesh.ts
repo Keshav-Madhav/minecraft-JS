@@ -535,6 +535,10 @@ export function buildChunkMapTile(data: Uint8Array, size: ChunkSize, sea: number
   const W = size.width, H = size.height;
   const out = new Uint8Array(W * W * 4);
   // First pass: resolve top non-plant block id + its height for every column.
+  // Full top-down scan — a heightmap-bounded start was tried but the terrain
+  // heightmap excludes above-surface solids (frozen-water ice, ice spikes, snow
+  // layers, structures), so bounding the scan dropped them from the map. The scan
+  // is not the map's bottleneck (columnSurface noise dominates) so it stays full.
   const topIds = new Int32Array(W * W), topYs = new Int16Array(W * W);
   for (let lz = 0; lz < W; lz++) {
     for (let lx = 0; lx < W; lx++) {

@@ -80,6 +80,7 @@ export class Player {
   // you stop at walls instead of clipping (MC-style creative flight).
   flying = false;
   canFly = true;
+  flySpeedScale = 1;   // scroll wheel adjusts this while flying (creative / survival-flight)
   // Space held (regardless of flying) — read by Physics for swim-up while in water.
   wantsUp = false;
 
@@ -277,7 +278,7 @@ export class Player {
     if (wl > 0) { wx /= wl; wf /= wl; }
 
     this.sprinting = this.#doubleTapSprint && wf > 0.1;
-    const speed = this.maxSpeed * (this.sprinting ? FLY_SPRINT : FLY_BASE);
+    const speed = this.maxSpeed * (this.sprinting ? FLY_SPRINT : FLY_BASE) * this.flySpeedScale;
     const accel = FLY_ACCEL * delta;
     const damp = Math.exp(-GROUND_FRICTION * delta);
 
