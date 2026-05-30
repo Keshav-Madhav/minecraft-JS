@@ -1,16 +1,17 @@
 import * as THREE from 'three';
-import { OrbitControls } from 'three/examples/jsm/Addons.js';
-import Stats from 'three/examples/jsm/libs/stats.module.js';
-import { createGUI } from './ui';
+import { createMenu, GameMode, ShadowQuality, QualityPreset } from './ui';
 import { Player } from './player';
 import { Physics } from './physics';
 import { World } from './world';
 import { blocks } from './blocks';
+import { BLOCK_IDS } from './blockTypes';
 import { ModelLoader } from './ModelLoader';
 import { Clouds } from './clouds';
 import { WorldMap } from './map';
+import { Spectator } from './spectator';
 import { biomeTint, biomeWaterHex } from './chunkGen';
-import { updatePlantWind } from './blockArrayMaterial';
+import { updatePlantWind, toggleReferenceTextures } from './blockArrayMaterial';
+import { LightManager } from './lightManager';
 
 // Get window size
 let winWidth = window.innerWidth;
@@ -19,8 +20,8 @@ window.addEventListener('resize', () => {
   winWidth = window.innerWidth;
   winHeight = window.innerHeight;
 
-  OrbitCam.aspect = winWidth / winHeight;
-  OrbitCam.updateProjectionMatrix();
+  spectator.camera.aspect = winWidth / winHeight;
+  spectator.camera.updateProjectionMatrix();
 
   player.camera.aspect = winWidth / winHeight;
   player.camera.updateProjectionMatrix();
@@ -29,53 +30,38 @@ window.addEventListener('resize', () => {
 })
 
 let previousTime = performance.now();
-let hudTick = 0; // counts rendered frames; throttles the debug HUD refresh
 
-// Settings surfaced in the GUI. Real-play defaults: vsync on (uncapFPS off), fog
-// on (hides the streamed edge + carries the day/night colour), biome tint + the
-// day/night cycle on.
-const settings = { uncapFPS: false, fog: true, resolutionScale: 1, biomeLighting: true, dayNight: true };
+// Settings surfaced in the menu. Defaults: FPS UNLOCKED (uncapFPS on → VSync is
+// an opt-in toggle), fog on, biome tint + day/night on, and an always-on stats
+// overlay (top-right, under the minimap) while playing.
+const settings = { uncapFPS: true, fog: true, resolutionScale: 1, biomeLighting: true, dayNight: true, statsOverlay: true };
 const SKY_COLOR = 0x80a0e0;
 
 // Frame scheduler. requestAnimationFrame is hard-locked to the display refresh
-// rate (e.g. 60/120 Hz). To render uncapped (so FPS differences are visible),
-// drive the loop via a MessageChannel, which has no minimum-delay clamp the way
-// setTimeout(0) does.
+// rate (e.g. 60/120 Hz). To render uncapped, drive the loop via a MessageChannel,
+// which has no minimum-delay clamp the way setTimeout(0) does.
 const frameChannel = new MessageChannel();
 let frameScheduled = false;
 frameChannel.port1.onmessage = () => { frameScheduled = false; animate(); };
 function scheduleFrame() {
-  if (settings.uncapFPS) {
+  // Uncapped only while actively playing — no point spinning thousands of fps
+  // behind the pause menu or the world map (just vsync there).
+  if (settings.uncapFPS && !paused && !worldMap.isOpen()) {
     if (!frameScheduled) { frameScheduled = true; frameChannel.port2.postMessage(0); }
   } else {
     requestAnimationFrame(animate);
   }
 }
 
+// --- live perf stats (shown in the debug menu, not a permanent HUD) ----------
+let fps = 0, fpsFrames = 0, fpsLast = performance.now();
 
-// Stats = FPS monitor
-const stats = new Stats();
-document.body.appendChild(stats.dom);
-const renderStatsEl = document.getElementById('render-stats');
-
-// logarithmicDepthBuffer fixed z-fighting at distance (the thin sliver above
-// water flickering) but forces a per-fragment gl_FragDepth write that disables
-// hardware early-Z — costly in this overdraw-heavy scene. We instead reclaim
-// depth precision cheaply: a higher camera NEAR plane (the hyperbolic depth
-// buffer wastes most of its range in [0.1, ~10]; near=0.5 is ~5× better) plus a
-// polygonOffset on the water plane. Default OFF (the perf path). If the water
-// flicker returns over the ocean from the orbit cam, flip this back to `true`.
 const LOG_DEPTH = false;
-// 0.3 (not 0.1) reclaims most depth-buffer precision without clipping the held
-// tool (attached to the player camera at ~0.5 units). OrbitCam has no tool.
 const CAMERA_NEAR = 0.3;
-// Antialias is off — MSAA over this many triangles tanked the frame rate.
 function createRenderer(): THREE.WebGLRenderer {
   try {
     return new THREE.WebGLRenderer({ logarithmicDepthBuffer: LOG_DEPTH });
   } catch (e) {
-    // No WebGL (old browser / disabled / blacklisted GPU): show a message instead
-    // of a blank page with a cryptic console error.
     const msg = document.createElement('div');
     msg.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;'
       + 'background:#80a0e0;color:#fff;font:600 18px/1.5 sans-serif;text-align:center;padding:24px';
@@ -85,8 +71,6 @@ function createRenderer(): THREE.WebGLRenderer {
   }
 }
 const renderer = createRenderer();
-// Cap native ratio at 2 (a 3×+ display would otherwise shade 9× the fragments
-// for no visible gain) and scale by the user's resolution setting.
 function applyResolution() {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * settings.resolutionScale);
 }
@@ -95,73 +79,65 @@ renderer.setSize(winWidth, winHeight);
 renderer.setClearColor(0x80a0e0);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFShadowMap; // cheaper than soft; blocky shadows read fine
-// Full-rate shadow updates: updating only every other frame made the map stale
-// while moving, which read as the shadows jittering. The shadow pass is bounded
-// by the shadow RANGE (not draw distance), so per-frame is affordable. Swimming
-// is handled instead by snapping the shadow frustum to texel steps (see animate).
-// Filmic tone mapping rolls off bright highlights instead of clipping them to
-// white, which (with the brighter physically-based lights below) gives a richer,
-// less washed-out image. Exposure is user-tunable in the Lighting panel.
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.2;
 document.body.appendChild(renderer.domElement);
-
-// Setup for OrbitCam
-const OrbitCam = new THREE.PerspectiveCamera(70, winWidth / winHeight, CAMERA_NEAR, 4000);
-OrbitCam.position.set(-48, 190, -48); // above the terrain (sea level is 128)
-OrbitCam.layers.enable(1);
-OrbitCam.lookAt(8, 130, 8);
-
-// Setup for controls
-const controls = new OrbitControls(OrbitCam, renderer.domElement);
-controls.target.set(8, 130, 8);
-controls.update();
 
 // Setup for scene
 const scene = new THREE.Scene();
 const world = new World();
 world.params.seed = Math.floor(Math.random() * 10000);
-world.drawDistance = 16; // real-play draw distance (smooth + plenty of view)
 world.generate();
 scene.add(world);
 
-// Fog and the camera far plane scale with draw distance so the loaded edge
-// fades into the sky instead of either being clipped early or popping in.
+// SPECTATOR free-cam (the repurposed orbital camera). Created after the renderer
+// so it can bind OrbitControls to the canvas. Used only in spectator mode.
+const spectator = new Spectator(
+  new THREE.PerspectiveCamera(70, winWidth / winHeight, CAMERA_NEAR, 4000),
+  renderer.domElement,
+);
+spectator.camera.position.set(-48, 190, -48);
+spectator.camera.layers.enable(1);
+spectator.controls.target.set(8, 130, 8);
+spectator.controls.update();
+
+// Localized block lighting: a pool of point lights snapped to nearby emitters.
+const lightManager = new LightManager(scene);
+let lightInterval = 2;   // frames between point-light gathers (quality preset)
+let lightTick = 0;
+
+// Fog and the camera far plane scale with draw distance so the loaded edge fades
+// into the sky. Applied to BOTH cameras so fog matches whichever is active.
 function updateViewDistance() {
   const span = Math.max(world.drawDistance, 1) * world.chunkSize.width;
   player.camera.far = span + 48;
   player.camera.updateProjectionMatrix();
+  spectator.camera.far = span + 48;
+  spectator.camera.updateProjectionMatrix();
   scene.fog = settings.fog ? new THREE.Fog(SKY_COLOR, span * 0.4, span) : null;
   clouds.setViewDistance(player.camera.far);
-  // Cover the whole visible area + the snap-lag margin (the plane only re-centres
-  // every WATER_SNAP blocks) so the ocean always reaches the horizon.
   waterSpanCur = (span + 48 + WATER_SNAP) * 2;
-  waterMesh.scale.set(waterSpanCur, 1, waterSpanCur);   // horizontal XZ grid
-  waterSnapX = NaN;                                     // force a colour recompute next frame
+  waterMesh.scale.set(waterSpanCur, 1, waterSpanCur);
+  waterSnapX = NaN;
 }
-
 
 // Sky cloud layer (separate from the voxel world).
 const clouds = new Clouds();
 scene.add(clouds);
 
-// A single sea-level water plane that follows the player (still ONE draw call /
-// one transparent-sort entry — not per-chunk). But it's now a SUBDIVIDED grid
-// whose vertices are COLOURED by water depth + ocean type, sampled in world space
-// — so in-game the water reads shallow-teal over shelves, dark over deep basins,
-// and tinted per ocean type (warm→teal, frozen→pale), instead of one flat colour.
-// Land above sea still occludes it via the depth buffer, so it only shows in water.
-const WATER_SEG = 48;                 // grid resolution (49² sampled vertices)
-const WATER_SNAP = 24;                // re-centre + recolour the plane every 24 blocks of movement
-let waterSpanCur = 64;                // world-units the plane covers (set by updateViewDistance)
+// A single sea-level water plane that follows the player, vertex-coloured by
+// depth + ocean type (see updateWaterColors). One draw call, not per-chunk.
+const WATER_SEG = 48;
+const WATER_SNAP = 24;
+let waterSpanCur = 64;
 let waterSnapX = NaN, waterSnapZ = NaN;
 function buildWaterGeometry(seg: number): THREE.BufferGeometry {
   const n = seg + 1, verts = n * n;
   const pos = new Float32Array(verts * 3), col = new Float32Array(verts * 3), nrm = new Float32Array(verts * 3);
   for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
     const k = (j * n + i) * 3;
-    pos[k] = i / seg - 0.5; pos[k + 1] = 0; pos[k + 2] = j / seg - 0.5;  // horizontal XZ grid, local [-0.5,0.5]
-    nrm[k + 1] = 1;                                                      // flat up normal (for the sun glint)
+    pos[k] = i / seg - 0.5; pos[k + 1] = 0; pos[k + 2] = j / seg - 0.5;
+    nrm[k + 1] = 1;
   }
   const idx = new Uint32Array(seg * seg * 6); let o = 0;
   for (let j = 0; j < seg; j++) for (let i = 0; i < seg; i++) {
@@ -179,18 +155,12 @@ const waterGeo = buildWaterGeometry(WATER_SEG);
 const waterMesh = new THREE.Mesh(waterGeo, new THREE.MeshPhongMaterial({
   vertexColors: true, color: 0xffffff, transparent: true, opacity: 0.72,
   side: THREE.DoubleSide, depthWrite: false, specular: 0xbfe0ff, shininess: 96,
-  // Bias toward the camera in depth so the thin shoreline band doesn't z-fight
-  // (this + the higher near plane replaces logarithmicDepthBuffer).
   polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
 }));
 waterMesh.layers.set(1);
 waterMesh.frustumCulled = false;
 scene.add(waterMesh);
 
-// Sample water colour at each grid vertex (world space): shallow shelves read a
-// light tint, deep basins darken, and the hue follows the ocean TYPE under that
-// vertex. Recomputed only when the snapped plane centre moves (see animate), so
-// colours stay aligned with the mesh and the cost is paid only while moving.
 const _W_SHALLOW = new THREE.Color(0x86d0d8);
 const _wcDeep = new THREE.Color(), _wcShallow = new THREE.Color(), _wcOut = new THREE.Color();
 function updateWaterColors(cx: number, cz: number) {
@@ -202,8 +172,8 @@ function updateWaterColors(cx: number, cz: number) {
     const s = world.sampler(Math.floor(wx), Math.floor(wz));
     _wcDeep.setHex(biomeWaterHex(s.biome));
     _wcShallow.copy(_wcDeep).lerp(_W_SHALLOW, 0.55);
-    const t = Math.min(1, Math.max(0, seaY - s.height) / 36);     // 0 shallow → 1 deep
-    _wcOut.copy(_wcShallow).lerp(_wcDeep, t).multiplyScalar(1 - 0.32 * t); // darken with depth
+    const t = Math.min(1, Math.max(0, seaY - s.height) / 36);
+    _wcOut.copy(_wcShallow).lerp(_wcDeep, t).multiplyScalar(1 - 0.32 * t);
     const k = (j * n + i) * 3;
     col[k] = _wcOut.r; col[k + 1] = _wcOut.g; col[k + 2] = _wcOut.b;
   }
@@ -212,86 +182,178 @@ function updateWaterColors(cx: number, cz: number) {
 
 // Setup for player
 const player = new Player(scene);
-
 const physics = new Physics(scene);
 
-// Minimap + fullscreen 2D world map. Tiles are rendered off-thread (map worker)
-// from the same terrain noise as the world and cached, so what you see is what
-// generates and panning/zooming stays smooth.
+// Minimap + fullscreen 2D world map. The minimap now blits the world's own
+// per-chunk tiles (always in sync, no regeneration); the fullscreen map streams
+// IDB-persisted worker tiles.
 const _camDir = new THREE.Vector3();
 const worldMap = new WorldMap({
   getPlayer: () => {
-    // Heading from the camera's actual forward vector (reliable regardless of the
-    // PointerLockControls euler order). `yaw` is the CSS rotation that turns the
-    // minimap arrow (which points up = north = −Z at 0) to face the look direction.
-    player.camera.getWorldDirection(_camDir);
-    return { x: player.position.x, z: player.position.z, yaw: Math.atan2(_camDir.x, -_camDir.z) };
+    const cam = mode === 'spectator' ? spectator.camera : player.camera;
+    cam.getWorldDirection(_camDir);
+    const pos = mode === 'spectator' ? spectator.camera.position : player.position;
+    return { x: pos.x, z: pos.z, yaw: Math.atan2(_camDir.x, -_camDir.z) };
   },
+  getChunkTile: (cx, cz) => world.getChunkMapTileCanvas(cx, cz),
   onTeleport: (x, z) => {
     const surface = world.sampler(Math.floor(x), Math.floor(z));
     player.position.set(x, surface.height + 3, z);
     player.velocity.set(0, 0, 0);
-    // After the map closes the pointer is unlocked, so the OrbitCam renders —
-    // move it (and its target) to the destination too, or it'd keep showing the
-    // old location while chunks stream in at the new one.
-    OrbitCam.position.set(x - 50, surface.height + 70, z - 50);
-    controls.target.set(x, surface.height, z);
-    controls.update();
+    spectator.camera.getWorldDirection(_camDir);
+    spectator.placeAt(new THREE.Vector3(x, surface.height + 30, z), _camDir);
   },
-  // Release the pointer + freeze input while the map is open, restore on close.
-  onOpen: () => { player.enabled = false; document.exitPointerLock(); },
-  onClose: () => { player.enabled = true; },
+  onOpen: () => {
+    player.enabled = false;
+    if (mode === 'spectator') spectator.setEnabled(false);
+    else document.exitPointerLock();
+    updateHudVisibility();
+  },
+  onClose: () => {
+    player.enabled = true;
+    if (mode === 'spectator') { if (!paused) spectator.setEnabled(true); }
+    else if (!paused) player.controls.lock();   // works when closed via a click (teleport / ✕)
+    updateHudVisibility();
+  },
 });
 function configureMap() {
   worldMap.configure(world.params, world.chunkSize, world.params.terrain.waterOffset);
 }
 configureMap();
-// Re-point the map worker at the new params whenever the world regenerates
-// (GUI Apply, or loading a saved world via 'm') — otherwise the map silently
-// keeps rendering the old seed's terrain.
 world.onAfterGenerate = configureMap;
-
-// 'G' toggles the world map.
-document.addEventListener('keydown', (event) => {
-  if (event.key === 'g' || event.key === 'G') {
-    worldMap.toggle();
-  } else if (event.key === 'Escape' && worldMap.isOpen()) {
-    worldMap.close();
-  }
-});
 
 const modelLoader = new ModelLoader();
 modelLoader.loadModels((models) => {
   player.tool.setMesh(models.pickaxe);
 })
 
-// Lighting. three r167 uses physically-based light intensities (legacy lights
-// off since r155), so the pre-r155 "intensity 1" sun is ~×π brighter now — hence
-// sun ≈ 3.0. The directional sun gives shape/shadows; a HemisphereLight provides
-// bright sky-vs-ground ambient fill so faces turned away from the sun aren't
-// crushed to near-black.
-// Shadow-map resolution. Shared by the map allocation AND the texel-snap maths
-// (updateSunShadow) — they MUST agree or the snap quantises to the wrong grid and
-// shadows shimmer while moving.
-const SHADOW_MAP_SIZE = 4096;
+// ===========================================================================
+//  GAME MODES + PAUSE / MENU STATE MACHINE
+// ===========================================================================
+let mode: GameMode = 'survival';
+let paused = true;   // start paused: the menu doubles as the "click to play" screen
+const isFPS = () => mode !== 'spectator';
+
+const crosshairEl = document.getElementById('crosshair');
+const toolbarEl = document.getElementById('toolbar-container');
+// Always-on stats HUD (top-right, under the minimap) — toggleable in Settings.
+const statsOverlayEl = document.createElement('div');
+statsOverlayEl.id = 'stats-overlay';
+statsOverlayEl.style.display = 'none';
+document.body.appendChild(statsOverlayEl);
+function updateHudVisibility() {
+  const playing = !paused && !worldMap.isOpen();
+  const fpsPlay = isFPS() && playing;
+  if (toolbarEl) toolbarEl.style.display = fpsPlay ? '' : 'none';
+  if (crosshairEl) crosshairEl.style.display = (fpsPlay && player.controls.isLocked) ? '' : 'none';
+  if (statsOverlayEl) statsOverlayEl.style.display = (playing && settings.statsOverlay) ? '' : 'none';
+}
+
+function setMode(m: GameMode) {
+  const prev = mode;
+  mode = m;
+  if (m === 'spectator') {
+    player.camera.getWorldDirection(_camDir);
+    spectator.placeAt(player.position, _camDir);
+    player.enabled = false;
+    player.selectionHelper.visible = false;   // no block targeting in spectator
+    spectator.setEnabled(!paused);
+  } else {
+    if (prev === 'spectator') {
+      player.position.copy(spectator.camera.position);   // continuity: possess where you spectated
+      player.velocity.set(0, 0, 0);
+    }
+    spectator.setEnabled(false);
+    player.enabled = true;
+    player.canFly = true;
+    player.setFlying(m === 'creative');   // Creative flies by default; Survival walks
+  }
+  updateHudVisibility();
+}
+
+function pause() {
+  if (paused) return;
+  paused = true;
+  if (isFPS()) {
+    // player.enabled=false so movement keys don't re-grab the pointer while the
+    // menu is up; exitPointerLock fires 'unlock' which sees paused===true (no re-pause).
+    player.enabled = false;
+    document.exitPointerLock();
+  } else {
+    spectator.setEnabled(false);
+  }
+  menu.open();
+  updateHudVisibility();
+}
+function resume() {
+  paused = false;
+  menu.close();
+  if (isFPS()) { player.enabled = true; player.controls.lock(); }   // resume() always runs from a user gesture
+  else spectator.setEnabled(true);
+  updateHudVisibility();
+}
+
+// Pointer-lock events drive the FPS pause flow: Esc exits lock → menu opens.
+player.controls.addEventListener('lock', () => { paused = false; menu.close(); updateHudVisibility(); });
+player.controls.addEventListener('unlock', () => {
+  if (worldMap.isOpen() || !isFPS()) return;   // map / spectator manage themselves
+  if (!paused) pause();
+});
+
+// Any click on the canvas while playing FPS but unlocked (e.g. after closing the
+// map with Esc) re-locks the pointer. The block-edit handler below is gated on
+// isLocked, so this locking click never also edits.
+renderer.domElement.addEventListener('mousedown', () => {
+  if (isFPS() && !paused && !worldMap.isOpen() && !player.controls.isLocked) player.controls.lock();
+});
+
+document.addEventListener('keydown', (event) => {
+  const k = event.key;
+  if (k === 'm' || k === 'M') {
+    if (!paused) worldMap.toggle();
+  } else if (k === 'o' || k === 'O') {
+    toggleReferenceTextures();   // DEV-only texture compare
+  } else if (k === 'Escape') {
+    if (worldMap.isOpen()) worldMap.close();
+    else if (paused) resume();
+    else if (!isFPS()) pause();   // spectator has no pointer-lock event to hook
+    // FPS + unpaused: the browser exits pointer lock → 'unlock' handler opens the menu
+  }
+});
+
+// Lighting. Brighter physically-based intensities (three r155+ dropped legacy lights).
 const sun = new THREE.DirectionalLight(0xfff2d8, 2.9);
 const hemi = new THREE.HemisphereLight(0xbcd6ff /* sky */, 0x4d4233 /* ground */, 1.1);
-// A cool, dim MOON directional + a raised ambient floor so night stays navigable
-// instead of pitch black. The moon casts no shadows (cheap) and fades in as the
-// sun sets (intensity ∝ 1 - daylight). Direction is fixed (high, slightly raked).
 const moon = new THREE.DirectionalLight(0xaec6f0, 0);
-const MOON_PEAK = 0.6;
-const MOON_OFFSET = new THREE.Vector3(-120, 240, 90);
+const MOON_PEAK = 0.45;
 
-// The sun is a DIRECTIONAL light: only its DIRECTION matters, expressed as a
-// compass azimuth + elevation above the horizon. The light is parked at this
-// offset from the player each frame (and the shadow frustum re-centres on the
-// player). A mid elevation (~45°) casts clearly visible, directional shadows;
-// straight overhead would make shadows vanishingly short (which read as "no
-// shadows").
+function makeGlowTexture(inner: string, outer: string): THREE.CanvasTexture {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d')!;
+  const grd = g.createRadialGradient(32, 32, 1, 32, 32, 32);
+  grd.addColorStop(0, inner); grd.addColorStop(0.30, inner); grd.addColorStop(1, outer);
+  g.fillStyle = grd; g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+}
+const sunSprite = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: makeGlowTexture('rgba(255,250,235,1)', 'rgba(255,196,110,0)'),
+  transparent: true, depthWrite: false, fog: false, blending: THREE.AdditiveBlending,
+}));
+const moonSprite = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: makeGlowTexture('rgba(238,244,255,1)', 'rgba(150,178,228,0)'),
+  transparent: true, depthWrite: false, fog: false,
+}));
+sunSprite.frustumCulled = false;
+moonSprite.frustumCulled = false;
+sunSprite.layers.enable(1);
+moonSprite.layers.enable(1);
+scene.add(sunSprite);
+scene.add(moonSprite);
+const _sunDir = new THREE.Vector3();
+
 const SUN_DISTANCE = 240;
-let sunAzimuth = 199;   // degrees (compass)
-let sunElevation = 28;  // degrees above horizon (low = longer, more visible shadows)
+let sunAzimuth = 199;
+let sunElevation = 28;
 const sunOffset = new THREE.Vector3();
 function applySunDirection(azimuthDeg: number, elevationDeg: number) {
   sunAzimuth = azimuthDeg;
@@ -302,38 +364,41 @@ function applySunDirection(azimuthDeg: number, elevationDeg: number) {
   sunOffset.set(Math.cos(az) * horiz, Math.sin(el) * SUN_DISTANCE, Math.sin(az) * horiz);
 }
 
-// Half-width of the shadow frustum (world units). Bigger = shadows cover more
-// of the scene (the "spotlight" is larger) but the same shadow map is spread
-// thinner and more casters are drawn in the shadow pass. User-tunable.
 let shadowRange = 320;
 function applyShadowRange(r: number) {
   shadowRange = r;
   const cam = sun.shadow.camera;
   cam.left = -r; cam.right = r; cam.top = r; cam.bottom = -r;
-  // Depth must span the whole frustum even with a low (grazing) sun, or distant
-  // casters drop out. Generous far keeps that covered as range grows.
   cam.far = SUN_DISTANCE + r * 2 + 80;
   cam.updateProjectionMatrix();
 }
 
+// Shadow QUALITY: map resolution + range, or off. Map size must agree with the
+// texel-snap in updateSunShadow (it reads sun.shadow.mapSize.x), so we change it
+// here and dispose the old map so three reallocates at the new size.
+let shadowQuality: ShadowQuality = 'medium';
+function applyShadowQuality(q: ShadowQuality) {
+  shadowQuality = q;
+  if (q === 'off') { sun.castShadow = false; return; }
+  sun.castShadow = true;
+  const size = q === 'low' ? 1024 : q === 'medium' ? 2048 : 4096;
+  if (sun.shadow.mapSize.x !== size) {
+    sun.shadow.mapSize.set(size, size);
+    // Drop the old render target so three reallocates it at the new resolution.
+    if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
+  }
+  applyShadowRange(q === 'low' ? 110 : q === 'medium' ? 200 : 320);
+}
+
 function setUpLights() {
   sun.castShadow = true;
-  // Shadow frustum follows the player (re-centred each frame). A 4096 map over a
-  // ±140 range keeps texels small (~0.07 world units) so the bias can be TINY —
-  // which is what stops the shadow detaching ("peter-panning") from the block it
-  // belongs to. Large bias/normalBias is what caused the floating-shadow look.
   sun.shadow.camera.near = 1;
   sun.shadow.bias = -0.00008;
   sun.shadow.normalBias = 0.02;
-  sun.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
-  applyShadowRange(shadowRange);
+  applyShadowQuality(shadowQuality);   // sets mapSize + range
   applySunDirection(sunAzimuth, sunElevation);
   scene.add(sun);
   scene.add(sun.target);
-
-  const shadowHelper = new THREE.CameraHelper(sun.shadow.camera);
-  shadowHelper.visible = false;
-  scene.add(shadowHelper);
 
   scene.add(hemi);
 
@@ -342,12 +407,9 @@ function setUpLights() {
   scene.add(moon.target);
 }
 
-// Park the sun at its directional offset from the player and centre the shadow
-// frustum on the player — but SNAP that centre to whole shadow-map texel steps
-// along the light's own plane axes. Without this the texel grid slides
-// continuously under the geometry as you move, so shadow edges crawl/shimmer
-// ("swimming"). Snapping makes the grid jump one texel at a time, which is
-// imperceptible and rock-steady.
+// Park the sun at its offset from the player + snap the shadow frustum centre to
+// whole texel steps along the light's plane axes (stops shadow edges shimmering
+// as you move). The streaming anchor (player.position) follows the active camera.
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _up = new THREE.Vector3();
@@ -355,12 +417,12 @@ const _worldUp = new THREE.Vector3(0, 1, 0);
 const _altUp = new THREE.Vector3(0, 0, 1);
 const _center = new THREE.Vector3();
 function updateSunShadow() {
-  _fwd.copy(sunOffset).negate().normalize();                 // sun → player
+  _fwd.copy(sunOffset).negate().normalize();
   const up0 = Math.abs(_fwd.y) > 0.99 ? _altUp : _worldUp;
   _right.crossVectors(_fwd, up0).normalize();
   _up.crossVectors(_right, _fwd).normalize();
 
-  const texel = (2 * shadowRange) / SHADOW_MAP_SIZE;
+  const texel = (2 * shadowRange) / sun.shadow.mapSize.x;
   const px = player.position;
   const u = Math.round(px.dot(_right) / texel) * texel;
   const v = Math.round(px.dot(_up) / texel) * texel;
@@ -372,12 +434,6 @@ function updateSunShadow() {
 }
 
 // --- Biome-aware ambient tint ---------------------------------------------
-// Each biome carries an ambient tint (sky/ground fill + clear colour + a
-// brightness multiplier) in the chunkGen registry. We sample the biome under the
-// player and ease the lights toward its tint; the per-frame lerp makes crossing a
-// border a smooth fade (and biome regions are large, so it never strobes). This
-// is fully data-driven — a new biome's tint comes with its registry entry, no
-// edits here. `bright` multiplies the user's Sky/Fill base (slider stays boss).
 let baseFill = 1.1;
 const _tintSky = new THREE.Color(0xbcd6ff);
 const _tintGround = new THREE.Color(0x4d4233);
@@ -389,20 +445,13 @@ let _bright = 1, _targetBright = 1;
 let biomeTintTick = 0;
 
 // --- Day/night cycle -------------------------------------------------------
-// The sun rises in the east, arcs across the sky, and sets; the sky goes blue by
-// day → orange at dawn/dusk → dark navy at night, the directional sun fades out
-// at night (a low hemisphere "moonlight" floor keeps things visible), and fog +
-// clear colour follow the sky. Biome tint still shades the DAYTIME hue.
-let timeOfDay = 0.30;          // 0 midnight · 0.25 sunrise · 0.5 noon · 0.75 sunset
-let dayLength = 480;           // real seconds per full cycle
-let sunPeak = 2.9;             // midday sun intensity (GUI "Sun Brightness")
-// Sun elevation = BIAS + AMP·sin(...). The raised baseline (34) means the sun
-// only dips ~14° below the horizon at midnight, so the dark phase (elev<-6) is a
-// SHORT ~18% of the cycle — most of the day is daylight, with brief night.
+let timeOfDay = 0.30;
+let dayLength = 480;
+let sunPeak = 2.9;
 const SUN_BIAS = 34, SUN_AMP = 48;
-const NIGHT_SKY = new THREE.Color(0x141d33);   // lifted from near-black so the night horizon/fog reads
+const NIGHT_SKY = new THREE.Color(0x0c1120);
 const DUSK_SKY = new THREE.Color(0xe07338);
-const NIGHT_HEMI = new THREE.Color(0x3a4e70);  // brighter moonlit-sky ambient
+const NIGHT_HEMI = new THREE.Color(0x2c3c58);
 const SUN_DAY = new THREE.Color(0xfff2d8);
 const SUN_DUSK = new THREE.Color(0xff7326);
 const _sky = new THREE.Color();
@@ -410,18 +459,15 @@ const _hemiC = new THREE.Color();
 const sstep = THREE.MathUtils.smoothstep;
 
 function updateSky(delta: number) {
-  // 1) Place the sun. Day/night drives azimuth+elevation from `timeOfDay`; else
-  // the manual GUI sliders (sunAzimuth/sunElevation) hold.
   let elevReal = sunElevation;
   if (settings.dayNight) {
     timeOfDay = (timeOfDay + delta / Math.max(20, dayLength)) % 1;
-    elevReal = SUN_BIAS + SUN_AMP * Math.sin((timeOfDay - 0.25) * Math.PI * 2); // ~-14..+82
-    applySunDirection((timeOfDay * 360 + 60) % 360, elevReal);               // clamps elev for the light vector
+    elevReal = SUN_BIAS + SUN_AMP * Math.sin((timeOfDay - 0.25) * Math.PI * 2);
+    applySunDirection((timeOfDay * 360 + 60) % 360, elevReal);
   }
-  const daylight = THREE.MathUtils.clamp((elevReal + 6) / 18, 0, 1);         // 0 night → 1 day (twilight band)
-  const glow = sstep(elevReal, -8, 3) * (1 - sstep(elevReal, 3, 16));        // warm dawn/dusk near the horizon
+  const daylight = THREE.MathUtils.clamp((elevReal + 6) / 18, 0, 1);
+  const glow = sstep(elevReal, -8, 3) * (1 - sstep(elevReal, 3, 16));
 
-  // 2) Biome tint target (throttled sample) — the DAYTIME hue.
   if (settings.biomeLighting && (biomeTintTick++ % 8) === 0) {
     const s = world.sampler(Math.floor(player.position.x), Math.floor(player.position.z));
     const t = biomeTint(s.biome);
@@ -432,69 +478,174 @@ function updateSky(delta: number) {
   _tintClear.lerp(_targetClear, 0.04);
   _bright += (_targetBright - _bright) * 0.04;
 
-  // 3) Compose day/night over the biome tint.
-  _sky.copy(NIGHT_SKY).lerp(_tintClear, daylight).lerp(DUSK_SKY, glow * 0.6);  // sky/fog colour
+  _sky.copy(NIGHT_SKY).lerp(_tintClear, daylight).lerp(DUSK_SKY, glow * 0.6);
   renderer.setClearColor(_sky);
   if (scene.fog) (scene.fog as THREE.Fog).color.copy(_sky);
   _hemiC.copy(NIGHT_HEMI).lerp(_tintSky, daylight);
   hemi.color.copy(_hemiC);
   hemi.groundColor.copy(_tintGround).multiplyScalar(0.4 + 0.6 * daylight);
-  hemi.intensity = baseFill * _bright * (0.30 + 0.70 * daylight);            // raised night ambient floor
-  sun.intensity = sunPeak * daylight;                                         // sun off at night
-  sun.color.copy(SUN_DUSK).lerp(SUN_DAY, Math.min(1, daylight * 1.6));        // warm at the horizon
+  hemi.intensity = baseFill * _bright * (0.20 + 0.80 * daylight);
+  sun.intensity = sunPeak * daylight;
+  sun.color.copy(SUN_DUSK).lerp(SUN_DAY, Math.min(1, daylight * 1.6));
 
-  // Moon: cool fill that fades in as the sun goes down, so night is navigable.
+  const azr = sunAzimuth * Math.PI / 180, elr = elevReal * Math.PI / 180, ce = Math.cos(elr);
+  _sunDir.set(Math.cos(azr) * ce, Math.sin(elr), Math.sin(azr) * ce);
+  const skyDist = player.camera.far * 0.9;
+  sunSprite.position.copy(player.position).addScaledVector(_sunDir, skyDist);
+  moonSprite.position.copy(player.position).addScaledVector(_sunDir, -skyDist);
+  const ss = skyDist * 0.13, ms = skyDist * 0.09;
+  sunSprite.scale.set(ss, ss, 1);
+  moonSprite.scale.set(ms, ms, 1);
+  sunSprite.material.opacity = THREE.MathUtils.clamp(daylight * 1.6, 0, 1);
+  moonSprite.material.opacity = THREE.MathUtils.clamp((1 - daylight) * 1.3, 0, 1) * 0.95;
+
   moon.intensity = MOON_PEAK * (1 - daylight);
-  moon.position.copy(player.position).add(MOON_OFFSET);
+  moon.position.copy(player.position).addScaledVector(_sunDir, -SUN_DISTANCE);
   moon.target.position.copy(player.position);
 }
 
 function onMouseDown(event: MouseEvent) {
-  if(player.controls.isLocked && player.selectedCoords){
-    if(event.button === 0){
-      if(player.activeBlockId === blocks.air.id){
-        world.removeBlock(player.selectedCoords.x, player.selectedCoords.y, player.selectedCoords.z);
-        player.tool.startAnimation();
-      } else {
-        world.setBlock(player.selectedCoords.x, player.selectedCoords.y, player.selectedCoords.z, player.activeBlockId);
-      }
-    } else if(event.button === 2){
-      player.activeBlockId = world.getBlock(player.selectedCoords.x, player.selectedCoords.y, player.selectedCoords.z)?.id ?? blocks.air.id;
+  if (!player.controls.isLocked) return;   // also blocks edits in spectator / when paused
+  if (event.button === 2) {
+    const t = player.targetedBlock;
+    if (t && world.interactBlock(t.x, t.y, t.z)) return;
+    const s = player.selectedCoords;
+    if (s) player.activeBlockId = world.getBlock(s.x, s.y, s.z)?.id ?? blocks.air.id;
+    return;
+  }
+  if (event.button === 0 && player.selectedCoords) {
+    const c = player.selectedCoords;
+    if (player.activeBlockId === blocks.air.id) {
+      world.removeBlock(c.x, c.y, c.z);
+      player.tool.startAnimation();
+    } else {
+      world.setBlock(c.x, c.y, c.z, player.activeBlockId);
+      if (player.activeBlockId === BLOCK_IDS.oakDoorLowerClosed) world.setBlock(c.x, c.y + 1, c.z, BLOCK_IDS.oakDoorUpperClosed);
     }
   }
 }
 document.addEventListener('mousedown', onMouseDown);
 
-//draw loop
+// ===========================================================================
+//  QUALITY PRESETS  — bundle render distance, foliage, shadows, lights, etc.
+// ===========================================================================
+let qualityPreset: QualityPreset = 'fast';   // default to lowest graphics
+function applyQualityPreset(p: QualityPreset) {
+  qualityPreset = p;
+  if (p === 'fast') {
+    // Lowest: short view, tight foliage, NO shadow pass, NO dynamic point lights,
+    // NO cloud overdraw, downscaled render — the cheapest the engine goes.
+    world.drawDistance = 6; world.setFoliage(true, 3);
+    applyShadowQuality('off'); lightInterval = 4; lightManager.setEnabled(false);
+    settings.resolutionScale = 0.7; clouds.visible = false;
+  } else if (p === 'balanced') {
+    world.drawDistance = 12; world.setFoliage(true, 7);
+    applyShadowQuality('medium'); lightInterval = 2; lightManager.setEnabled(true);
+    settings.resolutionScale = 1; clouds.visible = true;
+  } else if (p === 'fancy') {
+    world.drawDistance = 16; world.setFoliage(true, 14);
+    applyShadowQuality('high'); lightInterval = 1; lightManager.setEnabled(true);
+    settings.resolutionScale = 1; clouds.visible = true;
+  }
+  applyResolution();
+  updateViewDistance();
+}
+
+setUpLights();
+applyQualityPreset(qualityPreset);   // sets draw distance + shadows + lights + resolution
+updateViewDistance();
+
+const menu = createMenu({
+  world,
+  player,
+  settings,
+  regenerate: () => { world.generate(false); },
+  onViewDistanceChange: updateViewDistance,
+  onResolutionChange: applyResolution,
+  getStats: () => {
+    const r = renderer.info.render, m = renderer.info.memory;
+    const p = mode === 'spectator' ? spectator.camera.position : player.position;
+    return {
+      fps, x: p.x, y: p.y, z: p.z,
+      drawCalls: r.calls, triangles: r.triangles, chunks: world.chunkCount,
+      geometries: m.geometries, textures: m.textures,
+      mode, flying: player.flying, onGround: player.onGround,
+    };
+  },
+  getMode: () => mode,
+  setMode,
+  onResume: resume,
+  onSave: () => world.save(),
+  onLoad: () => world.load(),
+  lighting: {
+    getSun: () => sunPeak, setSun: (v) => { sunPeak = v; },
+    getFill: () => baseFill, setFill: (v) => { baseFill = v; },
+    getExposure: () => renderer.toneMappingExposure, setExposure: (v) => { renderer.toneMappingExposure = v; },
+    getAzimuth: () => sunAzimuth, setAzimuth: (v) => applySunDirection(v, sunElevation),
+    getElevation: () => sunElevation, setElevation: (v) => applySunDirection(sunAzimuth, v),
+    getBiomeTint: () => settings.biomeLighting, setBiomeTint: (v) => { settings.biomeLighting = v; },
+    getDayNight: () => settings.dayNight, setDayNight: (v) => { settings.dayNight = v; },
+    getTime: () => timeOfDay, setTime: (v) => { timeOfDay = v; },
+    getDayLength: () => dayLength, setDayLength: (v) => { dayLength = v; },
+  },
+  quality: {
+    applyPreset: applyQualityPreset,
+    getPreset: () => qualityPreset,
+    getRenderDistance: () => world.drawDistance,
+    setRenderDistance: (v) => { world.drawDistance = v; qualityPreset = 'custom'; updateViewDistance(); },
+    getFoliage: () => world.foliageEnabled,
+    setFoliage: (v) => { world.setFoliage(v, world.foliageDistance); qualityPreset = 'custom'; },
+    getFoliageDistance: () => world.foliageDistance,
+    setFoliageDistance: (v) => { world.setFoliage(world.foliageEnabled, v); qualityPreset = 'custom'; },
+    getShadowQuality: () => shadowQuality,
+    setShadowQuality: (v) => { applyShadowQuality(v); qualityPreset = 'custom'; },
+    getShadowRange: () => shadowRange,
+    setShadowRange: (v) => { applyShadowRange(v); qualityPreset = 'custom'; },
+    getBlockLights: () => lightManager.enabled,
+    setBlockLights: (v) => { lightManager.setEnabled(v); qualityPreset = 'custom'; },
+    getClouds: () => clouds.visible,
+    setClouds: (v) => { clouds.visible = v; qualityPreset = 'custom'; },
+    getStatsOverlay: () => settings.statsOverlay,
+    setStatsOverlay: (v) => { settings.statsOverlay = v; updateHudVisibility(); },
+  },
+});
+
+// Start in the menu (Survival selected). The user clicks Play to lock in and go.
+// player input stays disabled until then so stray key presses don't grab the pointer.
+player.enabled = false;
+menu.open();
+updateHudVisibility();
+
+// draw loop
 function animate() {
   const currentTime = performance.now();
-  const delta = (currentTime - previousTime) / 1000;
+  // Clamp the step so a backgrounded tab (huge dt) can't spiral the physics
+  // accumulator into thousands of substeps on refocus.
+  const delta = Math.min((currentTime - previousTime) / 1000, 0.1);
+  const playing = !paused && !worldMap.isOpen();
 
-  if(player.controls.isLocked) {
+  if (mode === 'spectator') {
+    spectator.update(delta, !playing);
+    if (playing) player.position.copy(spectator.camera.position);   // streaming anchor follows the free-cam
+  } else if (playing && player.controls.isLocked) {
     player.update(world);
     physics.update(delta, player, world);
   }
 
-  // Advance the day/night cycle (places + colours the sun, sets sky/fog), then
-  // position the directed sun + its texel-snapped shadow frustum on the player.
-  updateSky(delta);
-  updateSunShadow();
-  updatePlantWind(currentTime / 1000);   // gentle foliage sway (vertex-shader wind)
+  updateSky(playing ? delta : 0);   // freeze the day/night clock while paused
+  if (sun.castShadow) updateSunShadow();   // skip the frustum maths entirely when shadows are off
+  updatePlantWind(currentTime / 1000);
 
   worldMap.update();
 
-  // When the 2D world map is open we don't render the voxel world at all — just
-  // the map overlay — so the main thread is free for map sampling.
   if (!worldMap.isOpen()) {
-    // Stream chunks and drain the bounded work queues every frame, even before
-    // pointer lock, so draw-distance changes fill in smoothly.
     world.update(player);
     world.processQueues();
+    if (lightManager.enabled && (lightTick++ % lightInterval) === 0) {
+      lightManager.update(world, player.position, currentTime / 1000);
+    }
 
     clouds.update(player.position.x, player.position.z, currentTime / 1000);
-    // Snap the water plane to a coarse grid and recolour its vertices only when
-    // that snapped centre changes — colours stay aligned with the (snapped) mesh,
-    // and the per-vertex world-sampling cost is paid only while crossing water.
     const wsx = Math.round(player.position.x / WATER_SNAP) * WATER_SNAP;
     const wsz = Math.round(player.position.z / WATER_SNAP) * WATER_SNAP;
     waterMesh.position.set(wsx, world.params.terrain.waterOffset + 0.45, wsz);
@@ -503,59 +654,28 @@ function animate() {
       updateWaterColors(wsx, wsz);
     }
 
-    // Orbit view on spawn (free look at the world); locking the pointer (press a
-    // movement key) switches to first-person play.
-    const activeCamera = player.controls.isLocked ? player.camera : OrbitCam;
-    // No manual frustum culling: three.js culls each chunk mesh automatically and
-    // PER PASS (main camera for colour, the sun's shadow camera for shadows), so
-    // an off-screen mountain still casts its shadow onto the player. Hiding
-    // chunks with .visible=false would have removed them from the shadow pass.
-    hudTick++;
+    const activeCamera = mode === 'spectator' ? spectator.camera : player.camera;
     renderer.render(scene, activeCamera);
   }
-  stats.update();
 
-  // Refresh the debug HUD a few times a second, not every frame — building the
-  // string (toLocaleString etc.) and writing innerText every frame is needless.
-  if (renderStatsEl && (hudTick & 15) === 0) {
-    const r = renderer.info.render, m = renderer.info.memory;
-    // Draw calls already reflect what survives three's per-pass frustum cull, so
-    // it's the meaningful "what's actually drawn" number (chunks = total loaded).
-    // geom/tex (live GPU resources) are a cheap leak guard-rail — they should
-    // track chunkCount, not climb without bound.
-    renderStatsEl.innerText =
-      `draw calls: ${r.calls}  |  triangles: ${r.triangles.toLocaleString()}\n` +
-      `chunks loaded: ${world.chunkCount}  |  geom: ${m.geometries}  tex: ${m.textures}`;
+  // Live FPS (rolling, ~4×/s) for the debug menu + the always-on overlay.
+  fpsFrames++;
+  if (currentTime - fpsLast >= 250) {
+    fps = fpsFrames * 1000 / (currentTime - fpsLast); fpsFrames = 0; fpsLast = currentTime;
+    if (statsOverlayEl.style.display !== 'none') {
+      const r = renderer.info.render;
+      const p = mode === 'spectator' ? spectator.camera.position : player.position;
+      statsOverlayEl.textContent =
+        `FPS ${Math.round(fps)}  ·  ${mode}\n` +
+        `XYZ ${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)}\n` +
+        `draws ${r.calls}  ·  tris ${r.triangles.toLocaleString()}\n` +
+        `chunks ${world.chunkCount}`;
+    }
   }
+  if (menu.isOpen()) menu.refreshStats();
 
   previousTime = currentTime;
   scheduleFrame();
 }
 
-setUpLights();
-updateViewDistance();
-createGUI({
-  world,
-  player,
-  settings,
-  regenerate: () => { world.generate(false); }, // preserve edits; generate() refreshes the map via onAfterGenerate
-  onViewDistanceChange: updateViewDistance,
-  onResolutionChange: applyResolution,
-  lighting: {
-    getSun: () => sunPeak, setSun: (v) => { sunPeak = v; },   // midday peak; day/night scales it
-    getFill: () => baseFill, setFill: (v) => { baseFill = v; },
-    getExposure: () => renderer.toneMappingExposure, setExposure: (v) => { renderer.toneMappingExposure = v; },
-    getShadowRange: () => shadowRange, setShadowRange: applyShadowRange,
-    getShadows: () => sun.castShadow, setShadows: (v) => { sun.castShadow = v; },
-    // Sun direction (manual). Used when the Day/Night cycle is OFF; otherwise the
-    // cycle overwrites it each frame.
-    getAzimuth: () => sunAzimuth, setAzimuth: (v) => applySunDirection(v, sunElevation),
-    getElevation: () => sunElevation, setElevation: (v) => applySunDirection(sunAzimuth, v),
-    getBiomeTint: () => settings.biomeLighting, setBiomeTint: (v) => { settings.biomeLighting = v; },
-    // Day/night cycle.
-    getDayNight: () => settings.dayNight, setDayNight: (v) => { settings.dayNight = v; },
-    getTime: () => timeOfDay, setTime: (v) => { timeOfDay = v; },
-    getDayLength: () => dayLength, setDayLength: (v) => { dayLength = v; },
-  },
-});
 animate();

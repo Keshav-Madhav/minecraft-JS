@@ -12,17 +12,25 @@ const SPAWN = new Three.Vector3(0, 200, 0);
 const _hitInside = new Three.Vector3();
 const _hitOutside = new Three.Vector3();
 const _selected = new Three.Vector3();
+const _targeted = new Three.Vector3();
 
 // ---- movement tuning -------------------------------------------------------
 const SPRINT_MULT = 1.35;        // sprint speed = maxSpeed × this
 const GROUND_ACCEL = 70;         // m/s² ramp toward target speed on the ground
 const AIR_ACCEL = 26;            // limited air control (steer, don't fully redirect)
 const GROUND_FRICTION = 13;      // exponential decel coeff when stopping on the ground
+const ICE_ACCEL = 16;            // low traction on ice: slow to build/redirect speed
+const ICE_FRICTION = 1.4;        // ice barely slows you → a long glide to a stop
 const COYOTE_TIME = 0.10;        // s after walking off an edge you can still jump
 const JUMP_BUFFER = 0.16;        // s a jump press is remembered (fires the instant you land)
 const SPRINT_JUMP_BOOST = 1.18;  // forward-speed multiplier kicked in on a sprint-jump
 const DOUBLE_TAP_MS = 280;       // double-tap-forward window to start sprinting
 const BASE_FOV = 70, SPRINT_FOV = 78;
+// --- flight (creative + survival's "enable flight") -------------------------
+const FLY_BASE = 1.6;            // fly speed = maxSpeed × this (horizontal AND vertical)
+const FLY_SPRINT = 3.0;          // fly-sprint multiplier (double-tap-forward while flying)
+const FLY_ACCEL = 80;            // responsive full-control acceleration while flying
+const FLY_TOGGLE_MS = 300;       // double-tap-space window to toggle flight on/off
 // move cur toward target by at most maxStep (per-substep linear acceleration).
 const approach = (cur: number, target: number, maxStep: number) => {
   const d = target - cur;
@@ -43,6 +51,7 @@ export class Player {
   height = 1.8;
   jumpSpeed = 10;
   onGround = false;
+  onIce = false;   // set by Physics: standing on ice/packed ice → slide (low friction)
 
   maxSpeed = 8;   // walking speed (GUI "Speed" slider); sprint scales from this
   // velocity is camera-local: x = strafe/right, z = forward, y = vertical. The
@@ -55,18 +64,30 @@ export class Player {
 
   // movement input + state
   #kW = false; #kS = false; #kA = false; #kD = false;  // held direction keys
+  #kUp = false; #kDown = false;  // ascend / descend (Space / Shift) while flying
   sprintKey = false;             // sprint modifier (Shift) held
   #doubleTapSprint = false;      // double-tap-forward sprint, sticky until forward released
   #lastTapW = 0;
+  #lastTapSpace = 0;             // double-tap-space → toggle flight
   sprinting = false;             // resolved sprint state (drives the FOV kick)
   #coyote = COYOTE_TIME;         // time since last grounded (coyote window)
   #jumpBuffer = 0;               // remaining validity of a buffered jump press
   #fov = BASE_FOV;
 
+  // Flight. `flying` = no gravity, free vertical movement (Space up / Shift down);
+  // `canFly` gates the double-tap-space toggle (Creative + Survival both allow it).
+  // Physics skips gravity/buoyancy while flying but STILL resolves collisions, so
+  // you stop at walls instead of clipping (MC-style creative flight).
+  flying = false;
+  canFly = true;
+  // Space held (regardless of flying) — read by Physics for swim-up while in water.
+  wantsUp = false;
+
   cameraHelper = new Three.CameraHelper(this.camera);
 
   raycaster = new Three.Raycaster(undefined, undefined, 0, 4);
   selectedCoords:  Three.Vector3 | null = null;
+  targetedBlock:   Three.Vector3 | null = null;   // the SOLID block under the crosshair (for right-click "use")
   selectionHelper: Three.Mesh;
 
   activeBlockId = blocks.air.id;
@@ -107,8 +128,16 @@ export class Player {
   update(world: World) {
     this.updateRayCast(world)
     this.tool.update();
-    this.updateHud();
     this.#updateFov();
+  }
+
+  // Toggle flight (double-tap space, or set by the mode switch). Clears vertical
+  // velocity so you don't keep a fall/jump impulse, and un-grounds on takeoff.
+  setFlying(v: boolean) {
+    if (this.flying === v) return;
+    this.flying = v;
+    this.velocity.y = 0;
+    if (v) this.onGround = false;
   }
 
   // Subtle FOV widen while sprinting (sense of speed). Per-frame lerp; only
@@ -148,10 +177,16 @@ export class Player {
         this.selectedCoords = _selected.set(Math.round(_hitOutside.x), Math.round(_hitOutside.y), Math.round(_hitOutside.z));
       }
 
+      // The SOLID block actually under the crosshair (nudge INTO the hit) — used
+      // for right-click "use" (open a door/trapdoor) regardless of held block.
+      _targeted.copy(intersection.point).addScaledVector(dir, 0.01);
+      this.targetedBlock = _targeted.set(Math.round(_targeted.x), Math.round(_targeted.y), Math.round(_targeted.z));
+
       this.selectionHelper.position.copy(this.selectedCoords);
       this.selectionHelper.visible = true;
     } else {
       this.selectedCoords = null;
+      this.targetedBlock = null;
       this.selectionHelper.visible = false;
     }
   }
@@ -195,6 +230,7 @@ export class Player {
   // control, and a buffered/coyote-time jump. Gives movement momentum: you ramp
   // up and coast down instead of snapping between full speed and a dead stop.
   #updateMovement(delta: number) {
+    if (this.flying) { this.#updateFlying(delta); return; }
     // --- jump assist: coyote time + input buffer ---
     this.#coyote = this.onGround ? 0 : this.#coyote + delta;
     if (this.#jumpBuffer > 0) this.#jumpBuffer -= delta;
@@ -216,12 +252,13 @@ export class Player {
     const speed = this.sprinting ? this.maxSpeed * SPRINT_MULT : this.maxSpeed;
 
     if (wl > 0) {
-      const accel = (this.onGround ? GROUND_ACCEL : AIR_ACCEL) * delta;
+      const groundAccel = this.onIce ? ICE_ACCEL : GROUND_ACCEL;
+      const accel = (this.onGround ? groundAccel : AIR_ACCEL) * delta;
       this.velocity.x = approach(this.velocity.x, wx * speed, accel);
       this.velocity.z = approach(this.velocity.z, wf * speed, accel);
     } else if (this.onGround) {
-      // no input on the ground: friction eases to a stop (snappy, not instant)
-      const damp = Math.exp(-GROUND_FRICTION * delta);
+      // no input on the ground: friction eases to a stop (a long glide on ice)
+      const damp = Math.exp(-(this.onIce ? ICE_FRICTION : GROUND_FRICTION) * delta);
       this.velocity.x *= damp;
       this.velocity.z *= damp;
       if (Math.abs(this.velocity.x) < 0.05) this.velocity.x = 0;
@@ -230,13 +267,32 @@ export class Player {
     // airborne with no input → momentum preserved (no friction): sprint-jumps glide
   }
 
-  // Refresh the position HUD. Called once per rendered frame — NOT from the
-  // 200 Hz physics substep, where it cost up to 200 getElementById + innerText
-  // (layout-triggering) writes per second.
-  private posEl: HTMLElement | null = null;
-  updateHud() {
-    if (!this.posEl) this.posEl = document.getElementById('player-pos');
-    if (this.posEl) this.posEl.innerText = this.toString();
+  // Flight movement: full-control horizontal accel (no gravity, no ground/air
+  // distinction) plus direct vertical from Space/Shift. While flying, Shift means
+  // "descend" (not sprint), so fly-sprint is via double-tap-forward only.
+  #updateFlying(delta: number) {
+    let wx = (this.#kD ? 1 : 0) - (this.#kA ? 1 : 0);
+    let wf = (this.#kW ? 1 : 0) - (this.#kS ? 1 : 0);
+    const wl = Math.hypot(wx, wf);
+    if (wl > 0) { wx /= wl; wf /= wl; }
+
+    this.sprinting = this.#doubleTapSprint && wf > 0.1;
+    const speed = this.maxSpeed * (this.sprinting ? FLY_SPRINT : FLY_BASE);
+    const accel = FLY_ACCEL * delta;
+    const damp = Math.exp(-GROUND_FRICTION * delta);
+
+    if (wl > 0) {
+      this.velocity.x = approach(this.velocity.x, wx * speed, accel);
+      this.velocity.z = approach(this.velocity.z, wf * speed, accel);
+    } else {
+      this.velocity.x *= damp; this.velocity.z *= damp;
+      if (Math.abs(this.velocity.x) < 0.05) this.velocity.x = 0;
+      if (Math.abs(this.velocity.z) < 0.05) this.velocity.z = 0;
+    }
+
+    const vy = (this.#kUp ? 1 : 0) - (this.#kDown ? 1 : 0);
+    if (vy !== 0) this.velocity.y = approach(this.velocity.y, vy * speed, accel);
+    else { this.velocity.y *= damp; if (Math.abs(this.velocity.y) < 0.05) this.velocity.y = 0; }
   }
 
   updateBounds() {
@@ -302,7 +358,7 @@ export class Player {
       case 's': this.#kS = true; break;
       case 'a': this.#kA = true; break;
       case 'd': this.#kD = true; break;
-      case 'Shift': this.sprintKey = true; break;
+      case 'Shift': this.sprintKey = true; this.#kDown = true; break;   // descend while flying
       case 'r':
         this.camera.position.copy(SPAWN);
         this.velocity.set(0, 0, 0);
@@ -310,9 +366,18 @@ export class Player {
         this.#coyote = COYOTE_TIME + 1;
         break;
       case ' ':
-        // buffer the jump; #updateMovement fires it the moment it's valid (so a
-        // press a hair early, or while pressed against a block, still jumps).
-        this.#jumpBuffer = JUMP_BUFFER;
+        // double-tap space toggles flight (Creative + Survival). While flying,
+        // holding space ascends; otherwise buffer a jump (fires the moment it's
+        // valid — a hair early, or while pressed against a block, still jumps).
+        // wantsUp tracks the held key for swim-up in water (see Physics).
+        this.wantsUp = true;
+        if (!event.repeat && this.canFly) {
+          const now = performance.now();
+          if (now - this.#lastTapSpace < FLY_TOGGLE_MS) this.setFlying(!this.flying);
+          this.#lastTapSpace = now;
+        }
+        if (this.flying) this.#kUp = true;
+        else this.#jumpBuffer = JUMP_BUFFER;
         break;
     }
   }
@@ -324,7 +389,8 @@ export class Player {
       case 's': this.#kS = false; break;
       case 'a': this.#kA = false; break;
       case 'd': this.#kD = false; break;
-      case 'Shift': this.sprintKey = false; break;
+      case 'Shift': this.sprintKey = false; this.#kDown = false; break;
+      case ' ': this.#kUp = false; this.wantsUp = false; break;
     }
   }
 

@@ -5,6 +5,8 @@
 // every PNG to the GPU a second time and built ~30 unused materials. The worker
 // uses the parallel pure-data module `blockTypes.ts`.
 
+import { BLOCK_IDS } from './blockTypes';
+
 type allBlocks = 'air' | 'grass' | 'dirt' | 'stone' | 'coalOre' | 'ironOre' | 'tree' | 'leaves' | 'sand' | 'cloud' | 'snow';
 
 type BlockInfo = {
@@ -29,7 +31,7 @@ export const blocks: { [key in allBlocks]: BlockInfo } = {
   snow:    { id: 10, name: 'Snow',        color: 0xffffff },
 };
 
-type ResourceInfo = { id: number; name: string; color: number; scale: { x: number; y: number; z: number }; scarcity: number };
+type ResourceInfo = { id: number; name: string; color: number; scale: { x: number; y: number; z: number }; scarcity: number; minY?: number; maxY?: number };
 
 function assertResource(block: BlockInfo): ResourceInfo {
   if (block.color === undefined || block.scale === undefined || block.scarcity === undefined) {
@@ -38,10 +40,26 @@ function assertResource(block: BlockInfo): ResourceInfo {
   return { id: block.id, name: block.name, color: block.color, scale: block.scale, scarcity: block.scarcity };
 }
 
+// Ore veins + stone-variant patches scattered into the host rock (stone OR
+// deepslate). Ores carry a [minY,maxY] depth window so they layer by depth
+// (diamond/redstone deep, copper shallow, …) — also makes their sweep cheaper.
+// ORES come first so they claim host rock before the (common) stone variants
+// fill the rest; variants never overwrite an ore (only host rock is replaced).
+const oreGen = (id: number, name: string, color: number, s: number, scarcity: number, minY: number, maxY: number): ResourceInfo =>
+  ({ id, name, color, scale: { x: s, y: s, z: s }, scarcity, minY, maxY });
+
 export const resources: ResourceInfo[] = [
-  // Ore veins scattered into stone. (Stone itself is placed by the terrain
-  // pass, so it's no longer a "resource" — that was a no-op that wasted a noise
-  // sweep and showed a do-nothing slider.)
   assertResource(blocks.coalOre),
   assertResource(blocks.ironOre),
+  oreGen(BLOCK_IDS.copperOre, 'Copper Ore', 0xc06a48, 16, 0.82, 4, 96),
+  oreGen(BLOCK_IDS.goldOre, 'Gold Ore', 0xf4c130, 12, 0.86, 2, 40),
+  oreGen(BLOCK_IDS.redstoneOre, 'Redstone Ore', 0xc81818, 12, 0.84, 2, 18),
+  oreGen(BLOCK_IDS.lapisOre, 'Lapis Ore', 0x2a4c9a, 10, 0.87, 2, 36),
+  oreGen(BLOCK_IDS.diamondOre, 'Diamond Ore', 0x5fe0d8, 10, 0.90, 1, 15),
+  oreGen(BLOCK_IDS.emeraldOre, 'Emerald Ore', 0x2ea84e, 8, 0.92, 6, 120),
+  // stone variants: large smooth blobs of alternate rock through the stone column
+  oreGen(BLOCK_IDS.andesite, 'Andesite', 0x8a8a8e, 26, 0.58, 0, 110),
+  oreGen(BLOCK_IDS.diorite, 'Diorite', 0xd0d0d2, 26, 0.60, 0, 110),
+  oreGen(BLOCK_IDS.granite, 'Granite', 0xa9776a, 26, 0.60, 0, 110),
+  oreGen(BLOCK_IDS.tuff, 'Tuff', 0x6e7066, 18, 0.62, 0, 26),
 ];

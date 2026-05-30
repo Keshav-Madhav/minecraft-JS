@@ -1,23 +1,38 @@
 import { ChunkParams, ChunkSize } from './chunkGen';
 import type { MapWorkerRequest, MapTileResponse } from './mapWorker';
+import { idbGetTile, idbPutTile } from './mapTileCache';
 
 const clamp = (v: number, a: number, b: number) => v < a ? a : v > b ? b : v;
 
-// Map tiles are rendered by the worker at TILE_PX pixels and cached. Multiple
-// world-sizes (zoom levels, like a slippy map) keep the number of visible tiles
-// bounded at ANY zoom — without that, zooming far out needed thousands of tiles
-// and thrashed the cache. A tile's world-size is chosen so it draws ~TILE_PX on
-// screen (≈1 tile-pixel per screen-pixel).
+// ---------------------------------------------------------------------------
+//  MINIMAP — now rendered directly from the world's already-generated per-chunk
+//  tiles (WorldChunk.getMapTileCanvas), blitted 1:1. No map-worker round-trip,
+//  no chunk re-generation: it's always in sync with what's loaded and costs only
+//  a handful of drawImage calls per frame. (The old path regenerated whole 128-
+//  world tiles — ~64 chunks of full chunk-gen each — continuously as you walked,
+//  which is what made the detailed view slow.)
+//
+//  FULLSCREEN MAP — still rendered by the map-worker pool (it can pan anywhere,
+//  including unloaded terrain), but tiles are now persisted in IndexedDB keyed by
+//  the world signature, so revisited areas load instantly and survive reloads.
+// ---------------------------------------------------------------------------
+
+// Fullscreen-map tiles are rendered by the worker at TILE_PX pixels and cached.
+// Multiple world-sizes (zoom levels, like a slippy map) keep the number of
+// visible tiles bounded at ANY zoom.
 const TILE_PX = 128;
 const TILE_LEVELS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384];
-const MAX_CACHE = 900;        // LRU cap on cached tile canvases (touch-on-use)
-const MAX_TILE_OUTSTANDING = 8;
+const MAX_CACHE = 1200;       // LRU cap on in-memory tile canvases (touch-on-use)
+// The minimap no longer uses the worker pool, and the game's chunk workers are
+// idle while the fullscreen map is open (the voxel world isn't rendered then), so
+// we can afford a wider pool for snappier map loads.
+const MAP_WORKERS = Math.max(3, Math.min(6, (navigator.hardwareConcurrency || 4) - 1));
+const MAX_TILE_OUTSTANDING = MAP_WORKERS * 6;   // queue a few per worker so none idles
 
 // Choose the world-size whose pixels are at-or-finer than the screen, so tiles
-// are crisp (never upscaled into a muddy blur). Picking the *coarser* level was
-// what made zoomed-out views muddy.
+// are crisp (never upscaled into a muddy blur).
 function pickTileWorld(worldPerPixel: number): number {
-  const maxL = worldPerPixel * TILE_PX; // tile detail (L/TILE_PX) <= screen wpp
+  const maxL = worldPerPixel * TILE_PX;
   let chosen = TILE_LEVELS[0];
   for (const L of TILE_LEVELS) {
     if (L <= maxL) chosen = L; else break;
@@ -27,6 +42,8 @@ function pickTileWorld(worldPerPixel: number): number {
 
 export type WorldMapOptions = {
   getPlayer: () => { x: number, z: number, yaw: number },
+  // Cached top-down canvas for a loaded chunk, or null if not loaded (minimap).
+  getChunkTile: (chunkX: number, chunkZ: number) => HTMLCanvasElement | null,
   onTeleport: (worldX: number, worldZ: number) => void,
   onOpen?: () => void,
   onClose?: () => void,
@@ -36,18 +53,21 @@ type WantTile = { key: string, originX: number, originZ: number, tileWorld: numb
 
 export class WorldMap {
   private opts: WorldMapOptions;
-  private worker: Worker | null = null;
+  private workers: Worker[] = [];
+  private nextWorker = 0;   // round-robin index for spreading tile requests
 
-  // tile cache
+  // fullscreen-map tile cache
   private cache = new Map<string, HTMLCanvasElement>();
   private requested = new Set<string>();
   private outstanding = 0;
   private want: WantTile[] = [];
+  private sig = '0';        // world signature — IDB key prefix + stale-result guard
+  private chunkW = 16;      // chunk width in blocks (set in configure)
 
   // minimap
+  private miniWrap: HTMLElement;
   private mini: HTMLCanvasElement;
   private miniMarker: HTMLElement;
-  private miniWpp = 4;
 
   // fullscreen map
   private overlay: HTMLElement;
@@ -65,14 +85,17 @@ export class WorldMap {
     this.opts = opts;
     this.initWorker();
 
-    const miniWrap = document.createElement('div');
-    miniWrap.className = 'minimap';
+    this.miniWrap = document.createElement('div');
+    this.miniWrap.className = 'minimap';
     this.mini = document.createElement('canvas');
-    this.mini.width = this.mini.height = 160;
+    this.mini.width = this.mini.height = 192;   // 192 blocks across at 1 block/px
     this.miniMarker = document.createElement('div');
     this.miniMarker.className = 'minimap__marker';
-    miniWrap.append(this.mini, this.miniMarker);
-    document.body.append(miniWrap);
+    this.miniWrap.append(this.mini, this.miniMarker);
+    // Click the minimap to open the fullscreen world map.
+    this.miniWrap.title = 'Open map (M)';
+    this.miniWrap.addEventListener('click', () => this.openMap());
+    document.body.append(this.miniWrap);
 
     this.overlay = document.createElement('div');
     this.overlay.className = 'worldmap';
@@ -80,7 +103,7 @@ export class WorldMap {
     this.big.className = 'worldmap__canvas';
     const hint = document.createElement('div');
     hint.className = 'worldmap__hint';
-    hint.textContent = 'Drag to pan · scroll to zoom · click to teleport · Esc/G to close';
+    hint.textContent = 'Drag to pan · scroll to zoom · click to teleport · Esc/M to close';
     const close = document.createElement('button');
     close.className = 'worldmap__close';
     close.textContent = '✕';
@@ -93,37 +116,48 @@ export class WorldMap {
 
   private initWorker() {
     try {
-      this.worker = new Worker(new URL('./mapWorker.ts', import.meta.url), { type: 'module' });
-      this.worker.onmessage = (e: MessageEvent<MapTileResponse>) => this.onTile(e.data);
-      this.worker.onerror = () => { this.worker = null; };
+      for (let i = 0; i < MAP_WORKERS; i++) {
+        const w = new Worker(new URL('./mapWorker.ts', import.meta.url), { type: 'module' });
+        w.onmessage = (e: MessageEvent<MapTileResponse>) => this.onTile(e.data);
+        w.onerror = () => { /* keep the rest of the pool alive */ };
+        this.workers.push(w);
+      }
     } catch {
-      this.worker = null;
+      this.workers = [];
     }
   }
 
-  // (Re)point the map worker at the current world; clears cached tiles.
+  // (Re)point the map workers at the current world; clears the in-memory cache and
+  // sets the world signature (IDB key prefix), so a regenerated/loaded world never
+  // shows another world's persisted tiles.
   configure(params: ChunkParams, size: ChunkSize, sea: number) {
     this.cache.clear();
     this.requested.clear();
     this.outstanding = 0;
-    if (this.worker) {
-      const msg: MapWorkerRequest = { type: 'config', params, size, sea };
-      this.worker.postMessage(msg);
-    }
+    this.chunkW = size.width;
+    const t = params.terrain;
+    this.sig = `${params.seed}_${t.scale}_${t.magnitude}_${t.offset}_${t.waterOffset}`;
+    const msg: MapWorkerRequest = { type: 'config', params, size, sea };
+    for (const w of this.workers) w.postMessage(msg);   // every worker needs the world config
   }
 
+  // Worker finished a tile → adopt it and persist to IDB for next time.
   private onTile(res: MapTileResponse) {
+    this.adoptTile(res.key, res.buffer, res.tilePx, true);
+  }
+
+  private adoptTile(key: string, buffer: ArrayBuffer, tilePx: number, persist: boolean) {
     this.outstanding = Math.max(0, this.outstanding - 1);
-    this.requested.delete(res.key);
+    this.requested.delete(key);
     const canvas = document.createElement('canvas');
-    canvas.width = canvas.height = res.tilePx;
-    canvas.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(res.buffer), res.tilePx, res.tilePx), 0, 0);
-    this.cache.set(res.key, canvas);
+    canvas.width = canvas.height = tilePx;
+    canvas.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(buffer), tilePx, tilePx), 0, 0);
+    this.cache.set(key, canvas);
     if (this.cache.size > MAX_CACHE) {
-      // evict oldest (Map preserves insertion order) that isn't pending
       const oldest = this.cache.keys().next().value as string | undefined;
-      if (oldest) this.cache.delete(oldest);
+      if (oldest && oldest !== key) this.cache.delete(oldest);
     }
+    if (persist) idbPutTile(this.sig + '|' + key, buffer);
   }
 
   private bindMapEvents() {
@@ -151,11 +185,10 @@ export class WorldMap {
         this.close();
       }
     });
-    // Gentle, proportional zoom (exp of scroll delta) — the old 1.15-per-event
-    // step was far too sensitive, especially on trackpads.
+    // Gentle, proportional zoom (exp of scroll delta).
     this.big.addEventListener('wheel', (e) => {
       e.preventDefault();
-      this.wpp = clamp(this.wpp * Math.exp(e.deltaY * 0.0012), 1.5, 64);
+      this.wpp = clamp(this.wpp * Math.exp(e.deltaY * 0.0012), 1, 64);
     }, { passive: false });
   }
 
@@ -175,6 +208,7 @@ export class WorldMap {
   toggle() { this.open ? this.close() : this.openMap(); }
 
   openMap() {
+    if (this.open) return;
     const p = this.opts.getPlayer();
     this.centerX = p.x; this.centerZ = p.z;
     const aspect = window.innerHeight / window.innerWidth;
@@ -186,12 +220,34 @@ export class WorldMap {
   }
 
   close() {
+    if (!this.open) return;
     this.overlay.classList.remove('worldmap--open');
     this.open = false;
     this.opts.onClose?.();
   }
 
-  // Composite cached tiles for a view; queues any missing tiles (nearest first).
+  // ---- minimap: blit loaded chunk tiles directly (fast, in-sync) ------------
+  private compositeMini(px: number, pz: number) {
+    const ctx = this.mini.getContext('2d')!;
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = '#0b0f17';
+    ctx.fillRect(0, 0, this.mini.width, this.mini.height);
+
+    const W = this.chunkW;
+    const half = this.mini.width / 2;
+    // Integer screen origin so adjacent tiles abut perfectly (no seams/gaps).
+    const ox = Math.round(half - px), oz = Math.round(half - pz);
+    const cx0 = Math.floor((px - half) / W), cx1 = Math.floor((px + half) / W);
+    const cz0 = Math.floor((pz - half) / W), cz1 = Math.floor((pz + half) / W);
+    for (let cz = cz0; cz <= cz1; cz++) {
+      for (let cx = cx0; cx <= cx1; cx++) {
+        const tile = this.opts.getChunkTile(cx, cz);
+        if (tile) ctx.drawImage(tile, ox + cx * W, oz + cz * W, W, W);
+      }
+    }
+  }
+
+  // ---- fullscreen map: composite cached tiles; queue missing ones -----------
   private composite(canvas: HTMLCanvasElement, cx: number, cz: number, wpp: number) {
     const ctx = canvas.getContext('2d')!;
     ctx.imageSmoothingEnabled = true;
@@ -213,9 +269,7 @@ export class WorldMap {
         const sy = (oz - topW) / wpp;
         const tile = this.cache.get(key);
         if (tile) {
-          // Touch on use (move to most-recent) so a visible tile is never the
-          // LRU eviction victim — that was causing visible tiles to be evicted,
-          // re-requested and re-rendered in a flickering loop.
+          // Touch on use (LRU) so a visible tile is never the eviction victim.
           this.cache.delete(key);
           this.cache.set(key, tile);
           ctx.drawImage(tile, sx, sy, ss, ss);
@@ -227,38 +281,57 @@ export class WorldMap {
     }
   }
 
-  // Drain the want-list to the worker, nearest first, gated by outstanding.
+  // Drain the want-list, nearest first, gated by outstanding. Each tile is first
+  // looked up in the persistent IDB cache; only a miss hits the worker pool.
   private pumpRequests() {
-    if (!this.worker || this.want.length === 0) return;
+    if (this.want.length === 0) return;
     this.want.sort((a, b) => a.d - b.d);
     for (const t of this.want) {
       if (this.outstanding >= MAX_TILE_OUTSTANDING) break;
       if (this.requested.has(t.key) || this.cache.has(t.key)) continue;
       this.requested.add(t.key);
       this.outstanding++;
-      const msg: MapWorkerRequest = {
-        type: 'tile', key: t.key,
-        originX: t.originX, originZ: t.originZ,
-        tileWorld: t.tileWorld, tilePx: TILE_PX,
-      };
-      this.worker.postMessage(msg);
+      this.resolveTile(t);
     }
     this.want.length = 0;
+  }
+
+  private async resolveTile(t: WantTile) {
+    const sigAtRequest = this.sig;
+    let buf: ArrayBuffer | null = null;
+    try { buf = await idbGetTile(this.sig + '|' + t.key); } catch { buf = null; }
+    // World may have regenerated while we awaited IDB — drop the stale result.
+    if (this.sig !== sigAtRequest) {
+      this.outstanding = Math.max(0, this.outstanding - 1);
+      this.requested.delete(t.key);
+      return;
+    }
+    if (buf) { this.adoptTile(t.key, buf, TILE_PX, false); return; }
+    if (this.workers.length === 0) {
+      this.outstanding = Math.max(0, this.outstanding - 1);
+      this.requested.delete(t.key);
+      return;
+    }
+    const msg: MapWorkerRequest = {
+      type: 'tile', key: t.key,
+      originX: t.originX, originZ: t.originZ,
+      tileWorld: t.tileWorld, tilePx: TILE_PX,
+    };
+    this.workers[this.nextWorker++ % this.workers.length].postMessage(msg);   // reply lands in onTile
   }
 
   // Called every frame.
   update() {
     const p = this.opts.getPlayer();
-    this.want.length = 0;
-
     this.miniMarker.style.transform = `translate(-50%, -50%) rotate(${p.yaw}rad)`;
-    this.composite(this.mini, p.x, p.z, this.miniWpp);
+    this.compositeMini(p.x, p.z);
 
     if (this.open) {
+      this.want.length = 0;
       this.composite(this.big, this.centerX, this.centerZ, this.wpp);
       this.drawPlayerOnMap(p.x, p.z);
+      this.pumpRequests();
     }
-    this.pumpRequests();
   }
 
   private drawPlayerOnMap(px: number, pz: number) {

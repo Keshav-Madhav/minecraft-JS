@@ -1,6 +1,6 @@
-import { generateChunkData, createWorldSampler, WorldSampler, ChunkParams, ChunkSize } from './chunkGen';
+import { generateChunkData, createWorldSampler, wellShaftRange, biomeWaterHex, WorldSampler, ChunkParams, ChunkSize } from './chunkGen';
 import { ResourceGenInfo, BLOCK_IDS } from './blockTypes';
-import { buildChunkGeometry, GeometryArrays } from './chunkMesh';
+import { buildChunkGeometry, buildChunkMapTile, scanEmitters, GeometryArrays } from './chunkMesh';
 
 // The worker generates a chunk's block data AND greedily meshes it, off the
 // main thread. Cross-chunk border faces are culled by sampling the deterministic
@@ -24,7 +24,7 @@ export type WorkerRequest = ConfigMessage | GenMessage;
 export type GeometryPayload = {
   positions: ArrayBuffer, normals: ArrayBuffer, uvs: ArrayBuffer, layers: ArrayBuffer, indices: ArrayBuffer,
   i16: boolean,   // whether `indices` is a Uint16Array (else Uint32Array) — for reconstruction on the main thread
-  colors?: ArrayBuffer,   // plants group only: vec4/vertex (biome tint rgb + wind sway a)
+  colors?: ArrayBuffer,   // vec4/vertex tint: plants (rgb + sway a) AND cubes (biome tint rgb, white=untinted)
 } | null;
 
 export type MeshMessage = {
@@ -35,6 +35,8 @@ export type MeshMessage = {
   casters: GeometryPayload,
   nonCasters: GeometryPayload,
   plants: GeometryPayload,   // cross-billboard / carpet / vine foliage
+  emitters: ArrayBuffer,     // light-emitter world positions [wx,wy,wz,id,…] (Float32) for the point-light pool
+  mapTile: ArrayBuffer,      // W×W RGBA top-down tile for the in-sync minimap (Uint8)
 };
 
 let config: ConfigMessage | null = null;
@@ -66,30 +68,47 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const sample = sampler;
   const { worldX, worldZ } = msg;
 
-  // Capture the per-column biome during generation so plant tinting is a free
-  // array lookup instead of re-sampling columnSurface for every grass-tinted cell.
-  const biomeMap = new Uint8Array(cfg.size.width * cfg.size.width);
-  const data = generateChunkData(cfg.size, cfg.params, worldX, worldZ, cfg.resources, biomeMap);
+  // Capture the per-column climate grass tint during generation so plant tinting
+  // is a free array read instead of re-sampling columnSurface per grass cell.
+  const tw = cfg.size.width;
+  const tintMap = new Uint8Array(tw * tw * 3);
+  const data = generateChunkData(cfg.size, cfg.params, worldX, worldZ, cfg.resources, tintMap);
 
   // Apron: neighbour solidity from the deterministic surface height. Memoised
   // per border column so repeated y queries are O(1). Returns any non-air id for
   // solid (only air-vs-solid matters for face culling).
   const heightCache = new Map<number, number>();
+  // A well's centre column is hollow below ground; cache its carved range per
+  // border column so a chunk border bisecting a well still seals the shaft wall.
+  const carveCache = new Map<number, [number, number] | null>();
   const getOutside = (lx: number, y: number, lz: number) => {
     const key = (lx + 1) * 100000 + (lz + 1);
     let h = heightCache.get(key);
     if (h === undefined) { h = sample(worldX + lx, worldZ + lz).height; heightCache.set(key, h); }
-    return y <= h ? BLOCK_IDS.stone : BLOCK_IDS.air;
+    if (y > h) return BLOCK_IDS.air;
+    let carve = carveCache.get(key);
+    if (carve === undefined) { carve = wellShaftRange(cfg.params, sample, worldX + lx, worldZ + lz); carveCache.set(key, carve); }
+    return (carve && y >= carve[0] && y <= carve[1]) ? BLOCK_IDS.air : BLOCK_IDS.stone;
   };
 
-  // Plant tint reads the biome straight from the precomputed map (in-chunk only).
-  const bw = cfg.size.width;
-  const getBiome = (lx: number, lz: number) => biomeMap[lx * bw + lz];
+  // Plant tint reads the precomputed climate grass tint directly (in-chunk only).
+  const getTint = (lx: number, lz: number): readonly [number, number, number] => {
+    const i = (lx * tw + lz) * 3;
+    return [tintMap[i] / 255, tintMap[i + 1] / 255, tintMap[i + 2] / 255];
+  };
 
-  const geometry = buildChunkGeometry(data, cfg.size, getOutside, getBiome);
+  const geometry = buildChunkGeometry(data, cfg.size, getOutside, getTint);
   const casters = geometryToPayload(geometry.casters);
   const nonCasters = geometryToPayload(geometry.nonCasters);
   const plants = geometryToPayload(geometry.plants);
+  // light-emitter positions for the point-light pool (read `data` before transfer)
+  const emitters = scanEmitters(data, cfg.size, worldX, worldZ);
+  // Top-down minimap tile from the same real block data the world renders, so the
+  // minimap is always in-sync without a separate generation round-trip. Water hue
+  // is sampled per submerged column (cheap — only ocean columns hit the sampler).
+  const sea = cfg.params.terrain.waterOffset;
+  const mapTile = buildChunkMapTile(data, cfg.size, sea, getTint,
+    (lx, lz) => biomeWaterHex(sample(worldX + lx, worldZ + lz).biome));
 
   // Transfer the block-data buffer directly (no copy): `data` is freshly
   // allocated per gen, the mesher kept no reference to it, and the worker doesn't
@@ -98,7 +117,8 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const message: MeshMessage = {
     type: 'mesh', version: cfg.version, key: msg.key,
     data: data.buffer, casters: casters.payload, nonCasters: nonCasters.payload, plants: plants.payload,
+    emitters: emitters.buffer, mapTile: mapTile.buffer,
   };
   (self as unknown as Worker).postMessage(message,
-    [...casters.transfer, ...nonCasters.transfer, ...plants.transfer, data.buffer]);
+    [...casters.transfer, ...nonCasters.transfer, ...plants.transfer, data.buffer, emitters.buffer, mapTile.buffer]);
 };

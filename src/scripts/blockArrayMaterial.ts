@@ -6,7 +6,8 @@ import { TEXTURE_LAYER, LAYER_COUNT } from './blockTypes';
 // call per chunk instead of one per material.
 const LAYER_URLS: (string | null)[] = [];
 LAYER_URLS[TEXTURE_LAYER.dirt] = 'textures/dirt.png';
-LAYER_URLS[TEXTURE_LAYER.grassTop] = 'textures/grass.png';
+// grass top + oak leaves are GRAYSCALE and biome-tinted at mesh build (see chunkMesh)
+LAYER_URLS[TEXTURE_LAYER.grassTop] = 'textures/biomes/grass_top_gray.png';
 LAYER_URLS[TEXTURE_LAYER.grassSide] = 'textures/grass_side.png';
 LAYER_URLS[TEXTURE_LAYER.stone] = 'textures/stone.png';
 LAYER_URLS[TEXTURE_LAYER.coal] = 'textures/coal_ore.png';
@@ -14,7 +15,7 @@ LAYER_URLS[TEXTURE_LAYER.iron] = 'textures/iron_ore.png';
 LAYER_URLS[TEXTURE_LAYER.sand] = 'textures/sand.png';
 LAYER_URLS[TEXTURE_LAYER.treeSide] = 'textures/tree_side.png';
 LAYER_URLS[TEXTURE_LAYER.treeTop] = 'textures/tree_top.png';
-LAYER_URLS[TEXTURE_LAYER.leaves] = 'textures/leaves.png';
+LAYER_URLS[TEXTURE_LAYER.leaves] = 'textures/biomes/oak_leaves_gray.png';
 LAYER_URLS[TEXTURE_LAYER.snow] = 'textures/snow.png';
 LAYER_URLS[TEXTURE_LAYER.white] = null; // generated solid white (clouds)
 // --- biome expansion: textures live in the separate public/textures/biomes dir ---
@@ -59,6 +60,128 @@ LAYER_URLS[TEXTURE_LAYER.tallSeagrassBottom] = 'textures/foliage/tall_seagrass_b
 LAYER_URLS[TEXTURE_LAYER.tallSeagrassTop] = 'textures/foliage/tall_seagrass_top.png';
 LAYER_URLS[TEXTURE_LAYER.largeFernBottom] = 'textures/foliage/large_fern_bottom.png';
 LAYER_URLS[TEXTURE_LAYER.largeFernTop] = 'textures/foliage/large_fern_top.png';
+// --- building blocks + wood variants + clay/gravel/sandstone/glass ---
+LAYER_URLS[TEXTURE_LAYER.cobblestone] = 'textures/biomes/cobblestone.png';
+LAYER_URLS[TEXTURE_LAYER.oakPlanks] = 'textures/biomes/oak_planks.png';
+LAYER_URLS[TEXTURE_LAYER.birchPlanks] = 'textures/biomes/birch_planks.png';
+LAYER_URLS[TEXTURE_LAYER.darkOakPlanks] = 'textures/biomes/dark_oak_planks.png';
+LAYER_URLS[TEXTURE_LAYER.junglePlanks] = 'textures/biomes/jungle_planks.png';
+LAYER_URLS[TEXTURE_LAYER.strippedOakLogSide] = 'textures/biomes/stripped_oak_log_side.png';
+LAYER_URLS[TEXTURE_LAYER.birchLogSide] = 'textures/biomes/birch_log_side.png';
+LAYER_URLS[TEXTURE_LAYER.birchLogTop] = 'textures/biomes/birch_log_top.png';
+LAYER_URLS[TEXTURE_LAYER.darkOakLogSide] = 'textures/biomes/dark_oak_log_side.png';
+LAYER_URLS[TEXTURE_LAYER.darkOakLogTop] = 'textures/biomes/dark_oak_log_top.png';
+LAYER_URLS[TEXTURE_LAYER.jungleLogSide] = 'textures/biomes/jungle_log_side.png';
+LAYER_URLS[TEXTURE_LAYER.jungleLogTop] = 'textures/biomes/jungle_log_top.png';
+LAYER_URLS[TEXTURE_LAYER.birchLeaves] = 'textures/biomes/birch_leaves.png';
+LAYER_URLS[TEXTURE_LAYER.darkOakLeaves] = 'textures/biomes/dark_oak_leaves.png';
+LAYER_URLS[TEXTURE_LAYER.jungleLeaves] = 'textures/biomes/jungle_leaves.png';
+LAYER_URLS[TEXTURE_LAYER.gravel] = 'textures/biomes/gravel.png';
+LAYER_URLS[TEXTURE_LAYER.clay] = 'textures/biomes/clay.png';
+LAYER_URLS[TEXTURE_LAYER.sandstone] = 'textures/biomes/sandstone.png';
+LAYER_URLS[TEXTURE_LAYER.sandstoneTop] = 'textures/biomes/sandstone_top.png';
+LAYER_URLS[TEXTURE_LAYER.glass] = 'textures/biomes/glass.png';
+LAYER_URLS[TEXTURE_LAYER.stoneBricks] = 'textures/biomes/stone_bricks.png';
+LAYER_URLS[TEXTURE_LAYER.bricks] = 'textures/biomes/bricks.png';
+LAYER_URLS[TEXTURE_LAYER.mossyCobblestone] = 'textures/biomes/mossy_cobblestone.png';
+LAYER_URLS[TEXTURE_LAYER.smoothStone] = 'textures/biomes/smooth_stone.png';
+LAYER_URLS[TEXTURE_LAYER.bookshelf] = 'textures/biomes/bookshelf.png';
+LAYER_URLS[TEXTURE_LAYER.glowstone] = 'textures/biomes/glowstone.png';
+LAYER_URLS[TEXTURE_LAYER.oakDoor] = 'textures/biomes/oak_door.png';
+LAYER_URLS[TEXTURE_LAYER.oakTrapdoor] = 'textures/biomes/oak_trapdoor.png';
+LAYER_URLS[TEXTURE_LAYER.ice] = 'textures/biomes/ice.png';
+LAYER_URLS[TEXTURE_LAYER.packedIce] = 'textures/biomes/packed_ice.png';
+LAYER_URLS[TEXTURE_LAYER.podzolTop] = 'textures/biomes/podzol_top.png';
+LAYER_URLS[TEXTURE_LAYER.podzolSide] = 'textures/biomes/podzol_side.png';
+LAYER_URLS[TEXTURE_LAYER.mushroomRedSmall] = 'textures/foliage/mushroom_red_small.png';
+LAYER_URLS[TEXTURE_LAYER.mushroomBrownSmall] = 'textures/foliage/mushroom_brown_small.png';
+LAYER_URLS[TEXTURE_LAYER.sugarCane] = 'textures/foliage/sugar_cane.png';
+LAYER_URLS[TEXTURE_LAYER.flowerBlueOrchid] = 'textures/foliage/flower_blue_orchid.png';
+// --- expansion set (geology / decorative / ores / mineral / wood / wool) ---
+const B = 'textures/biomes/';
+LAYER_URLS[TEXTURE_LAYER.andesite] = B + 'andesite.png';
+LAYER_URLS[TEXTURE_LAYER.diorite] = B + 'diorite.png';
+LAYER_URLS[TEXTURE_LAYER.granite] = B + 'granite.png';
+LAYER_URLS[TEXTURE_LAYER.polishedAndesite] = B + 'polished_andesite.png';
+LAYER_URLS[TEXTURE_LAYER.polishedDiorite] = B + 'polished_diorite.png';
+LAYER_URLS[TEXTURE_LAYER.polishedGranite] = B + 'polished_granite.png';
+LAYER_URLS[TEXTURE_LAYER.deepslate] = B + 'deepslate.png';
+LAYER_URLS[TEXTURE_LAYER.tuff] = B + 'tuff.png';
+LAYER_URLS[TEXTURE_LAYER.calcite] = B + 'calcite.png';
+LAYER_URLS[TEXTURE_LAYER.basalt] = B + 'basalt.png';
+LAYER_URLS[TEXTURE_LAYER.blackstone] = B + 'blackstone.png';
+LAYER_URLS[TEXTURE_LAYER.netherrack] = B + 'netherrack.png';
+LAYER_URLS[TEXTURE_LAYER.endStone] = B + 'end_stone.png';
+LAYER_URLS[TEXTURE_LAYER.obsidian] = B + 'obsidian.png';
+LAYER_URLS[TEXTURE_LAYER.magma] = B + 'magma.png';
+LAYER_URLS[TEXTURE_LAYER.quartzBlock] = B + 'quartz_block.png';
+LAYER_URLS[TEXTURE_LAYER.quartzPillarSide] = B + 'quartz_pillar_side.png';
+LAYER_URLS[TEXTURE_LAYER.quartzPillarTop] = B + 'quartz_pillar_top.png';
+LAYER_URLS[TEXTURE_LAYER.netherBricks] = B + 'nether_bricks.png';
+LAYER_URLS[TEXTURE_LAYER.prismarine] = B + 'prismarine.png';
+LAYER_URLS[TEXTURE_LAYER.prismarineBricks] = B + 'prismarine_bricks.png';
+LAYER_URLS[TEXTURE_LAYER.seaLantern] = B + 'sea_lantern.png';
+LAYER_URLS[TEXTURE_LAYER.crackedStoneBricks] = B + 'cracked_stone_bricks.png';
+LAYER_URLS[TEXTURE_LAYER.chiseledStoneBricks] = B + 'chiseled_stone_bricks.png';
+LAYER_URLS[TEXTURE_LAYER.mossyStoneBricks] = B + 'mossy_stone_bricks.png';
+LAYER_URLS[TEXTURE_LAYER.cutSandstone] = B + 'cut_sandstone.png';
+LAYER_URLS[TEXTURE_LAYER.smoothSandstone] = B + 'smooth_sandstone.png';
+LAYER_URLS[TEXTURE_LAYER.chiseledSandstone] = B + 'chiseled_sandstone.png';
+LAYER_URLS[TEXTURE_LAYER.redSandstoneSide] = B + 'red_sandstone.png';
+LAYER_URLS[TEXTURE_LAYER.redSandstoneTop] = B + 'red_sandstone_top.png';
+LAYER_URLS[TEXTURE_LAYER.cutRedSandstone] = B + 'cut_red_sandstone.png';
+LAYER_URLS[TEXTURE_LAYER.goldOre] = B + 'gold_ore.png';
+LAYER_URLS[TEXTURE_LAYER.diamondOre] = B + 'diamond_ore.png';
+LAYER_URLS[TEXTURE_LAYER.emeraldOre] = B + 'emerald_ore.png';
+LAYER_URLS[TEXTURE_LAYER.lapisOre] = B + 'lapis_ore.png';
+LAYER_URLS[TEXTURE_LAYER.redstoneOre] = B + 'redstone_ore.png';
+LAYER_URLS[TEXTURE_LAYER.copperOre] = B + 'copper_ore.png';
+LAYER_URLS[TEXTURE_LAYER.goldBlock] = B + 'gold_block.png';
+LAYER_URLS[TEXTURE_LAYER.diamondBlock] = B + 'diamond_block.png';
+LAYER_URLS[TEXTURE_LAYER.emeraldBlock] = B + 'emerald_block.png';
+LAYER_URLS[TEXTURE_LAYER.ironBlock] = B + 'iron_block.png';
+LAYER_URLS[TEXTURE_LAYER.lapisBlock] = B + 'lapis_block.png';
+LAYER_URLS[TEXTURE_LAYER.redstoneBlock] = B + 'redstone_block.png';
+LAYER_URLS[TEXTURE_LAYER.copperBlock] = B + 'copper_block.png';
+LAYER_URLS[TEXTURE_LAYER.coalBlock] = B + 'coal_block.png';
+LAYER_URLS[TEXTURE_LAYER.acaciaPlanks] = B + 'acacia_planks.png';
+LAYER_URLS[TEXTURE_LAYER.sprucePlanks] = B + 'spruce_planks.png';
+LAYER_URLS[TEXTURE_LAYER.mangrovePlanks] = B + 'mangrove_planks.png';
+LAYER_URLS[TEXTURE_LAYER.cherryPlanks] = B + 'cherry_planks.png';
+LAYER_URLS[TEXTURE_LAYER.acaciaLogSide] = B + 'acacia_log_side.png';
+LAYER_URLS[TEXTURE_LAYER.acaciaLogTop] = B + 'acacia_log_top.png';
+LAYER_URLS[TEXTURE_LAYER.spruceLogSide] = B + 'spruce_log_side.png';
+LAYER_URLS[TEXTURE_LAYER.spruceLogTop] = B + 'spruce_log_top.png';
+LAYER_URLS[TEXTURE_LAYER.mangroveLogSide] = B + 'mangrove_log_side.png';
+LAYER_URLS[TEXTURE_LAYER.mangroveLogTop] = B + 'mangrove_log_top.png';
+LAYER_URLS[TEXTURE_LAYER.acaciaLeaves] = B + 'acacia_leaves.png';
+LAYER_URLS[TEXTURE_LAYER.spruceLeaves] = B + 'spruce_leaves.png';
+LAYER_URLS[TEXTURE_LAYER.mangroveLeaves] = B + 'mangrove_leaves.png';
+LAYER_URLS[TEXTURE_LAYER.hayBaleSide] = B + 'hay_bale_side.png';
+LAYER_URLS[TEXTURE_LAYER.hayBaleTop] = B + 'hay_bale_top.png';
+LAYER_URLS[TEXTURE_LAYER.woolWhite] = B + 'wool_white.png';
+LAYER_URLS[TEXTURE_LAYER.woolOrange] = B + 'wool_orange.png';
+LAYER_URLS[TEXTURE_LAYER.woolMagenta] = B + 'wool_magenta.png';
+LAYER_URLS[TEXTURE_LAYER.woolLightBlue] = B + 'wool_light_blue.png';
+LAYER_URLS[TEXTURE_LAYER.woolYellow] = B + 'wool_yellow.png';
+LAYER_URLS[TEXTURE_LAYER.woolLime] = B + 'wool_lime.png';
+LAYER_URLS[TEXTURE_LAYER.woolPink] = B + 'wool_pink.png';
+LAYER_URLS[TEXTURE_LAYER.woolGray] = B + 'wool_gray.png';
+LAYER_URLS[TEXTURE_LAYER.woolLightGray] = B + 'wool_light_gray.png';
+LAYER_URLS[TEXTURE_LAYER.woolCyan] = B + 'wool_cyan.png';
+LAYER_URLS[TEXTURE_LAYER.woolPurple] = B + 'wool_purple.png';
+LAYER_URLS[TEXTURE_LAYER.woolBlue] = B + 'wool_blue.png';
+LAYER_URLS[TEXTURE_LAYER.woolBrown] = B + 'wool_brown.png';
+LAYER_URLS[TEXTURE_LAYER.woolGreen] = B + 'wool_green.png';
+LAYER_URLS[TEXTURE_LAYER.woolRed] = B + 'wool_red.png';
+LAYER_URLS[TEXTURE_LAYER.woolBlack] = B + 'wool_black.png';
+// light-emitting blocks
+LAYER_URLS[TEXTURE_LAYER.lantern] = B + 'lantern.png';
+LAYER_URLS[TEXTURE_LAYER.torch] = B + 'torch.png';
+LAYER_URLS[TEXTURE_LAYER.campfireTop] = B + 'campfire_top.png';
+LAYER_URLS[TEXTURE_LAYER.campfireSide] = B + 'campfire_side.png';
+LAYER_URLS[TEXTURE_LAYER.jackLanternSide] = B + 'jack_lantern_side.png';
+LAYER_URLS[TEXTURE_LAYER.jackLanternTop] = B + 'jack_lantern_top.png';
 
 const TILE = 16;
 
@@ -123,30 +246,37 @@ const arrayTexture = createArrayTexture();
 // (so it keeps three's lighting/shadows) is patched to sample the array texture by
 // a per-vertex layer index, using textureGrad with the un-fract'd derivatives so
 // greedy-merged quads tile cleanly without mip seams.
-export const blockArrayMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
-blockArrayMaterial.onBeforeCompile = (shader) => {
+// Shared shader injection for the cube materials: sample the array texture by a
+// per-vertex layer index (textureGrad with un-fract'd derivatives → clean tiling
+// on greedy-merged quads) and multiply by the baked per-vertex biome tint.
+function injectCubeShader(shader: THREE.WebGLProgramParametersWithUniforms) {
   shader.uniforms.uArray = { value: arrayTexture };
-
   shader.vertexShader = shader.vertexShader
     .replace('#include <common>', /* glsl */`
       #include <common>
       attribute vec2 tileUv;
       attribute float layerIndex;
+      attribute vec4 tintColor;   // rgb = baked biome tint (white = untinted), a = emissive amount
       varying vec2 vTileUv;
       varying float vLayer;
+      varying vec3 vTintCol;
+      varying float vEmis;
     `)
     .replace('#include <begin_vertex>', /* glsl */`
       #include <begin_vertex>
       vTileUv = tileUv;
       vLayer = layerIndex;
+      vTintCol = tintColor.rgb;
+      vEmis = tintColor.a;
     `);
-
   shader.fragmentShader = shader.fragmentShader
     .replace('#include <common>', /* glsl */`
       #include <common>
       uniform sampler2DArray uArray;
       varying vec2 vTileUv;
       varying float vLayer;
+      varying vec3 vTintCol;
+      varying float vEmis;
     `)
     .replace('#include <map_fragment>', /* glsl */`
       // Flip V: DataArrayTexture stores image rows top-to-bottom, but world V
@@ -156,9 +286,29 @@ blockArrayMaterial.onBeforeCompile = (shader) => {
       vec4 texel = textureGrad(uArray, vec3(auv, vLayer), dFdx(vTileUv), dFdy(vTileUv));
       // sRGB -> linear so lighting is correct (output is re-encoded by three).
       texel.rgb = pow(texel.rgb, vec3(2.2));
-      diffuseColor *= texel;
+      texel.rgb *= vTintCol;   // MC-style per-biome tint (grass tops / biome leaves; white elsewhere)
+      diffuseColor *= texel;   // diffuseColor.a now carries texel.a → alphaTest (leaf material) discards holes
+    `)
+    // Emitter blocks (torch/lantern/glowstone/…) glow their own texture colour
+    // regardless of scene light — vEmis (=tintColor.a) is 0 for normal blocks.
+    .replace('#include <emissivemap_fragment>', /* glsl */`
+      #include <emissivemap_fragment>
+      totalEmissiveRadiance += texel.rgb * vEmis;
     `);
-};
+}
+
+let blockShader: THREE.WebGLProgramParametersWithUniforms | null = null;
+let leafShader: THREE.WebGLProgramParametersWithUniforms | null = null;
+export const blockArrayMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+blockArrayMaterial.onBeforeCompile = (shader) => { blockShader = shader; injectCubeShader(shader); };
+
+// Leaf material: identical shader + biome tint, but ALPHA-TESTED so the cutout
+// holes in the leaf textures show through (MC "fancy" leaves). Used for the
+// nonCasters mesh (leaves + clouds; clouds are opaque so alphaTest keeps them).
+// alphaTest (not transparent) keeps it in the cheap OPAQUE pass — no depth re-sort.
+export const leafArrayMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+leafArrayMaterial.alphaTest = 0.5;
+leafArrayMaterial.onBeforeCompile = (shader) => { leafShader = shader; injectCubeShader(shader); };
 
 // ---------------------------------------------------------------------------
 //  PLANT MATERIAL — for the cross-billboard / carpet / vine "plants" geometry
@@ -231,10 +381,79 @@ plantMaterial.onBeforeCompile = (shader) => {
       texel.rgb = pow(texel.rgb, vec3(2.2));
       texel.rgb *= vTint;          // MC-style biome tint of the (grayscale) plant
       diffuseColor *= texel;       // diffuseColor.a now carries texel.a -> alphaTest discards
+    `)
+    // The torch billboard is a light EMITTER — make its layer glow (self-lit) so it
+    // reads as a flame even in the dark. Detected by texture layer (no extra attribute).
+    .replace('#include <emissivemap_fragment>', /* glsl */`
+      #include <emissivemap_fragment>
+      if (abs(vLayer - ${TEXTURE_LAYER.torch}.0) < 0.5) totalEmissiveRadiance += texel.rgb;
     `);
 };
 
 // Advance the foliage wind (called once per rendered frame from the draw loop).
 export function updatePlantWind(timeSeconds: number) {
   if (plantShader) plantShader.uniforms.uTime.value = timeSeconds;
+}
+
+// ---------------------------------------------------------------------------
+//  DEV-ONLY texture toggle — swap the live DataArrayTexture between OUR textures
+//  and the Minecraft reference set. The refs live in the gitignored public/_ref/
+//  (generated by .texref/make_compare.py); when that pack is absent the toggle
+//  no-ops. Our per-vertex biome tint still applies, so MC's grayscale grass/leaves
+//  show correctly tinted — a faithful side-by-side in the actual world.
+// ---------------------------------------------------------------------------
+let refArrayTexture: THREE.DataArrayTexture | null = null;
+let usingRef = false;
+
+function buildRefArrayTexture(refmap: Record<string, string>): THREE.DataArrayTexture {
+  const data = new Uint8Array(TILE * TILE * 4 * LAYER_COUNT);
+  const whiteOffset = TEXTURE_LAYER.white * TILE * TILE * 4;
+  data.fill(255, whiteOffset, whiteOffset + TILE * TILE * 4);
+  const texture = new THREE.DataArrayTexture(data, TILE, TILE, LAYER_COUNT);
+  texture.magFilter = THREE.NearestFilter;
+  texture.minFilter = THREE.NearestMipmapLinearFilter;
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  texture.generateMipmaps = true;
+  texture.anisotropy = 8;
+  texture.needsUpdate = true;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = TILE;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+  let pending = 0;
+  const done = () => { if (--pending === 0) texture.needsUpdate = true; };
+  LAYER_URLS.forEach((url, layer) => {
+    if (!url) return;
+    const base = url.split('/').pop()!;            // our texture filename, e.g. 'andesite.png'
+    const ref = refmap[base];
+    const src = ref ? ('_ref/' + ref) : url;       // MC reference where mapped, else keep ours
+    pending++;
+    const img = new Image();
+    img.onload = () => {
+      ctx.clearRect(0, 0, TILE, TILE);
+      ctx.drawImage(img, 0, 0, TILE, TILE);
+      data.set(ctx.getImageData(0, 0, TILE, TILE).data, layer * TILE * TILE * 4);
+      done();
+    };
+    img.onerror = () => done();
+    img.src = src;
+  });
+  return texture;
+}
+
+// Flip between our textures and the MC reference set (builds the ref texture once).
+export function toggleReferenceTextures(): void {
+  const apply = () => {
+    usingRef = !usingRef;
+    const tex = usingRef ? refArrayTexture! : arrayTexture;
+    if (blockShader) blockShader.uniforms.uArray.value = tex;
+    if (leafShader) leafShader.uniforms.uArray.value = tex;
+    if (plantShader) plantShader.uniforms.uArray.value = tex;
+    console.info(`[texture toggle] now showing ${usingRef ? 'MINECRAFT reference' : 'our'} textures`);
+  };
+  if (refArrayTexture) { apply(); return; }
+  fetch('_ref/refmap.json')
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('no ref pack')))
+    .then((refmap: Record<string, string>) => { refArrayTexture = buildRefArrayTexture(refmap); apply(); })
+    .catch(() => console.warn('[texture toggle] dev ref pack missing — run `python3 .texref/make_compare.py` to enable'));
 }

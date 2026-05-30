@@ -3,8 +3,8 @@ import { WorldChunk } from './worldChunk';
 import { Player } from './player';
 import { DataStore } from './dataStore';
 import { resources } from './blocks';
-import { ChunkParams, generateChunkData, createWorldSampler, WorldSampler } from './chunkGen';
-import { ResourceGenInfo, BLOCK_IDS } from './blockTypes';
+import { ChunkParams, generateChunkData, createWorldSampler, WorldSampler, climateGrassTint } from './chunkGen';
+import { ResourceGenInfo, BLOCK_IDS, TOGGLE, DOOR_PART } from './blockTypes';
 import { GeometryArrays } from './chunkMesh';
 import type { WorkerRequest, MeshMessage, GeometryPayload } from './chunkWorker';
 
@@ -45,6 +45,13 @@ export class World extends Three.Group {
     clouds: { scale: 20, density: 0.2 }
   };
   drawDistance = 10;
+
+  // Foliage (plant billboards) are alpha-tested overdraw with no shadow
+  // contribution, so they're safe to hide beyond a shorter radius than the
+  // terrain — a big fill-rate win at distance. `foliageEnabled=false` hides all.
+  // Re-evaluated on chunk apply + whenever the player crosses a chunk boundary.
+  foliageEnabled = true;
+  foliageDistance = 8;   // chunks
 
   asyncLoading = true;
   // three.js already frustum-culls every chunk mesh automatically AND per-pass
@@ -131,16 +138,8 @@ export class World extends Three.Group {
     this.sampler = createWorldSampler(this.params, this.chunkSize);
 
     this.initWorkers();
-
-    document.addEventListener('keydown', (event) => {
-      if (event.key === 'n') {
-        event.preventDefault();
-        this.save();
-      } else if (event.key === 'm') {
-        event.preventDefault();
-        this.load();
-      }
-    });
+    // Save/Load are exposed as menu buttons now (the old 'm'/'n' keybinds were
+    // removed — 'm' opens the world map instead, wired in main.ts).
   }
 
   private initWorkers() {
@@ -203,9 +202,12 @@ export class World extends Three.Group {
     return BLOCK_IDS.air;
   };
 
-  // Biome id at a world column (deterministic terrain function). Passed into the
-  // local mesher for edit re-meshes so plant tints match the worker's output.
-  getBiomeAt = (worldX: number, worldZ: number): number => this.sampler(worldX, worldZ).biome;
+  // Climate grass tint at a world column (deterministic). Passed into the local
+  // mesher for edit re-meshes so plant tints match the worker's output exactly.
+  getGrassTint = (worldX: number, worldZ: number): readonly [number, number, number] => {
+    const s = this.sampler(worldX, worldZ);
+    return climateGrassTint(s.temp, s.humid);
+  };
 
   get chunkCount() {
     return this.chunkMap.size;
@@ -230,6 +232,8 @@ export class World extends Three.Group {
       this.pending = visibleChunks
         .filter(({ x, z }) => !this.chunkMap.has(this.chunkKey(x, z)))
         .sort((a, b) => ((a.x - c.x) ** 2 + (a.z - c.z) ** 2) - ((b.x - c.x) ** 2 + (b.z - c.z) ** 2));
+      // Player crossed a chunk boundary → re-evaluate which chunks show foliage.
+      this.refreshFoliageVisibility();
     } else if (this.removalPending) {
       // Keep removing (capped per frame) using the cached visible set — no need
       // to rebuild the visible list / pending every frame during removal.
@@ -262,8 +266,13 @@ export class World extends Three.Group {
       applied++;
     }
     for (const { chunk, msg } of batch) {
-      if (this.hasEditsAround(chunk)) chunk.buildMeshes(this.getWorldBlock, this.getBiomeAt);
-      else chunk.applyGeometry(payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters), payloadToArrays(msg.plants));
+      if (this.hasEditsAround(chunk)) chunk.buildMeshes(this.getWorldBlock, this.getGrassTint);  // also rescans emitters + rebuilds the map tile
+      else {
+        chunk.applyGeometry(payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters), payloadToArrays(msg.plants));
+        chunk.setEmitters(new Float32Array(msg.emitters));
+        chunk.setMapTile(new Uint8Array(msg.mapTile));
+      }
+      this.applyFoliageVisibility(chunk);
     }
 
     // 2) Request more generation (gated by in-flight = sent-but-not-applied).
@@ -288,7 +297,8 @@ export class World extends Three.Group {
       if (builds >= this.maxMeshBuildsPerFrame) break;
       this.meshQueue.delete(chunk);
       if (chunk.hasData && chunk.parent === this) {
-        chunk.buildMeshes(this.getWorldBlock, this.getBiomeAt);
+        chunk.buildMeshes(this.getWorldBlock, this.getGrassTint);
+        this.applyFoliageVisibility(chunk);
         builds++;
       }
     }
@@ -307,6 +317,32 @@ export class World extends Three.Group {
         this.meshQueue.add(neighbour);
       }
     }
+  }
+
+  // ---- foliage distance culling -------------------------------------------
+  // Toggle a chunk's plant mesh by distance from the player's chunk. Plants cast
+  // no shadow, so hiding them never affects the shadow pass (unlike terrain).
+  private applyFoliageVisibility(chunk: WorldChunk) {
+    const mesh = chunk.plantMesh;
+    if (!mesh) return;
+    if (!this.foliageEnabled) { mesh.visible = false; return; }
+    const { x, z } = chunk.userData as chunkCoords;
+    const cheb = Math.max(Math.abs(x - this.lastPlayerChunkX), Math.abs(z - this.lastPlayerChunkZ));
+    mesh.visible = cheb <= this.foliageDistance;
+  }
+  refreshFoliageVisibility() {
+    for (const chunk of this.chunkMap.values()) this.applyFoliageVisibility(chunk);
+  }
+  setFoliage(enabled: boolean, distance: number) {
+    this.foliageEnabled = enabled;
+    this.foliageDistance = distance;
+    this.refreshFoliageVisibility();
+  }
+
+  // The cached top-down canvas for a loaded chunk (for the in-sync minimap blit).
+  getChunkMapTileCanvas(cx: number, cz: number): HTMLCanvasElement | null {
+    const chunk = this.chunkMap.get(this.chunkKey(cx, cz));
+    return chunk && chunk.loaded ? chunk.getMapTileCanvas() : null;
   }
 
   getVisibleChunks(player: Player) {
@@ -397,6 +433,8 @@ export class World extends Three.Group {
       id: r.id,
       scale: { x: r.scale.x, y: r.scale.y, z: r.scale.z },
       scarcity: r.scarcity,
+      minY: r.minY,
+      maxY: r.maxY,
     }));
   }
 
@@ -508,7 +546,7 @@ export class World extends Three.Group {
     const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
 
     if (chunk) {
-      chunk.addBlock(coords.block.x, coords.block.y, coords.block.z, id, this.getWorldBlock, this.getBiomeAt);
+      chunk.addBlock(coords.block.x, coords.block.y, coords.block.z, id, this.getWorldBlock, this.getGrassTint);
       this.remeshAround(x, y, z, chunk);
     }
   }
@@ -518,9 +556,29 @@ export class World extends Three.Group {
     const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
 
     if (chunk) {
-      chunk.removeBlock(coords.block.x, coords.block.y, coords.block.z, this.getWorldBlock, this.getBiomeAt);
+      chunk.removeBlock(coords.block.x, coords.block.y, coords.block.z, this.getWorldBlock, this.getGrassTint);
       this.remeshAround(x, y, z, chunk);
     }
+  }
+
+  // Right-click "use": toggle a door/trapdoor (and a door's paired half). Returns
+  // true if the block was interactive (so the caller skips block-pick/place).
+  interactBlock(x: number, y: number, z: number): boolean {
+    const id = this.getBlockId(x, y, z);
+    const toggled = TOGGLE[id];
+    if (toggled === undefined) return false;
+    const setOne = (wx: number, wy: number, wz: number, nid: number) => {
+      const c = this.worldToChunkCoords(wx, wy, wz);
+      const chunk = this.getChunk(c.chunk.x, c.chunk.z);
+      if (chunk) { chunk.setBlockEdit(c.block.x, c.block.y, c.block.z, nid, this.getWorldBlock, this.getGrassTint); this.remeshAround(wx, wy, wz, chunk); }
+    };
+    setOne(x, y, z, toggled);
+    if (DOOR_PART[id] === 1) {                       // doors are 2-tall — toggle the other half too
+      const above = this.getBlockId(x, y + 1, z), below = this.getBlockId(x, y - 1, z);
+      if (DOOR_PART[above] === 1 && TOGGLE[above] !== undefined) setOne(x, y + 1, z, TOGGLE[above]);
+      else if (DOOR_PART[below] === 1 && TOGGLE[below] !== undefined) setOne(x, y - 1, z, TOGGLE[below]);
+    }
+    return true;
   }
 
   // After a single-block edit, re-mesh any neighbouring chunk that borders the
