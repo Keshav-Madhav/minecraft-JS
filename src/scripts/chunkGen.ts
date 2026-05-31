@@ -63,7 +63,7 @@ export function generateChunkData(
   const surfaceMap = new Uint8Array(size.width * size.width);
 
   generateTerrain(simplex, params, size, worldX, worldZ, set, heightMap, biomeMap, outTint, surfaceMap);
-  generateResources(rng, size, worldX, worldZ, resources, get, set);
+  generateResources(rng, size, worldX, worldZ, resources, get, set, biomeMap);
 
   // Features (trees + ground decorations). generateFeatures re-seeds its own
   // per-WORLD-CELL RNG internally (so placement is identical in every chunk that a
@@ -988,23 +988,35 @@ export function createWorldSampler(params: ChunkParams, size: ChunkSize): WorldS
 // ===========================================================================
 const ORE_STEP = 2;
 const isHostRock = (id: number) => id === BLOCK_IDS.stone || id === BLOCK_IDS.deepslate;
-function generateResources(rng: RNG, size: ChunkSize, worldX: number, worldZ: number, resources: ResourceGenInfo[], get: GetFn, set: SetFn) {
+function generateResources(rng: RNG, size: ChunkSize, worldX: number, worldZ: number, resources: ResourceGenInfo[], get: GetFn, set: SetFn, biomeMap: Uint8Array) {
+  const W = size.width;
   resources.forEach(resource => {
     const simplex = new SimplexNoise(rng);
     const y0 = Math.max(0, resource.minY ?? 0);
     const y1 = Math.min(size.height - 1, resource.maxY ?? size.height - 1);
-    for (let x = 0; x < size.width; x += ORE_STEP)
-      for (let z = 0; z < size.width; z += ORE_STEP)
+    const peak = (y0 + y1) * 0.5, halfSpan = Math.max(1, (y1 - y0) * 0.5);
+    const mountainOnly = resource.id === BLOCK_IDS.emeraldOre;   // emerald → mountains only (MC)
+    for (let x = 0; x < W; x += ORE_STEP)
+      for (let z = 0; z < W; z += ORE_STEP) {
+        if (mountainOnly && biomeMap[x * W + z] !== BIOME.mountains) continue;
         for (let y = y0; y <= y1; y += ORE_STEP) {
           if (!isHostRock(get(x, y, z))) continue;
+          // Vertical TRIANGLE: lowest threshold (most ore) at the window midpoint,
+          // rising to the edges → each ore clusters at its characteristic depth.
+          const tent = 1 - Math.abs(y - peak) / halfSpan;
+          const thr = resource.scarcity + (1 - tent) * 0.10;
           const val = simplex.noise3d((worldX + x) / resource.scale.x, y / resource.scale.y, (worldZ + z) / resource.scale.z);
-          if (val > resource.scarcity) {
+          if (val > thr) {
             for (let dx = 0; dx < ORE_STEP; dx++)
               for (let dy = 0; dy < ORE_STEP; dy++)
-                for (let dz = 0; dz < ORE_STEP; dz++)
+                for (let dz = 0; dz < ORE_STEP; dz++) {
+                  // Per-block jitter breaks the 2×2×2 cell into an irregular blob.
+                  if (hash01(worldX + x + dx + (y + dy) * 131, worldZ + z + dz + (y + dy) * 57) < 0.2) continue;
                   if (isHostRock(get(x + dx, y + dy, z + dz))) set(x + dx, y + dy, z + dz, resource.id);
+                }
           }
         }
+      }
   });
 }
 

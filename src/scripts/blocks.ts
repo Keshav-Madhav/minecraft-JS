@@ -33,13 +33,6 @@ export const blocks: { [key in allBlocks]: BlockInfo } = {
 
 type ResourceInfo = { id: number; name: string; color: number; scale: { x: number; y: number; z: number }; scarcity: number; minY?: number; maxY?: number };
 
-function assertResource(block: BlockInfo): ResourceInfo {
-  if (block.color === undefined || block.scale === undefined || block.scarcity === undefined) {
-    throw new Error(`Block ${block.name} is missing required properties`);
-  }
-  return { id: block.id, name: block.name, color: block.color, scale: block.scale, scarcity: block.scarcity };
-}
-
 // Ore veins + stone-variant patches scattered into the host rock (stone OR
 // deepslate). Ores carry a [minY,maxY] depth window so they layer by depth
 // (diamond/redstone deep, copper shallow, …) — also makes their sweep cheaper.
@@ -48,15 +41,20 @@ function assertResource(block: BlockInfo): ResourceInfo {
 const oreGen = (id: number, name: string, color: number, s: number, scarcity: number, minY: number, maxY: number): ResourceInfo =>
   ({ id, name, color, scale: { x: s, y: s, z: s }, scarcity, minY, maxY });
 
+// Ore depth windows are remapped to THIS world's scale (sea=128, floor y0; MC's
+// sea-63/floor-(-64) ranges shifted up by ~65). generateResources applies a
+// vertical TRIANGLE weight inside each window (densest at the window midpoint,
+// tapering to the edges) so e.g. diamonds cluster near the floor and copper near
+// sea level — the MC "ores layer by depth" feel. Emerald is gated to mountains.
 export const resources: ResourceInfo[] = [
-  assertResource(blocks.coalOre),
-  assertResource(blocks.ironOre),
-  oreGen(BLOCK_IDS.copperOre, 'Copper Ore', 0xc06a48, 16, 0.82, 4, 96),
-  oreGen(BLOCK_IDS.goldOre, 'Gold Ore', 0xf4c130, 12, 0.86, 2, 40),
-  oreGen(BLOCK_IDS.redstoneOre, 'Redstone Ore', 0xc81818, 12, 0.84, 2, 18),
-  oreGen(BLOCK_IDS.lapisOre, 'Lapis Ore', 0x2a4c9a, 10, 0.87, 2, 36),
-  oreGen(BLOCK_IDS.diamondOre, 'Diamond Ore', 0x5fe0d8, 10, 0.90, 1, 15),
-  oreGen(BLOCK_IDS.emeraldOre, 'Emerald Ore', 0x2ea84e, 8, 0.92, 6, 120),
+  oreGen(BLOCK_IDS.coalOre, 'Coal Ore', 0x202020, 20, 0.80, 40, 205),       // common, mid→near-surface
+  oreGen(BLOCK_IDS.ironOre, 'Iron Ore', 0x806060, 16, 0.80, 1, 150),        // broad, deep→mid
+  oreGen(BLOCK_IDS.copperOre, 'Copper Ore', 0xc06a48, 16, 0.82, 49, 132),   // around sea level
+  oreGen(BLOCK_IDS.goldOre, 'Gold Ore', 0xf4c130, 12, 0.86, 1, 56),         // deep
+  oreGen(BLOCK_IDS.redstoneOre, 'Redstone Ore', 0xc81818, 12, 0.84, 1, 34), // deepest band
+  oreGen(BLOCK_IDS.lapisOre, 'Lapis Ore', 0x2a4c9a, 10, 0.86, 1, 72),       // deep, peak mid
+  oreGen(BLOCK_IDS.diamondOre, 'Diamond Ore', 0x5fe0d8, 10, 0.90, 1, 28),   // hugs the floor
+  oreGen(BLOCK_IDS.emeraldOre, 'Emerald Ore', 0x2ea84e, 8, 0.88, 96, 300),  // MOUNTAINS only, high
   // stone variants: large smooth blobs of alternate rock through the stone column
   oreGen(BLOCK_IDS.andesite, 'Andesite', 0x8a8a8e, 26, 0.58, 0, 110),
   oreGen(BLOCK_IDS.diorite, 'Diorite', 0xd0d0d2, 26, 0.60, 0, 110),
