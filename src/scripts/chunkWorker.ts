@@ -1,4 +1,4 @@
-import { generateChunkData, createWorldSampler, wellShaftRange, biomeWaterHex, WorldSampler, ChunkParams, ChunkSize } from './chunkGen';
+import { generateChunkData, createWorldSampler, createCaveSampler, LAVA_Y, wellShaftRange, biomeWaterHex, WorldSampler, ChunkParams, ChunkSize } from './chunkGen';
 import { ResourceGenInfo, BLOCK_IDS } from './blockTypes';
 import { buildChunkGeometry, buildChunkMapTile, scanEmitters, GeometryArrays } from './chunkMesh';
 
@@ -41,6 +41,7 @@ export type MeshMessage = {
 
 let config: ConfigMessage | null = null;
 let sampler: WorldSampler | null = null;
+let caveSampler: ReturnType<typeof createCaveSampler> | null = null;
 
 function geometryToPayload(g: GeometryArrays | null): { payload: GeometryPayload, transfer: ArrayBuffer[] } {
   if (!g) return { payload: null, transfer: [] };
@@ -59,13 +60,15 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   if (msg.type === 'config') {
     config = msg;
     sampler = createWorldSampler(msg.params, msg.size);
+    caveSampler = createCaveSampler(msg.params);
     return;
   }
 
   // gen
-  if (!config || !sampler || msg.version !== config.version) return; // stale request
+  if (!config || !sampler || !caveSampler || msg.version !== config.version) return; // stale request
   const cfg = config;
   const sample = sampler;
+  const caveAt = caveSampler;
   const { worldX, worldZ } = msg;
 
   // Capture the per-column climate grass tint during generation so plant tinting
@@ -88,7 +91,12 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
     if (y > h) return BLOCK_IDS.air;
     let carve = carveCache.get(key);
     if (carve === undefined) { carve = wellShaftRange(cfg.params, sample, worldX + lx, worldZ + lz); carveCache.set(key, carve); }
-    return (carve && y >= carve[0] && y <= carve[1]) ? BLOCK_IDS.air : BLOCK_IDS.stone;
+    if (carve && y >= carve[0] && y <= carve[1]) return BLOCK_IDS.air;
+    // Caves: mirror the body's carve so border cave walls aren't culled into holes.
+    // Lava-filled cells (y<=LAVA_Y) are opaque solid → report solid (cull); open
+    // cave air → report air (draw the wall face). Matches the body's solidity exactly.
+    if (caveAt(worldX + lx, y, worldZ + lz, h)) return y <= LAVA_Y ? BLOCK_IDS.stone : BLOCK_IDS.air;
+    return BLOCK_IDS.stone;
   };
 
   // Plant tint reads the precomputed climate grass tint directly (in-chunk only).

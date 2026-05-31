@@ -1029,6 +1029,61 @@ function deepRock(wx: number, wz: number, y: number): number {
   return y < top ? BLOCK_IDS.deepslate : BLOCK_IDS.stone;
 }
 
+// ===========================================================================
+//  CAVES — deterministic, apron-safe sub-surface air. SPAGHETTI tunnels (the
+//  intersection of two low-freq simplex iso-sheets |n|<eps, which meet in a 1-D
+//  curve → a tube) OR'd with sparse CHEESE rooms (a single iso-band gated by a
+//  coarse rarity field). A PURE fn of (wx,wy,wz) on the seed-only simplex, so the
+//  stateless border apron (getOutside) evaluates the IDENTICAL predicate at the
+//  neighbour column → cave wall faces at chunk borders are never culled (no holes).
+//  Carved only well below the surface (a depth fade pinches tube mouths shut so
+//  surface entrances are rare) and never into the bedrock band. Carved air at/below
+//  LAVA_Y becomes a lava sea — realised in the fill, not a separate pass.
+// ===========================================================================
+const CAVE_Y_MIN = 6;            // keep caves out of the bedrock floor band
+const CAVE_SURFACE_MARGIN = 7;   // never carve at/above (surfaceHeight - this)
+const CAVE_FADE = 16;            // tubes pinch shut over this many blocks below the margin
+export const LAVA_Y = 11;        // carved air at/below this Y fills with lava (deep lava sea)
+const CAVE_S_XZ = 68, CAVE_S_Y = 46, CAVE_EPS_S = 0.044;   // spaghetti tube thickness
+const CAVE_C_XZ = 112, CAVE_C_Y = 56, CAVE_EPS_C = 0.050;  // cheese room iso-band
+const CAVE_B_OFF = 9173;         // decorrelates the 2nd spaghetti field from the 1st
+function caveAir(simplex: SimplexNoise, wx: number, wy: number, wz: number, surfaceH: number): boolean {
+  if (wy < CAVE_Y_MIN) return false;
+  const depth = (surfaceH - wy) - CAVE_SURFACE_MARGIN;
+  if (depth <= 0) return false;
+  const fade = depth >= CAVE_FADE ? 1 : depth / CAVE_FADE;   // 0 near the margin → 1 deep
+  // Spaghetti: the 1st iso-sheet short-circuits the 2nd, so most cells pay 1 noise.
+  const a = simplex.noise3d(wx / CAVE_S_XZ, wy / CAVE_S_Y, wz / CAVE_S_XZ);
+  if (a < CAVE_EPS_S && a > -CAVE_EPS_S && Math.abs(a) < CAVE_EPS_S * fade) {
+    const b = simplex.noise3d((wx + CAVE_B_OFF) / CAVE_S_XZ, wy / CAVE_S_Y, (wz + CAVE_B_OFF) / CAVE_S_XZ);
+    if (Math.abs(b) < CAVE_EPS_S * fade) return true;
+  }
+  // Cheese: sparse big caverns, gated by a coarse rarity field so they don't dominate.
+  const gate = simplex.noise3d(wx / 240, wy / 170, wz / 240);
+  if (gate > 0.36) {
+    const c = simplex.noise3d((wx + 5300) / CAVE_C_XZ, wy / CAVE_C_Y, (wz + 5300) / CAVE_C_XZ);
+    if (Math.abs(c) < CAVE_EPS_C * fade) return true;
+  }
+  return false;
+}
+// One deep cell: bedrock floor (rough y0-4, always at y0), else cave air/lava, else
+// the deepslate/stone layer. Shared by the normal fill AND the badlands band's deep
+// stone so every biome gets the same caves + bedrock + deep-rock layering.
+function deepCell(simplex: SimplexNoise, wx: number, wz: number, y: number, surfaceH: number): number {
+  if (y === 0) return BLOCK_IDS.bedrock;
+  if (y <= 4 && hash01(wx + y * 9973, wz + y * 131) < (5 - y) / 5) return BLOCK_IDS.bedrock;
+  if (caveAir(simplex, wx, y, wz, surfaceH)) return y <= LAVA_Y ? BLOCK_IDS.lava : BLOCK_IDS.air;
+  return deepRock(wx, wz, y);
+}
+
+// Standalone cave predicate for the stateless APRON (getOutside): its own seed-only
+// simplex has the identical permutation to the generator's, so it returns the exact
+// same carve decision at any world cell → border cave walls mesh seamlessly.
+export function createCaveSampler(params: ChunkParams) {
+  const simplex = new SimplexNoise(new RNG(params.seed));
+  return (wx: number, wy: number, wz: number, surfaceH: number) => caveAir(simplex, wx, wy, wz, surfaceH);
+}
+
 function generateTerrain(simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number,
   set: SetFn, outHeight: Int16Array, outBiome: Uint8Array, outTint?: Uint8Array, outSurface?: Uint8Array) {
   const cfg = makeSurfaceConfig(params, size);
@@ -1055,13 +1110,14 @@ function generateTerrain(simplex: SimplexNoise, params: ChunkParams, size: Chunk
       for (let y = 0; y <= cs.height; y++) {
         if (band) {
           // Keep the biome's banded subsurface (badlands terracotta), but route its
-          // DEEP plain-stone fill through deepRock so mesas layer into deepslate too.
+          // DEEP plain-stone fill through deepCell so mesas get deepslate, bedrock
+          // and caves at depth too.
           const b = band(y, cs.height, cfg.sea);
-          set(x, y, z, b === BLOCK_IDS.stone ? deepRock(wx, wz, y) : b);
+          set(x, y, z, b === BLOCK_IDS.stone ? deepCell(simplex, wx, wz, y, cs.height) : b);
         }
         else if (y === cs.height) set(x, y, z, cs.surfaceId);
         else if (y > cs.height - 4) set(x, y, z, cs.subId);
-        else set(x, y, z, deepRock(wx, wz, y));
+        else set(x, y, z, deepCell(simplex, wx, wz, y, cs.height));
       }
       if (cs.height < cfg.sea && cs.temp < ICE_SURFACE_TEMP) {
         set(x, cfg.sea, z, BLOCK_IDS.ice);                                 // walkable frozen surface

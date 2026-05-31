@@ -113,6 +113,7 @@ export const BLOCK_IDS = {
   furnace: 178, furnaceLit: 179, craftingTable: 180, chest: 181,
   bedFoot: 182, bedHead: 183, barrel: 184,
   flowerPot: 185,   // a potted-flower CROSS billboard (plant), placed on tables/floors
+  bedrock: 186, lava: 187,   // world-floor + cave lava sea (worldgen)
 } as const;
 
 // Settings used by procedural resource (ore) generation. Plain data so it can
@@ -244,6 +245,7 @@ export const TEXTURE_LAYER = {
   bedFootTop: 179, bedHeadTop: 180, bedSide: 181,
   barrelTop: 182, barrelSide: 183,
   flowerPot: 184,
+  bedrock: 185, lava: 186,
 } as const;
 
 // Derived so it can never drift out of sync when a layer is added.
@@ -316,6 +318,7 @@ for (const [id, layer] of [
   [BLOCK_IDS.andesite, T.andesite], [BLOCK_IDS.diorite, T.diorite], [BLOCK_IDS.granite, T.granite],
   [BLOCK_IDS.polishedAndesite, T.polishedAndesite], [BLOCK_IDS.polishedDiorite, T.polishedDiorite], [BLOCK_IDS.polishedGranite, T.polishedGranite],
   [BLOCK_IDS.deepslate, T.deepslate], [BLOCK_IDS.tuff, T.tuff], [BLOCK_IDS.calcite, T.calcite],
+  [BLOCK_IDS.bedrock, T.bedrock], [BLOCK_IDS.lava, T.lava],
   [BLOCK_IDS.basalt, T.basalt], [BLOCK_IDS.blackstone, T.blackstone], [BLOCK_IDS.netherrack, T.netherrack],
   [BLOCK_IDS.endStone, T.endStone], [BLOCK_IDS.obsidian, T.obsidian], [BLOCK_IDS.magma, T.magma],
   [BLOCK_IDS.quartzBlock, T.quartzBlock], [BLOCK_IDS.netherBricks, T.netherBricks],
