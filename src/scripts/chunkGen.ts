@@ -424,7 +424,7 @@ BIOMES[BIOME.jungle] = {
 BIOMES[BIOME.darkForest] = {
   // roofed forest: very dense 2×2 dark-oak (overlapping canopies) + huge mushrooms,
   // bushes, fallen logs; mushroom + rose-bush + leaf-litter floor (foliage pass).
-  name: 'darkForest', surface: grassSurf, features: { darkOak: 0.86, hugeMushroom: 0.04, bush: 0.05, fallenLog: 0.03 },
+  name: 'darkForest', surface: grassSurf, features: { darkOak: 0.5, hugeMushroom: 0.04, bush: 0.05, fallenLog: 0.03 },
   mapColor: [40, 74, 38], tint: { sky: 0xa6bcc4, ground: 0x283820, clear: 0x6e8478, bright: 0.8 },
 };
 BIOMES[BIOME.birchForest] = {
@@ -434,7 +434,7 @@ BIOMES[BIOME.birchForest] = {
 BIOMES[BIOME.flowerForest] = {
   // wooded WITH flowers — denser tree cover than before so it reads as a forest,
   // not just a flowery field (the foliage pass lays the dense flower patches).
-  name: 'flowerForest', surface: grassSurf, features: { oak: 0.22, birch: 0.14, bush: 0.06, flowers: 0.42 },
+  name: 'flowerForest', surface: grassSurf, features: { oak: 0.06, birch: 0.04, bush: 0.06, flowers: 0.42 },
   mapColor: [96, 150, 72], tint: { sky: 0xc6dcf0, ground: 0x44542e, clear: 0x96b6dc, bright: 1.0 },
 };
 BIOMES[BIOME.meadow] = {
@@ -839,6 +839,10 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   const lakeLowland = sm(baseH, sea + 1, sea + 8) * (1 - sm(baseH, sea + 16, sea + 30));
   const lakeMem = lakeBasin * lakeLowland * (1 - badlandsMem) * (1 - riverMem);
   if (lakeMem > 0) height += lakeMem * ((sea - 3) - baseH);
+  // A partial-membership rim could land just ABOVE sea (a dry moat around the lake
+  // that the global water plane never floods). Force any strong-lake column under
+  // the waterline so the whole basin floods to a clean shore.
+  if (lakeMem > 0.5) height = Math.min(height, sea - 1);
 
   // Mushroom island — RARE but BIG (now that oceans are large). Low-frequency,
   // smooth, high-threshold field in DEEP water; dome ADDED to the seabed so it
@@ -880,7 +884,7 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   // places biomes on the horizontal field; elevation cooling is a surface concern
   // via the snow/rock overlay below, not a biome reassignment).
   let biome: number;
-  if (islandMem > 0.3 && aboveSea > -10) biome = BIOME.mushroom;
+  if (islandMem > 0.3 && aboveSea > 1) biome = BIOME.mushroom;   // only the dome that breaches the sea (no submerged giant mushrooms)
   else if (swampMem > 0.5) biome = c.temp > 0.20 ? BIOME.mangroveSwamp : BIOME.swamp;   // warm swamp → mangrove
   // Badlands shells only ABOVE sea — so a river/coast that carved one of these
   // columns below sea reads as water, not red sand bleeding into the river/ocean.
@@ -929,8 +933,12 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
     // peaks snow (alpine height OR a lapse-cooled freezing summit). The snowy
     // mountain-range biome ALWAYS snow-caps above the line (it's defined as snowy).
     const arid = c.temp > 0.20 || c.humid < -0.15;   // hot OR dry → bare rock, no snow
-    if (aboveSea > 48) { surfaceId = BLOCK_IDS.stone; subId = BLOCK_IDS.stone; }   // exposed rock (any climate)
-    if ((biome === BIOME.mountains || !arid) && (aboveSea > 66 || tempEff < -0.46)) surfaceId = BLOCK_IDS.snow;
+    // Wobble the rock/snow contour with a broad low-freq field so the lines snake
+    // up and down the slopes instead of ringing every peak at a dead-flat altitude
+    // (the old topographic-map look). Pure fn of (wx,wz) → apron-safe.
+    const lineWob = fbm(simplex, wx + 33000, wz + 33000, fs * 0.6, 2) * 11;
+    if (aboveSea > 48 + lineWob) { surfaceId = BLOCK_IDS.stone; subId = BLOCK_IDS.stone; }   // exposed rock (any climate)
+    if ((biome === BIOME.mountains || !arid) && (aboveSea > 66 + lineWob || tempEff < -0.46)) surfaceId = BLOCK_IDS.snow;
   }
 
   // Taiga floor: smooth podzol patches (low-freq noise — coherent blobs, not the
@@ -1026,7 +1034,7 @@ function generateResources(rng: RNG, size: ChunkSize, worldX: number, worldZ: nu
 // Cold water freezes to a walkable ice sheet at the surface (matches the snow /
 // frozen-river threshold). Pure fn of climate → apron stays valid (ice sits above
 // the heightmap like a tree, so borders only get hidden overdraw, never holes).
-const ICE_SURFACE_TEMP = -0.30;   // more cold water freezes over (was -0.45, too rare)
+export const ICE_SURFACE_TEMP = -0.30;   // more cold water freezes over (was -0.45, too rare)
 
 // Lower-world rock. The old code put deepslate below an ABSOLUTE Y in [7,13], so on
 // a sea=128 world it was a 7-13-block sliver at the floor under ~125 blocks of plain

@@ -67,8 +67,15 @@ export class Physics {
       // Are we in open water? (body centre below sea level AND the column at sea
       // level is air over a sub-sea floor — i.e. real ocean, not a land hill).
       const bodyCenterY = player.position.y - player.height * 0.5;
-      const inWater = !player.flying && bodyCenterY < sea &&
-        world.getBlockId(Math.floor(player.position.x), sea, Math.floor(player.position.z)) === blocks.air.id;
+      const fx = Math.floor(player.position.x), fz = Math.floor(player.position.z);
+      // In open water? Torso below the sea plane AND in an open cell, in a genuine
+      // WATER column — the sea-level cell here must also be open. That excludes land
+      // hills (sea-level cell is solid rock there) and, importantly, dry CAVES under
+      // land (which now carve air below sea level): their sea-level cell is the solid
+      // surface rock, so a cave isn't mistaken for water. Two cheap O(1) block reads.
+      const inWater = !player.flying && bodyCenterY < sea
+        && world.getBlockId(fx, Math.floor(bodyCenterY), fz) === blocks.air.id
+        && world.getBlockId(fx, sea, fz) === blocks.air.id;
 
       player.inWater = inWater;
       // Flight (Creative / Survival-flight): no gravity, vertical from input.

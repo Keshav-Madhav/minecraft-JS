@@ -1,4 +1,4 @@
-import { generateChunkData, createWorldSampler, createCaveSampler, LAVA_Y, wellShaftRange, biomeWaterHex, WorldSampler, ChunkParams, ChunkSize } from './chunkGen';
+import { generateChunkData, createWorldSampler, createCaveSampler, LAVA_Y, ICE_SURFACE_TEMP, wellShaftRange, biomeWaterHex, WorldSampler, ChunkParams, ChunkSize } from './chunkGen';
 import { ResourceGenInfo, BLOCK_IDS } from './blockTypes';
 import { buildChunkGeometry, buildChunkMapTile, scanEmitters, GeometryArrays } from './chunkMesh';
 
@@ -80,15 +80,23 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   // Apron: neighbour solidity from the deterministic surface height. Memoised
   // per border column so repeated y queries are O(1). Returns any non-air id for
   // solid (only air-vs-solid matters for face culling).
-  const heightCache = new Map<number, number>();
+  const surfCache = new Map<number, ReturnType<typeof sample>>();
   // A well's centre column is hollow below ground; cache its carved range per
   // border column so a chunk border bisecting a well still seals the shaft wall.
   const carveCache = new Map<number, [number, number] | null>();
+  const sea = cfg.params.terrain.waterOffset;
   const getOutside = (lx: number, y: number, lz: number) => {
     const key = (lx + 1) * 100000 + (lz + 1);
-    let h = heightCache.get(key);
-    if (h === undefined) { h = sample(worldX + lx, worldZ + lz).height; heightCache.set(key, h); }
-    if (y > h) return BLOCK_IDS.air;
+    let s = surfCache.get(key);
+    if (s === undefined) { s = sample(worldX + lx, worldZ + lz); surfCache.set(key, s); }
+    const h = s.height;
+    if (y > h) {
+      // Frozen ocean/river: a 1-2 block ice cap sits at y=sea / sea-1 on cold
+      // submerged columns (placed in generateTerrain above the heightmap). The
+      // apron must report it solid or the shared border ice face is double-drawn.
+      if (h < sea && (y === sea || y === sea - 1) && s.temp < ICE_SURFACE_TEMP) return BLOCK_IDS.stone;
+      return BLOCK_IDS.air;
+    }
     let carve = carveCache.get(key);
     if (carve === undefined) { carve = wellShaftRange(cfg.params, sample, worldX + lx, worldZ + lz); carveCache.set(key, carve); }
     if (carve && y >= carve[0] && y <= carve[1]) return BLOCK_IDS.air;
@@ -114,7 +122,7 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   // Top-down minimap tile from the same real block data the world renders, so the
   // minimap is always in-sync without a separate generation round-trip. Water hue
   // is sampled per submerged column (cheap — only ocean columns hit the sampler).
-  const sea = cfg.params.terrain.waterOffset;
+  // (`sea` is declared once above, reused here for the map tile.)
   const mapTile = buildChunkMapTile(data, cfg.size, sea, getTint,
     (lx, lz) => biomeWaterHex(sample(worldX + lx, worldZ + lz).biome));
 
