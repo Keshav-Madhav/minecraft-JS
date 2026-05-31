@@ -775,7 +775,18 @@ function animate() {
   if (orbitGizmo.visible) orbitGizmo.position.copy(spectator.controls.target);
 
   updateSky(playing ? delta : 0);   // freeze the day/night clock while paused
-  if (sun.castShadow) updateSunShadow();   // skip the frustum maths entirely when shadows are off
+  // Shadows only contribute while the sun is up (sun.intensity = sunPeak·daylight),
+  // so at night the depth pass renders into a map that's then multiplied by ~0 —
+  // a full scene re-render (1k–8k texels) wasted for ~half the day cycle. Freeze
+  // the shadow map via autoUpdate rather than toggling sun.castShadow: changing
+  // the cast-flag would change the shader's shadow-light count and force every
+  // material to recompile (a visible dusk/dawn hitch). autoUpdate is a render-time
+  // flag only — flipping it costs nothing and triggers no recompile, and three
+  // re-renders the map fresh at the player's current position the first daylight
+  // frame after it flips back on (the frozen map was invisible at intensity ~0).
+  const shadowsActive = sun.castShadow && currentDaylight > 0.02;
+  renderer.shadowMap.autoUpdate = shadowsActive;
+  if (shadowsActive) updateSunShadow();   // skip the frustum maths too when frozen/off
   updatePlantWind(currentTime / 1000);
 
   worldMap.update();

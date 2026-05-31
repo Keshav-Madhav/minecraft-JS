@@ -64,6 +64,15 @@ export class WorldMap {
   private sig = '0';        // world signature — IDB key prefix + stale-result guard
   private chunkW = 16;      // chunk width in blocks (set in configure)
 
+  // Minimap recomposite gate: the composite is pixel-identical until the integer
+  // screen origin shifts (player moved ≥1px), so we cache the last origin and skip
+  // redrawing the ~13×13 tile grid every frame while standing still / moving sub-
+  // pixel. A low heartbeat still recomposites a few times/sec so freshly-streamed
+  // tiles fill in even when stationary.
+  private miniOx = NaN;
+  private miniOz = NaN;
+  private miniTick = 0;
+
   // minimap
   private miniWrap: HTMLElement;
   private mini: HTMLCanvasElement;
@@ -324,7 +333,16 @@ export class WorldMap {
   update() {
     const p = this.opts.getPlayer();
     this.miniMarker.style.transform = `translate(-50%, -50%) rotate(${p.yaw}rad)`;
-    this.compositeMini(p.x, p.z);
+    // Only recomposite when the result would actually differ: the integer screen
+    // origin (same maths as compositeMini) changed, or the heartbeat fired to pick
+    // up newly-streamed tiles. The marker rotation above stays per-frame so the
+    // compass turns smoothly even when the map itself doesn't need redrawing.
+    const half = this.mini.width / 2;
+    const ox = Math.round(half - p.x), oz = Math.round(half - p.z);
+    if (ox !== this.miniOx || oz !== this.miniOz || (this.miniTick++ % 12) === 0) {
+      this.miniOx = ox; this.miniOz = oz;
+      this.compositeMini(p.x, p.z);
+    }
 
     if (this.open) {
       this.want.length = 0;
