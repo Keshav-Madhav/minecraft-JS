@@ -114,6 +114,11 @@ export const BLOCK_IDS = {
   bedFoot: 182, bedHead: 183, barrel: 184,
   flowerPot: 185,   // a potted-flower CROSS billboard (plant), placed on tables/floors
   bedrock: 186, lava: 187,   // world-floor + cave lava sea (worldgen)
+  // Wave-4 vegetation (cross-billboard plants, except pumpkin = cube)
+  kelp: 188, kelpTop: 189, bamboo: 190, sweetBerryBush: 191,
+  sunflowerLower: 192, sunflowerUpper: 193, lilacLower: 194, lilacUpper: 195,
+  roseBushLower: 196, roseBushUpper: 197, peonyLower: 198, peonyUpper: 199,
+  seaPickle: 200, pumpkin: 201,
 } as const;
 
 // Settings used by procedural resource (ore) generation. Plain data so it can
@@ -246,6 +251,11 @@ export const TEXTURE_LAYER = {
   barrelTop: 182, barrelSide: 183,
   flowerPot: 184,
   bedrock: 185, lava: 186,
+  // Wave-4 vegetation
+  kelp: 187, kelpTop: 188, bamboo: 189, sweetBerryBush: 190,
+  sunflowerBottom: 191, sunflowerTop: 192, lilacBottom: 193, lilacTop: 194,
+  roseBushBottom: 195, roseBushTop: 196, peonyBottom: 197, peonyTop: 198,
+  seaPickle: 199, pumpkinTop: 200, pumpkinSide: 201,
 } as const;
 
 // Derived so it can never drift out of sync when a layer is added.
@@ -347,6 +357,7 @@ for (const [id, side, top] of [
   [BLOCK_IDS.mangroveLog, T.mangroveLogSide, T.mangroveLogTop], [BLOCK_IDS.quartzPillar, T.quartzPillarSide, T.quartzPillarTop],
   [BLOCK_IDS.redSandstone, T.redSandstoneSide, T.redSandstoneTop], [BLOCK_IDS.hayBale, T.hayBaleSide, T.hayBaleTop],
   [BLOCK_IDS.campfire, T.campfireSide, T.campfireTop], [BLOCK_IDS.jackOLantern, T.jackLanternSide, T.jackLanternTop],
+  [BLOCK_IDS.pumpkin, T.pumpkinSide, T.pumpkinTop],
 ] as const) {
   BLOCK_FACE_LAYERS[id] = [side, side, top, top, side, side];
 }
@@ -487,6 +498,20 @@ export const PLANTS: { readonly [id: number]: PlantDef } = {
   [BLOCK_IDS.torch]:             { layer: PT.torch,              kind: 'cross', tint: 'none', off: 0, swayLo: 0, swayHi: 0 },
   // potted flower (interior decoration): a small terracotta pot + bloom, no sway.
   [BLOCK_IDS.flowerPot]:         { layer: PT.flowerPot,          kind: 'cross', tint: 'none', off: 0, swayLo: 0, swayHi: 0 },
+  // --- Wave-4 vegetation (cross billboards) ---
+  [BLOCK_IDS.kelp]:              { layer: PT.kelp,    kind: 'cross', tint: 'none', off: 0, swayLo: 0.2, swayHi: 0.8 },
+  [BLOCK_IDS.kelpTop]:           { layer: PT.kelpTop, kind: 'cross', tint: 'none', off: 0, swayLo: 0.4, swayHi: 1 },
+  [BLOCK_IDS.bamboo]:            { layer: PT.bamboo,  kind: 'cross', tint: 'none', off: 0, swayLo: 0, swayHi: 0.3 },
+  [BLOCK_IDS.sweetBerryBush]:    { layer: PT.sweetBerryBush, kind: 'cross', tint: 'none', off: 0 },
+  [BLOCK_IDS.seaPickle]:         { layer: PT.seaPickle, kind: 'cross', tint: 'none', off: 0 },
+  [BLOCK_IDS.sunflowerLower]:    { layer: PT.sunflowerBottom, kind: 'cross', tint: 'none', off: 0, swayLo: 0, swayHi: 0.4 },
+  [BLOCK_IDS.sunflowerUpper]:    { layer: PT.sunflowerTop,    kind: 'cross', tint: 'none', off: 0, swayLo: 0.4, swayHi: 0.8 },
+  [BLOCK_IDS.lilacLower]:        { layer: PT.lilacBottom,     kind: 'cross', tint: 'none', off: 0, swayLo: 0, swayHi: 0.4 },
+  [BLOCK_IDS.lilacUpper]:        { layer: PT.lilacTop,        kind: 'cross', tint: 'none', off: 0, swayLo: 0.4, swayHi: 0.8 },
+  [BLOCK_IDS.roseBushLower]:     { layer: PT.roseBushBottom,  kind: 'cross', tint: 'none', off: 0, swayLo: 0, swayHi: 0.4 },
+  [BLOCK_IDS.roseBushUpper]:     { layer: PT.roseBushTop,     kind: 'cross', tint: 'none', off: 0, swayLo: 0.4, swayHi: 0.8 },
+  [BLOCK_IDS.peonyLower]:        { layer: PT.peonyBottom,     kind: 'cross', tint: 'none', off: 0, swayLo: 0, swayHi: 0.4 },
+  [BLOCK_IDS.peonyUpper]:        { layer: PT.peonyTop,        kind: 'cross', tint: 'none', off: 0, swayLo: 0.4, swayHi: 0.8 },
 };
 
 // O(1) "is this id a plant?" for the mesher's hot loops & physics broadphase —

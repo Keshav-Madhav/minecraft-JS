@@ -1577,6 +1577,22 @@ function generateFoliage(simplex: SimplexNoise, params: ChunkParams, size: Chunk
           set(x, sea, z, BLOCK_IDS.lilyPad);
           placed = true;
         }
+        // Kelp: tall swaying columns in cold/normal/lukewarm oceans (NOT warm/frozen,
+        // matching MC). A stack of kelp crosses from the seabed toward the surface,
+        // capped by a leafier kelp tip; pure fn of (wx,wz) → seamless across borders.
+        if (!placed && (biome === BIOME.ocean || biome === BIOME.coldOcean || biome === BIOME.lukewarmOcean)
+            && depth >= 3 && get(x, h + 1, z) === BLOCK_IDS.air
+            && fbm(simplex, wx + 51000, wz + 51000, 24, 2) > 0.42 && hash01(wx + 7, wz + 31) < 0.20) {
+          const topY = Math.min(h + 2 + Math.floor(hash01(wx + 3, wz + 13) * (depth - 1)), sea - 2);
+          for (let yy = h + 1; yy <= topY; yy++) set(x, yy, z, BLOCK_IDS.kelp);
+          if (topY >= h + 1) set(x, topY, z, BLOCK_IDS.kelpTop);
+          placed = true;
+        }
+        // Sea pickles: small warm-ocean seabed clusters (warm-ocean identity).
+        if (!placed && biome === BIOME.warmOcean && depth >= 1 && depth <= 14 && get(x, h + 1, z) === BLOCK_IDS.air
+            && fbm(simplex, wx + 52000, wz + 52000, 12, 2) > 0.4 && hash01(wx + 11, wz + 5) < 0.35) {
+          set(x, h + 1, z, BLOCK_IDS.seaPickle); placed = true;
+        }
         // Seagrass / tall seagrass carpet the seabed in shallow-to-mid water of any
         // kind (oceans, lakes, rivers); the deep abyss stays bare (depth cap + perf).
         if (!placed && depth >= 1 && depth <= 16 && get(x, h + 1, z) === BLOCK_IDS.air) {
@@ -1627,6 +1643,35 @@ function generateFoliage(simplex: SimplexNoise, params: ChunkParams, size: Chunk
           for (let i = 1; i <= ch && h + i < size.height; i++) set(x, h + i, z, BLOCK_IDS.sugarCane);
           continue;
         }
+      }
+
+      // --- Wave-4 land vegetation (claim the cell, like the other ground cover) ---
+      // Sweet berry bushes: taiga / redwood, on grass or podzol (patchy).
+      if ((biome === BIOME.taiga || biome === BIOME.redwoodForest) && (top === BLOCK_IDS.grass || top === BLOCK_IDS.podzol)
+          && fbm(simplex, wx + 47000, wz + 47000, 14, 2) > 0.45 && r < 0.10) {
+        set(x, h + 1, z, BLOCK_IDS.sweetBerryBush); continue;
+      }
+      // Bamboo: sparse 4-9-tall canes (stacked cross billboards) in jungle.
+      if (biome === BIOME.jungle && top === BLOCK_IDS.grass
+          && fbm(simplex, wx + 48000, wz + 48000, 18, 2) > 0.35 && r < 0.10) {
+        const bh = 4 + Math.floor(hash01(wx + 19, wz + 7) * 6);
+        for (let i = 1; i <= bh && h + i < size.height && get(x, h + i, z) === BLOCK_IDS.air; i++) set(x, h + i, z, BLOCK_IDS.bamboo);
+        continue;
+      }
+      // Pumpkin: rare lone gourd (a solid cube) on any grassy biome.
+      if (top === BLOCK_IDS.grass && hash01(wx + 311, wz + 733) < 0.006 && fbm(simplex, wx + 49000, wz + 49000, 10, 1) > 0.2) {
+        set(x, h + 1, z, BLOCK_IDS.pumpkin); continue;
+      }
+      // Tall (2-block) flowers — sunflower / lilac / rose bush / peony — a rare
+      // highlight in flower-rich + plains/forest biomes; single-species patches.
+      if (top === BLOCK_IDS.grass && (h + 2) < size.height && get(x, h + 2, z) === BLOCK_IDS.air
+          && (biome === BIOME.flowerForest || biome === BIOME.meadow || biome === BIOME.plains
+              || biome === BIOME.forest || biome === BIOME.birchForest || biome === BIOME.warmForest)
+          && fbm(simplex, wx + 50000, wz + 50000, 20, 2) > 0.4 && r < (biome === BIOME.flowerForest ? 0.10 : 0.03)) {
+        const k = Math.abs(Math.floor(fbm(simplex, wx + 95000, wz + 95000, 50, 1) * 7)) % 4;
+        const lower = [BLOCK_IDS.sunflowerLower, BLOCK_IDS.lilacLower, BLOCK_IDS.roseBushLower, BLOCK_IDS.peonyLower][k];
+        const upper = [BLOCK_IDS.sunflowerUpper, BLOCK_IDS.lilacUpper, BLOCK_IDS.roseBushUpper, BLOCK_IDS.peonyUpper][k];
+        set(x, h + 1, z, lower); set(x, h + 2, z, upper); continue;
       }
 
       // --- dead bush on hot, dry sand --------------------------------------
