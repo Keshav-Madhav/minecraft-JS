@@ -5,7 +5,7 @@ import { findNearestBiome, findNearestStructure, compass, BIOME_TARGETS, STRUCTU
 
 export type GameMode = 'survival' | 'creative' | 'spectator';
 
-export type PerfSettings = { uncapFPS: boolean, fog: boolean, resolutionScale: number };
+export type PerfSettings = { uncapFPS: boolean, fpsCap: number, fog: boolean, fogNear: number, resolutionScale: number };
 
 // Live lighting handles (applied immediately, no rebuild).
 export type LightingControls = {
@@ -35,9 +35,19 @@ export type QualityControls = {
   getShadowRange: () => number, setShadowRange: (v: number) => void,
   getBlockLights: () => boolean, setBlockLights: (v: boolean) => void,
   getClouds: () => boolean, setClouds: (v: boolean) => void,
+  getCloudOpacity: () => number, setCloudOpacity: (v: number) => void,
   getFrustumStreaming: () => boolean, setFrustumStreaming: (v: boolean) => void,
   getStatsOverlay: () => boolean, setStatsOverlay: (v: boolean) => void,
   getUltraGraphics: () => boolean, setUltraGraphics: (v: boolean) => void,
+  getBloom: () => number, setBloom: (v: number) => void,
+  getGodRays: () => number, setGodRays: (v: number) => void,
+  getResolutionScale: () => number, setResolutionScale: (v: number) => void,
+};
+
+// First-person / spectator view controls (applied live, no rebuild).
+export type PlayerViewControls = {
+  getFov: () => number, setFov: (v: number) => void,
+  getMouseSensitivity: () => number, setMouseSensitivity: (v: number) => void,
 };
 
 export type StatsSnapshot = {
@@ -52,9 +62,9 @@ type MenuOptions = {
   settings: PerfSettings,
   lighting: LightingControls,
   quality: QualityControls,
+  playerView: PlayerViewControls,
   regenerate: () => void,
   onViewDistanceChange: () => void,
-  onResolutionChange: () => void,
   getStats: () => StatsSnapshot,
   getMode: () => GameMode,
   setMode: (m: GameMode) => void,
@@ -318,67 +328,100 @@ export function createMenu(opts: MenuOptions): MenuController {
   const setBody = bodies['Settings'];
   const syncables: HTMLElement[] = [];
   const remember = (row: HTMLElement) => { syncables.push(row); return row; };
-  // Refresh every slider/toggle/segmented control's displayed value (after a
-  // preset bulk-change or a mode switch flips things under the UI).
-  const syncSettings = () => { for (const r of syncables) (r as any)._sync?.(); };
+  // Rows that are only meaningful while a parent toggle is on (e.g. Foliage
+  // Distance needs Foliage on) — registered here, then greyed + click-blocked
+  // (.ui-row--disabled) whenever their predicate is false.
+  const depRules: { row: HTMLElement, on: () => boolean }[] = [];
+  const dep = (row: HTMLElement, on: () => boolean) => { depRules.push({ row, on }); return row; };
+  const applyDeps = () => { for (const d of depRules) d.row.classList.toggle('ui-row--disabled', !d.on()); };
+  // Refresh every control's displayed value + the dependent-row enabled state
+  // (after a preset bulk-change or a mode switch flips things under the UI).
+  const syncSettings = () => { for (const r of syncables) (r as any)._sync?.(); applyDeps(); };
 
-  // --- Quality (presets + advanced) ---
+  // --- Quality: preset + an Advanced drawer split into Graphics / Performance / Debug ---
   const q = addSection(setBody, '⚡  Quality');
-  remember(addSegmented<QualityPreset>(q, 'Preset',
+  const presetRow = remember(addSegmented<QualityPreset>(q, 'Preset',
     [{ value: 'fast', label: 'Fast' }, { value: 'balanced', label: 'Balanced' }, { value: 'fancy', label: 'Fancy' }, { value: 'ultra', label: 'Ultra' }],
     quality.getPreset,   // returns 'custom' when knobs were tuned → no preset highlighted
     (v) => { quality.applyPreset(v); syncSettings(); opts.onViewDistanceChange(); }));
-
   const adv = addSection(q, 'Advanced', true);
-  remember(addSlider(adv, 'Render Distance', {
-    min: 2, max: 64, step: 1,   // up to 64 chunks (VERY heavy on RAM — for strong machines)
-    get: quality.getRenderDistance, set: quality.setRenderDistance,
-    onChange: opts.onViewDistanceChange,
-  }));
-  remember(addToggle(adv, 'Foliage', quality.getFoliage, quality.setFoliage));
-  remember(addSlider(adv, 'Foliage Distance', {
-    min: 1, max: 64, step: 1,
-    get: quality.getFoliageDistance, set: quality.setFoliageDistance,
-  }));
+  // Tuning ANY advanced knob flips the preset to 'custom' (in the main.ts setters);
+  // reflect that instantly by re-syncing the Preset chip (it de-highlights). Delegated
+  // on the Advanced body so it covers sliders (input), toggles (change) and segmented
+  // buttons (click) alike. The collapse header is a sibling, so it doesn't trigger this.
+  const refreshPreset = () => (presetRow as any)._sync?.();
+  adv.addEventListener('input', refreshPreset);
+  adv.addEventListener('change', refreshPreset);
+  adv.addEventListener('click', refreshPreset);
+
+  // GRAPHICS — what the world looks like.
+  adv.append(el('div', 'ui-subhead', 'Graphics'));
   remember(addSegmented<ShadowQuality>(adv, 'Shadows',
     [{ value: 'off', label: 'Off' }, { value: 'low', label: 'Low' }, { value: 'medium', label: 'Med' }, { value: 'high', label: 'High' }, { value: 'ultra', label: 'Ultra' }],
-    quality.getShadowQuality, quality.setShadowQuality));
-  // Ultra graphics: post-processing (bloom + god rays), soft hi-res shadows incl.
-  // foliage/leaf cutout shadows, fake water caustics + reflections. Heavy — opt-in.
-  remember(addToggle(adv, 'Ultra Graphics ✨', quality.getUltraGraphics, quality.setUltraGraphics));
-  remember(addSlider(adv, 'Shadow Range', {
-    min: 32, max: 360, step: 2,
-    get: quality.getShadowRange, set: quality.setShadowRange,
-  }));
+    quality.getShadowQuality, quality.setShadowQuality));   // each tier sets its own map size + range
+  // Ultra graphics: post-processing (bloom + god rays), foliage/leaf cutout shadows,
+  // fake water caustics + reflections. Heavy — opt-in, layers onto any preset.
+  remember(addToggle(adv, 'Ultra Graphics', quality.getUltraGraphics, quality.setUltraGraphics, applyDeps));
+  remember(dep(addSlider(adv, 'Bloom Strength', {
+    min: 0, max: 1.5, step: 0.05, decimals: 2, get: quality.getBloom, set: quality.setBloom,
+  }), quality.getUltraGraphics));
+  remember(dep(addSlider(adv, 'God Rays', {
+    min: 0, max: 1.5, step: 0.05, decimals: 2, get: quality.getGodRays, set: quality.setGodRays,
+  }), quality.getUltraGraphics));
+  remember(addToggle(adv, 'Clouds', quality.getClouds, quality.setClouds, applyDeps));
+  remember(dep(addSlider(adv, 'Cloud Opacity', {
+    min: 0, max: 1, step: 0.05, decimals: 2, get: quality.getCloudOpacity, set: quality.setCloudOpacity,
+  }), quality.getClouds));
+  remember(addToggle(adv, 'Fog', () => settings.fog, (v) => { settings.fog = v; }, () => { opts.onViewDistanceChange(); applyDeps(); }));
+  remember(dep(addSlider(adv, 'Fog Distance', {
+    min: 0.4, max: 1, step: 0.05, decimals: 2,
+    get: () => settings.fogNear, set: (v) => { settings.fogNear = v; }, onChange: opts.onViewDistanceChange,
+  }), () => settings.fog));
   remember(addToggle(adv, 'Block Lights', quality.getBlockLights, quality.setBlockLights));
-  remember(addToggle(adv, 'Clouds', quality.getClouds, quality.setClouds));
-  remember(addToggle(adv, 'Frustum Culling (saves RAM)', quality.getFrustumStreaming, quality.setFrustumStreaming));
-  remember(addSlider(adv, 'Resolution Scale', {
-    min: 0.5, max: 1, step: 0.05, decimals: 2,
-    get: () => settings.resolutionScale, set: (v) => { settings.resolutionScale = v; },
-    onInput: opts.onResolutionChange,
+  remember(addToggle(adv, 'Foliage', quality.getFoliage, quality.setFoliage, applyDeps));
+  remember(dep(addSlider(adv, 'Foliage Distance (chunks)', {
+    min: 1, max: 64, step: 1, get: quality.getFoliageDistance, set: quality.setFoliageDistance,
+  }), quality.getFoliage));
+
+  // PERFORMANCE — how hard the machine works.
+  adv.append(el('div', 'ui-subhead', 'Performance'));
+  remember(addSlider(adv, 'Render Distance (chunks)', {
+    min: 2, max: 64, step: 1,   // up to 64 chunks (VERY heavy on RAM — for strong machines)
+    get: quality.getRenderDistance, set: quality.setRenderDistance,   // setter already re-applies the view distance
   }));
-  remember(addToggle(adv, 'Fog', () => settings.fog, (v) => { settings.fog = v; }, opts.onViewDistanceChange));
-  // VSync ON caps to the display refresh rate; OFF (default) renders uncapped.
-  remember(addToggle(adv, 'VSync', () => !settings.uncapFPS, (v) => { settings.uncapFPS = !v; }));
-  remember(addToggle(adv, 'Stats Overlay (HUD)', quality.getStatsOverlay, quality.setStatsOverlay));
-  remember(addToggle(adv, 'Frustum Culling', () => world.frustumCulling, (v) => { world.frustumCulling = v; }));
+  remember(addSlider(adv, 'Resolution Scale', {
+    min: 0.5, max: 2, step: 0.05, decimals: 2,   // >1 = supersample (SSAA): crisp but heavy
+    get: quality.getResolutionScale, set: quality.setResolutionScale,
+  }));
+  // VSync ON caps to the display refresh; OFF (default) renders uncapped, then the
+  // Frame Rate Limit below applies a soft cap (Max = unlimited).
+  remember(addToggle(adv, 'VSync', () => !settings.uncapFPS, (v) => { settings.uncapFPS = !v; }, applyDeps));
+  remember(dep(addSegmented<string>(adv, 'Frame Rate Limit',
+    [{ value: '0', label: 'Max' }, { value: '60', label: '60' }, { value: '120', label: '120' }, { value: '144', label: '144' }, { value: '240', label: '240' }],
+    () => String(settings.fpsCap), (v) => { settings.fpsCap = Number(v); }), () => settings.uncapFPS));
+  remember(addToggle(adv, 'Chunk Streaming (saves RAM)', quality.getFrustumStreaming, quality.setFrustumStreaming));
+
+  // DEBUG / HUD
+  adv.append(el('div', 'ui-subhead', 'Debug / HUD'));
+  remember(addToggle(adv, 'Stats Overlay', quality.getStatsOverlay, quality.setStatsOverlay));
 
   // --- Lighting ---
   const light = addSection(setBody, '💡  Lighting', true);
   remember(addToggle(light, 'Day/Night Cycle', lighting.getDayNight, lighting.setDayNight));
   remember(addSlider(light, 'Time of Day', { min: 0, max: 1, step: 0.01, decimals: 2, get: lighting.getTime, set: lighting.setTime }));
-  remember(addSlider(light, 'Day Length (s)', { min: 30, max: 1200, step: 10, get: lighting.getDayLength, set: lighting.setDayLength }));
+  remember(addSlider(light, 'Day Length (s)', { min: 20, max: 1200, step: 10, get: lighting.getDayLength, set: lighting.setDayLength }));
   remember(addSlider(light, 'Sun Direction (°)', { min: 0, max: 360, step: 1, get: lighting.getAzimuth, set: lighting.setAzimuth }));
-  remember(addSlider(light, 'Sun Height (°)', { min: 5, max: 89, step: 1, get: lighting.getElevation, set: lighting.setElevation }));
+  remember(addSlider(light, 'Sun Height (°)', { min: 3, max: 89, step: 1, get: lighting.getElevation, set: lighting.setElevation }));
   remember(addSlider(light, 'Sun Brightness', { min: 0, max: 6, step: 0.1, decimals: 1, get: lighting.getSun, set: lighting.setSun }));
   remember(addSlider(light, 'Sky / Fill Light', { min: 0, max: 4, step: 0.1, decimals: 1, get: lighting.getFill, set: lighting.setFill }));
   remember(addSlider(light, 'Exposure', { min: 0.4, max: 2, step: 0.05, decimals: 2, get: lighting.getExposure, set: lighting.setExposure }));
   remember(addToggle(light, 'Biome Tint', lighting.getBiomeTint, lighting.setBiomeTint));
 
-  // --- Player ---
+  // --- Player (the headline FOV + Sensitivity freedom knobs, kept near the top) ---
   const playerFolder = addSection(setBody, '🏃  Player', true);
-  remember(addSlider(playerFolder, 'Walk Speed', { min: 1, max: 40, step: 1, get: () => player.maxSpeed, set: (v) => { player.maxSpeed = v; } }));
+  remember(addSlider(playerFolder, 'Field of View (°)', { min: 60, max: 110, step: 1, get: opts.playerView.getFov, set: opts.playerView.setFov }));
+  remember(addSlider(playerFolder, 'Mouse Sensitivity', { min: 0.2, max: 3, step: 0.05, decimals: 2, get: opts.playerView.getMouseSensitivity, set: opts.playerView.setMouseSensitivity }));
+  remember(addSlider(playerFolder, 'Walk Speed (blocks/s)', { min: 2, max: 20, step: 0.5, decimals: 1, get: () => player.maxSpeed, set: (v) => { player.maxSpeed = v; } }));
 
   // --- World (queued; Apply rebuilds) ---
   const terrain = addSection(setBody, '🌍  World');
@@ -397,7 +440,7 @@ export function createMenu(opts: MenuOptions): MenuController {
     remember(addSlider(terrain, label, { min, max, step, get, set, decimals }));
   gen('Seed', 0, 10000, 1, () => world.params.seed, (v) => { world.params.seed = v; });
   gen('Feature Scale', 50, 600, 5, () => world.params.terrain.scale, (v) => { world.params.terrain.scale = v; });
-  gen('Mountain Height', 0, 220, 1, () => world.params.terrain.magnitude, (v) => { world.params.terrain.magnitude = v; });
+  gen('Mountain Height', 0, 200, 1, () => world.params.terrain.magnitude, (v) => { world.params.terrain.magnitude = v; });
   gen('Land Bias', 0, 70, 1, () => world.params.terrain.offset, (v) => { world.params.terrain.offset = v; });
   gen('Water Level', 0, 256, 1, () => world.params.terrain.waterOffset, (v) => { world.params.terrain.waterOffset = v; });
 

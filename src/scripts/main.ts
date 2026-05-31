@@ -36,7 +36,7 @@ let previousTime = performance.now();
 // Settings surfaced in the menu. Defaults: FPS UNLOCKED (uncapFPS on → VSync is
 // an opt-in toggle), fog on, biome tint + day/night on, and an always-on stats
 // overlay (top-right, under the minimap) while playing.
-const settings = { uncapFPS: true, fog: true, resolutionScale: 1, biomeLighting: true, dayNight: true, statsOverlay: true };
+const settings = { uncapFPS: true, fpsCap: 0, fog: true, fogNear: 0.7, resolutionScale: 1, biomeLighting: true, dayNight: true, statsOverlay: true };
 const SKY_COLOR = 0x80a0e0;
 
 // Frame scheduler. requestAnimationFrame is hard-locked to the display refresh
@@ -49,7 +49,15 @@ function scheduleFrame() {
   // Uncapped only while actively playing — no point spinning thousands of fps
   // behind the pause menu or the world map (just vsync there).
   if (settings.uncapFPS && !paused && !worldMap.isOpen()) {
-    if (!frameScheduled) { frameScheduled = true; frameChannel.port2.postMessage(0); }
+    if (settings.fpsCap > 0) {
+      // Soft frame-rate cap: wait out the remainder of the target interval since
+      // this frame STARTED (previousTime), then run. JS timer jitter is fine for
+      // a soft cap and keeps the GPU/battery from a pointless uncapped spin.
+      const wait = Math.max(0, 1000 / settings.fpsCap - (performance.now() - previousTime));
+      setTimeout(animate, wait);
+    } else if (!frameScheduled) {
+      frameScheduled = true; frameChannel.port2.postMessage(0);
+    }
   } else {
     requestAnimationFrame(animate);
   }
@@ -77,7 +85,9 @@ function createRenderer(): THREE.WebGLRenderer {
 }
 const renderer = createRenderer();
 function applyResolution() {
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * settings.resolutionScale);
+  // resolutionScale > 1 supersamples (SSAA) for crisp voxel edges; clamp the final
+  // device-pixel product at 3 so a hi-DPI panel + 2× scale can't melt the GPU.
+  renderer.setPixelRatio(Math.min(Math.min(window.devicePixelRatio, 2) * settings.resolutionScale, 3));
 }
 applyResolution();
 renderer.setSize(winWidth, winHeight);
@@ -149,7 +159,10 @@ function updateViewDistance() {
   // span*0.4 → fully opaque well before the draw edge, which made even a long
   // render distance look short). The fade ends slightly past the edge so the very
   // last ring isn't a hard wall.
-  scene.fog = settings.fog ? new THREE.Fog(SKY_COLOR, span * 0.7, span * 1.08) : null;
+  // Fog Distance (settings.fogNear, 0.4–1.0) sets where the haze starts as a
+  // fraction of the view span; the fade band is a constant ~0.38 span beyond it
+  // so the far edge always dissolves softly (never a hard wall).
+  scene.fog = settings.fog ? new THREE.Fog(SKY_COLOR, span * settings.fogNear, span * (settings.fogNear + 0.38)) : null;
   clouds.setViewDistance(player.camera.far);
   // Scale the per-frame streaming budget with distance so a big view actually
   // FILLS quickly instead of slowly creeping out (the other half of why high
@@ -645,23 +658,25 @@ function applyQualityPreset(p: QualityPreset) {
   // toggle (off by default) that layers onto ANY preset (see setUltraGraphics).
   if (p === 'fast') {
     // Lowest: short view, tight foliage, NO shadow pass, NO dynamic point lights,
-    // NO cloud overdraw, downscaled render — the cheapest the engine goes.
-    world.drawDistance = 6; world.setFoliage(true, 3);
+    // NO cloud overdraw, lightly downscaled render — the cheapest the engine goes.
+    // (0.85 not 0.7 so the out-of-box image isn't noticeably blurry on weak GPUs.)
+    world.drawDistance = 6; world.setFoliage(true, 4);
     applyShadowQuality('off'); lightInterval = 4; lightManager.setEnabled(false);
-    settings.resolutionScale = 0.7; clouds.visible = false;
+    settings.resolutionScale = 0.85; clouds.visible = false;
   } else if (p === 'balanced') {
-    world.drawDistance = 12; world.setFoliage(true, 7);
+    world.drawDistance = 12; world.setFoliage(true, 8);
     applyShadowQuality('medium'); lightInterval = 2; lightManager.setEnabled(true);
     settings.resolutionScale = 1; clouds.visible = true;
   } else if (p === 'fancy') {
-    world.drawDistance = 16; world.setFoliage(true, 14);
+    world.drawDistance = 20; world.setFoliage(true, 16);
     applyShadowQuality('high'); lightInterval = 1; lightManager.setEnabled(true);
     settings.resolutionScale = 1; clouds.visible = true;
   } else if (p === 'ultra') {
-    // Max it out: 32-chunk view, foliage far out, 8192 soft shadows. The Render
+    // Max it out: 28-chunk view, foliage far out, 8192 soft shadows. The Render
     // Distance slider goes to 64 for those who want to push it (very heavy on RAM),
-    // but the preset stays at a sane 32. (Ultra Graphics post-FX is a separate toggle.)
-    world.drawDistance = 32; world.setFoliage(true, 32);
+    // but the preset stays at a sane 28. (Ultra Graphics post-FX is a separate toggle.)
+    // Ladder re-spaced 6/12/20/28 so fancy→ultra isn't a 4× chunk-ring cliff.
+    world.drawDistance = 28; world.setFoliage(true, 28);
     applyShadowQuality('ultra'); lightInterval = 1; lightManager.setEnabled(true);
     settings.resolutionScale = 1; clouds.visible = true;
   }
@@ -674,6 +689,10 @@ function applyQualityPreset(p: QualityPreset) {
 // INDEPENDENT of the quality preset (layers onto any of them; OFF by default).
 let ultraGraphics = false;
 let postfx: PostFX | null = null;
+// User tuning for the post-FX look (settings sliders). Defaults match the values
+// that used to be hardcoded in PostFX, so the look is unchanged at defaults. Kept
+// here (not on PostFX) so they survive the lazy create/dispose of the pipeline.
+const postfxSettings = { bloom: 0.6, godRays: 1.0 };
 function setUltraGraphics(on: boolean) {
   ultraGraphics = on;
   setFoliageShadows(on);            // new chunk meshes pick this up...
@@ -681,6 +700,7 @@ function setUltraGraphics(on: boolean) {
   // (water uReflect is driven every frame in the render loop from `ultraGraphics`)
   if (on && !postfx) postfx = new PostFX(renderer, scene, mode === 'spectator' ? spectator.camera : player.camera);
   else if (!on && postfx) { postfx.dispose(); postfx = null; }   // free the HDR buffers when ultra is off
+  if (postfx) { postfx.bloom.strength = postfxSettings.bloom; postfx.godRayScale = postfxSettings.godRays; }
 }
 
 setUpLights();
@@ -693,7 +713,6 @@ const menu = createMenu({
   settings,
   regenerate: () => { world.generate(false); },
   onViewDistanceChange: updateViewDistance,
-  onResolutionChange: applyResolution,
   getStats: () => {
     const r = renderer.info.render, m = renderer.info.memory;
     const p = mode === 'spectator' ? spectator.camera.position : player.position;
@@ -720,6 +739,15 @@ const menu = createMenu({
     getTime: () => timeOfDay, setTime: (v) => { timeOfDay = v; },
     getDayLength: () => dayLength, setDayLength: (v) => { dayLength = v; },
   },
+  playerView: {
+    getFov: () => player.baseFov,
+    // Apply to BOTH cameras so the view matches in survival/creative and spectator.
+    setFov: (v) => { player.setFov(v); spectator.camera.fov = v; spectator.camera.updateProjectionMatrix(); },
+    // One sensitivity drives the first-person look (PointerLockControls) and the
+    // spectator orbit drag (OrbitControls). Applied live on the next mouse move.
+    getMouseSensitivity: () => player.controls.pointerSpeed,
+    setMouseSensitivity: (v) => { player.controls.pointerSpeed = v; spectator.controls.rotateSpeed = v; },
+  },
   quality: {
     applyPreset: applyQualityPreset,
     getPreset: () => qualityPreset,
@@ -745,6 +773,16 @@ const menu = createMenu({
     // Ultra Graphics is an independent ADD-ON — toggling it does NOT change the
     // quality preset (it layers onto whichever preset is active).
     setUltraGraphics: (v) => { setUltraGraphics(v); },
+    getResolutionScale: () => settings.resolutionScale,
+    setResolutionScale: (v) => { settings.resolutionScale = v; applyResolution(); qualityPreset = 'custom'; },
+    // Post-FX tuning (only audible when Ultra Graphics is on; values persist across
+    // the lazy create/dispose via postfxSettings, applied live when postfx exists).
+    getBloom: () => postfxSettings.bloom,
+    setBloom: (v) => { postfxSettings.bloom = v; if (postfx) postfx.bloom.strength = v; },
+    getGodRays: () => postfxSettings.godRays,
+    setGodRays: (v) => { postfxSettings.godRays = v; if (postfx) postfx.godRayScale = v; },
+    getCloudOpacity: () => clouds.opacityMult,
+    setCloudOpacity: (v) => { clouds.setOpacity(v); qualityPreset = 'custom'; },
   },
 });
 

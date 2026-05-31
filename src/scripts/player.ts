@@ -25,7 +25,7 @@ const COYOTE_TIME = 0.10;        // s after walking off an edge you can still ju
 const JUMP_BUFFER = 0.16;        // s a jump press is remembered (fires the instant you land)
 const SPRINT_JUMP_BOOST = 1.18;  // forward-speed multiplier kicked in on a sprint-jump
 const DOUBLE_TAP_MS = 280;       // double-tap-forward window to start sprinting
-const BASE_FOV = 70, SPRINT_FOV = 78;
+const BASE_FOV = 70, FOV_SPRINT_KICK = 8;   // sprint widens FOV by this many degrees
 // --- flight (creative + survival's "enable flight") -------------------------
 const FLY_BASE = 1.6;            // fly speed = maxSpeed × this (horizontal AND vertical)
 const FLY_SPRINT = 3.0;          // fly-sprint multiplier (double-tap-forward while flying)
@@ -54,6 +54,7 @@ export class Player {
   onIce = false;   // set by Physics: standing on ice/packed ice → slide (low friction)
 
   maxSpeed = 8;   // walking speed (GUI "Speed" slider); sprint scales from this
+  baseFov = BASE_FOV;   // user-set field of view (deg); the sprint kick lerps on top
   // velocity is camera-local: x = strafe/right, z = forward, y = vertical. The
   // collision system maps it to world space via #right/#fwd (the camera's own
   // horizontal basis), so wall contacts cancel the matching component exactly.
@@ -147,13 +148,23 @@ export class Player {
   // Subtle FOV widen while sprinting (sense of speed). Per-frame lerp; only
   // touches the projection matrix while actually changing.
   #updateFov() {
-    const target = (this.sprinting && this.controls.isLocked) ? SPRINT_FOV : BASE_FOV;
+    const target = (this.sprinting && this.controls.isLocked) ? this.baseFov + FOV_SPRINT_KICK : this.baseFov;
     const next = this.#fov + (target - this.#fov) * 0.18;
     if (Math.abs(next - this.#fov) > 0.01) {
       this.#fov = next;
       this.camera.fov = next;
       this.camera.updateProjectionMatrix();
     }
+  }
+
+  // Set the base field of view (degrees) from the settings menu. Applies live —
+  // the camera + the lerp anchor both snap to the new base so there's no glide,
+  // and #updateFov keeps it there (or kicks +FOV_SPRINT_KICK while sprinting).
+  setFov(v: number) {
+    this.baseFov = v;
+    this.#fov = v;
+    this.camera.fov = v;
+    this.camera.updateProjectionMatrix();
   }
 
   updateRayCast(world: World) {

@@ -73,6 +73,7 @@ class CloudLayer extends THREE.Mesh {
   private speed: number;
   private cloudMap: THREE.Texture;
   private height: number;
+  private baseOpacity: number;   // style opacity; the master multiplier scales this
   private shader: { uniforms: { [k: string]: THREE.IUniform } } | null = null;
 
   constructor(style: LayerStyle) {
@@ -107,6 +108,7 @@ class CloudLayer extends THREE.Mesh {
     this.cloudMap = map;
     this.speed = style.speed;
     this.height = style.height;
+    this.baseOpacity = style.opacity;
     // Face DOWN: underside seen looking up; culled looking down so clouds don't
     // obscure the top-down / orbit view.
     this.rotation.x = Math.PI / 2;
@@ -120,6 +122,10 @@ class CloudLayer extends THREE.Mesh {
     }
   }
 
+  setOpacity(mult: number) {
+    (this.material as THREE.MeshBasicMaterial).opacity = this.baseOpacity * mult;
+  }
+
   update(px: number, pz: number, elapsed: number) {
     this.position.set(px, this.height, pz);
     this.cloudMap.offset.x = elapsed * this.speed;
@@ -129,11 +135,18 @@ class CloudLayer extends THREE.Mesh {
 
 export class Clouds extends THREE.Group {
   private cloudLayers: CloudLayer[];
+  opacityMult = 1;   // master cloud-opacity multiplier (settings slider)
 
   constructor() {
     super();
     this.cloudLayers = LAYERS.map(style => new CloudLayer(style));
     this.cloudLayers.forEach(l => this.add(l));
+  }
+
+  // Master opacity multiplier (0 = invisible, 1 = each layer's designed opacity).
+  setOpacity(mult: number) {
+    this.opacityMult = mult;
+    for (const l of this.cloudLayers) l.setOpacity(mult);
   }
 
   // Keep the fade just inside the camera far plane so clouds dissolve smoothly

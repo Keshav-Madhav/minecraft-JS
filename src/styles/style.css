@@ -375,6 +375,9 @@ body {
 
 .ui-row { padding: 6px 0; }
 .ui-row--inline { display: flex; align-items: center; justify-content: space-between; }
+/* A control that depends on a parent toggle (e.g. Foliage Distance when Foliage is
+   off): dim it and block interaction until the parent is re-enabled. */
+.ui-row--disabled { opacity: 0.4; pointer-events: none; }
 .ui-row__top {
   display: flex;
   justify-content: space-between;

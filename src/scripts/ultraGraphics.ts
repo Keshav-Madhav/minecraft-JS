@@ -66,6 +66,7 @@ export class PostFX {
   private renderPass: RenderPass;
   private godrays: ShaderPass;
   bloom: UnrealBloomPass;
+  godRayScale = 1;   // user multiplier on the god-ray shaft strength (settings slider)
   private _ndc = new THREE.Vector3();
 
   constructor(renderer: THREE.WebGLRenderer, scene: THREE.Scene, camera: THREE.Camera) {
@@ -103,7 +104,7 @@ export class PostFX {
     const off = Math.max(Math.abs(this._ndc.x), Math.abs(this._ndc.y));
     const onScreen = this._ndc.z < 1 ? Math.max(0, Math.min(1, 1 - (off - 1) / 0.6)) : 0;
     this.godrays.uniforms.uSunPos.value.set(this._ndc.x * 0.5 + 0.5, this._ndc.y * 0.5 + 0.5);
-    this.godrays.uniforms.uIntensity.value = onScreen * day * 0.8;
+    this.godrays.uniforms.uIntensity.value = onScreen * day * 0.8 * this.godRayScale;
     this.godrays.uniforms.uAtmo.value = day * 0.016;            // subtle omnipresent airlight
     if (sky) this.godrays.uniforms.uSky.value.copy(sky);
   }
