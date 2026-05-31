@@ -8,9 +8,10 @@ export class ModelLoader {
   }
 
   loadModels(onLoad: (models: { [key: string]: any }) => void){
-    // BASE_URL-prefixed (not a hardcoded '/') so the model resolves under whatever
-    // path the app is deployed at — root on Vercel/Netlify, a sub-path on Pages.
-    this.loader.load(import.meta.env.BASE_URL + 'pickaxe.glb', (gltf) => {
+    // RELATIVE path (no leading '/') so the model resolves under whatever path the
+    // app is deployed at — domain root on Vercel/Netlify, a sub-path on Pages —
+    // exactly like the textures (which also load via bare-relative URLs).
+    this.loader.load('pickaxe.glb', (gltf) => {
       const mesh = gltf.scene;
       this.models.pickaxe = mesh;
 
