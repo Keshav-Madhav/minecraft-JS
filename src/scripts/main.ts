@@ -840,7 +840,16 @@ function animate() {
     clouds.update(player.position.x, player.position.z, currentTime / 1000);
     const wsx = Math.round(player.position.x / WATER_SNAP) * WATER_SNAP;
     const wsz = Math.round(player.position.z / WATER_SNAP) * WATER_SNAP;
-    waterMesh.position.set(wsx, world.params.terrain.waterOffset + 0.45, wsz);
+    const seaY = world.params.terrain.waterOffset;
+    waterMesh.position.set(wsx, seaY + 0.45, wsz);
+    // Hide the single global sea plane when the camera is UNDERGROUND under a LAND
+    // column — otherwise, now that caves carve sub-sea air, the flat plane shows as
+    // a blue ceiling inside dry caverns. Over open ocean (surface below sea) it
+    // stays visible so you still see the surface from below while diving. One
+    // columnSurface sample/frame for the camera's own column — negligible.
+    const camP = mode === 'spectator' ? spectator.camera.position : player.position;
+    const localSurf = world.sampler(Math.floor(camP.x), Math.floor(camP.z)).height;
+    waterMesh.visible = !(localSurf > seaY && camP.y < localSurf - 2);
     if (wsx !== waterSnapX || wsz !== waterSnapZ) {
       waterSnapX = wsx; waterSnapZ = wsz;
       updateWaterColors(wsx, wsz);

@@ -1,7 +1,7 @@
 import * as Three from 'three';
 import { Player } from './player';
 import { blocks } from './blocks';
-import { isPlant, isSlippery, collisionBoxes } from './blockTypes';
+import { isPlant, isLiquid, isSlippery, collisionBoxes } from './blockTypes';
 import { World } from './world';
 
 // Auto-step: a moving, grounded player is lifted onto a ledge no taller than this
@@ -220,9 +220,10 @@ export class Physics {
     for(let x = extents.x.min; x <= extents.x.max; x++){
       for(let y = extents.y.min; y <= extents.y.max; y++){
         for(let z = extents.z.min; z <= extents.z.max; z++){
-          // Plants (grass/flowers/vines/…) are decorative — walk straight through.
+          // Plants (grass/flowers/vines/…) are decorative and lava is a liquid —
+          // walk/sink straight through both rather than colliding.
           const id = world.getBlockId(x, y, z);
-          if(id !== blocks.air.id && !isPlant(id)){
+          if(id !== blocks.air.id && !isPlant(id) && !isLiquid(id)){
             candidates.push({x, y, z, id});
           }
         }

@@ -1060,7 +1060,7 @@ function deepRock(wx: number, wz: number, y: number): number {
 //  surface entrances are rare) and never into the bedrock band. Carved air at/below
 //  LAVA_Y becomes a lava sea — realised in the fill, not a separate pass.
 // ===========================================================================
-const CAVE_Y_MIN = 6;            // keep caves out of the bedrock floor band
+export const CAVE_Y_MIN = 6;     // keep caves out of the bedrock floor band (mesher reads this as the cave-band floor)
 const CAVE_SURFACE_MARGIN = 7;   // never carve at/above (surfaceHeight - this)
 const CAVE_FADE = 16;            // tubes pinch shut over this many blocks below the margin
 export const LAVA_Y = 11;        // carved air at/below this Y fills with lava (deep lava sea)
@@ -1074,7 +1074,7 @@ function caveAir(simplex: SimplexNoise, wx: number, wy: number, wz: number, surf
   const fade = depth >= CAVE_FADE ? 1 : depth / CAVE_FADE;   // 0 near the margin → 1 deep
   // Spaghetti: the 1st iso-sheet short-circuits the 2nd, so most cells pay 1 noise.
   const a = simplex.noise3d(wx / CAVE_S_XZ, wy / CAVE_S_Y, wz / CAVE_S_XZ);
-  if (a < CAVE_EPS_S && a > -CAVE_EPS_S && Math.abs(a) < CAVE_EPS_S * fade) {
+  if (Math.abs(a) < CAVE_EPS_S * fade) {
     const b = simplex.noise3d((wx + CAVE_B_OFF) / CAVE_S_XZ, wy / CAVE_S_Y, (wz + CAVE_B_OFF) / CAVE_S_XZ);
     if (Math.abs(b) < CAVE_EPS_S * fade) return true;
   }

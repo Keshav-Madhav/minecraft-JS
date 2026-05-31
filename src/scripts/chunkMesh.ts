@@ -1,5 +1,5 @@
 import { BLOCK_IDS, BLOCK_FACE_LAYERS, NON_SHADOW_CASTER_IDS, PLANTS, PLANT_LOOKUP, CUTOUT_LOOKUP, SHAPED_LOOKUP, FENCE_LOOKUP, BLOCK_SHAPES, EMITTER_LOOKUP } from './blockTypes';
-import { ChunkSize, blockIndex, blockMapColor } from './chunkGen';
+import { ChunkSize, blockIndex, blockMapColor, CAVE_Y_MIN } from './chunkGen';
 
 // Returns the climate grass tint (rgb, 0..1) for a LOCAL chunk column (mapped to
 // world by the provider). Baked into grass-tinted plant vertices at mesh build.
@@ -198,13 +198,13 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
     acc.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
   };
 
-  // Vertical band where exposed faces can exist. The world is a heightmap (solid
-  // below the surface, air above — no caves), so everything outside [bandLow,
-  // bandHigh] is either all-solid (no faces) or all-air. Meshing only this band
-  // skips the bulk of the 256-tall column — a big speedup for every mesh and
-  // every neighbour re-mesh. bandLow also drops to expose edge walls toward
-  // lower / not-yet-loaded neighbours, so the result is identical to meshing the
-  // full column (verified by area conservation).
+  // Vertical band where exposed faces can exist. Above the surface is all-air and
+  // the deep column is all-solid EXCEPT the caves carved into it, so we mesh only
+  // [bandLow, bandHigh] to skip the bulk of the 320-tall column. bandHigh tracks
+  // the surface; bandLow drops to (a) the lowest surface among neighbours (edge
+  // walls toward lower/unloaded chunks) AND (b) the deepest exposed cave air — a
+  // cave below bandLow would otherwise emit ZERO geometry (invisible terrain you
+  // fall through). See the deepest-air scan below.
   let chunkMinTop = H - 1, chunkMaxTop = 0;
   for (let x = 0; x < W; x++) {
     for (let z = 0; z < W; z++) {
@@ -224,7 +224,23 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
   for (let i = 0; i < W; i++) {
     bandLow = Math.min(bandLow, scanNeighbourTop(-1, i), scanNeighbourTop(W, i), scanNeighbourTop(i, -1), scanNeighbourTop(i, W));
   }
-  bandLow = Math.max(0, bandLow - 1);
+  // Deepest exposed CAVE air, so the band reaches the cave floors/walls. Scan the
+  // INTERIOR (cheap idAt array reads) first — that lowers `deepestAir`, which then
+  // bounds the BORDER apron scan (getOutside mirrors caves) to only the few levels
+  // below it, so a neighbour cave deeper than any of ours is still sealed without a
+  // full-column noise scan. Bottom-up, breaking at the first air = the column's
+  // lowest air. CAVE_Y_MIN is the floor (bedrock below is never carved).
+  let deepestAir = bandLow;
+  for (let x = 0; x < W; x++) for (let z = 0; z < W; z++) {
+    for (let y = CAVE_Y_MIN; y < deepestAir; y++) if (idAt(x, y, z) === BLOCK_IDS.air) { deepestAir = y; break; }
+  }
+  for (let i = 0; i < W; i++) {
+    for (let y = CAVE_Y_MIN; y < deepestAir; y++) if (getOutside(-1, y, i) === BLOCK_IDS.air) { deepestAir = y; break; }
+    for (let y = CAVE_Y_MIN; y < deepestAir; y++) if (getOutside(W, y, i) === BLOCK_IDS.air) { deepestAir = y; break; }
+    for (let y = CAVE_Y_MIN; y < deepestAir; y++) if (getOutside(i, y, -1) === BLOCK_IDS.air) { deepestAir = y; break; }
+    for (let y = CAVE_Y_MIN; y < deepestAir; y++) if (getOutside(i, y, W) === BLOCK_IDS.air) { deepestAir = y; break; }
+  }
+  bandLow = Math.max(0, Math.min(bandLow, deepestAir) - 1);
   const bandHigh = chunkMaxTop;
 
   for (let dir = 0; dir < 6; dir++) {

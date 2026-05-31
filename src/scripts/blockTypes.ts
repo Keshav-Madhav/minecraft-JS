@@ -536,6 +536,13 @@ export const CUTOUT_LOOKUP = new Uint8Array(256);
 CUTOUT_LOOKUP[BLOCK_IDS.glass] = 1;
 export const isCutout = (id: number): boolean => CUTOUT_LOOKUP[id] === 1;
 
+// Liquids the player should NOT stand on — currently just lava (water is a single
+// render plane with no per-block id). Treated like plants by the physics broadphase
+// (non-colliding) so you sink into the lava sea instead of walking on it.
+export const LIQUID_LOOKUP = new Uint8Array(256);
+LIQUID_LOOKUP[BLOCK_IDS.lava] = 1;
+export const isLiquid = (id: number): boolean => LIQUID_LOOKUP[id] === 1;
+
 // ===========================================================================
 //  LIGHT SOURCES — emitter blocks. Two effects: (1) the block renders full-bright
 //  (emissive, via the cube tintColor.a channel baked at mesh build), and (2) the
