@@ -1016,6 +1016,19 @@ function generateResources(rng: RNG, size: ChunkSize, worldX: number, worldZ: nu
 // the heightmap like a tree, so borders only get hidden overdraw, never holes).
 const ICE_SURFACE_TEMP = -0.30;   // more cold water freezes over (was -0.45, too rare)
 
+// Lower-world rock. The old code put deepslate below an ABSOLUTE Y in [7,13], so on
+// a sea=128 world it was a 7-13-block sliver at the floor under ~125 blocks of plain
+// stone. Now deepslate fills the whole deep band below a per-column wobbled boundary
+// (~half the underground) with stone above — a real lower-rock layer. Pure fn of
+// (wx,wz,y): deepslate & stone are both solid, so the apron (which only tracks
+// solidity) needs no mirror. Shared by the normal fill AND the badlands `band` so
+// mesas get deepslate at depth too (previously they were stone all the way down).
+const DEEPSLATE_TOP = 56;   // deepslate everywhere below ~this Y (±4 jagged per-column wobble)
+function deepRock(wx: number, wz: number, y: number): number {
+  const top = DEEPSLATE_TOP + (hash01(wx + 17, wz + 31) - 0.5) * 8;
+  return y < top ? BLOCK_IDS.deepslate : BLOCK_IDS.stone;
+}
+
 function generateTerrain(simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number,
   set: SetFn, outHeight: Int16Array, outBiome: Uint8Array, outTint?: Uint8Array, outSurface?: Uint8Array) {
   const cfg = makeSurfaceConfig(params, size);
@@ -1038,14 +1051,17 @@ function generateTerrain(simplex: SimplexNoise, params: ChunkParams, size: Chunk
         outTint[idx * 3 + 2] = (tb * 255 + 0.5) | 0;
       }
       const band = BIOMES[cs.biome].band;
-      // deepslate replaces stone below a per-column wobbled depth (~7-13) so the
-      // lower world reads as a distinct rock layer (boundary varies, not a flat line)
-      const deepY = 7 + Math.floor(hash01(worldX + x + 17, worldZ + z + 31) * 7);
+      const wx = worldX + x, wz = worldZ + z;
       for (let y = 0; y <= cs.height; y++) {
-        if (band) set(x, y, z, band(y, cs.height, cfg.sea));
+        if (band) {
+          // Keep the biome's banded subsurface (badlands terracotta), but route its
+          // DEEP plain-stone fill through deepRock so mesas layer into deepslate too.
+          const b = band(y, cs.height, cfg.sea);
+          set(x, y, z, b === BLOCK_IDS.stone ? deepRock(wx, wz, y) : b);
+        }
         else if (y === cs.height) set(x, y, z, cs.surfaceId);
         else if (y > cs.height - 4) set(x, y, z, cs.subId);
-        else set(x, y, z, y < deepY ? BLOCK_IDS.deepslate : BLOCK_IDS.stone);
+        else set(x, y, z, deepRock(wx, wz, y));
       }
       if (cs.height < cfg.sea && cs.temp < ICE_SURFACE_TEMP) {
         set(x, cfg.sea, z, BLOCK_IDS.ice);                                 // walkable frozen surface
