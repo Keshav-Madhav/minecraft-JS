@@ -398,7 +398,7 @@ export function createMenu(opts: MenuOptions): MenuController {
   remember(addToggle(adv, 'VSync', () => !settings.uncapFPS, (v) => { settings.uncapFPS = !v; }, applyDeps));
   remember(dep(addSegmented<string>(adv, 'Frame Rate Limit',
     [{ value: '0', label: 'Max' }, { value: '60', label: '60' }, { value: '120', label: '120' }, { value: '144', label: '144' }, { value: '240', label: '240' }],
-    () => String(settings.fpsCap), (v) => { settings.fpsCap = Number(v); }), () => settings.uncapFPS));
+    () => String(settings.fpsCap), (v) => { const n = Number(v); settings.fpsCap = Number.isFinite(n) ? n : 0; }), () => settings.uncapFPS));
   remember(addToggle(adv, 'Chunk Streaming (saves RAM)', quality.getFrustumStreaming, quality.setFrustumStreaming));
 
   // DEBUG / HUD

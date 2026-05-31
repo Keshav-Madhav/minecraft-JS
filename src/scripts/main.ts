@@ -66,6 +66,25 @@ function scheduleFrame() {
 // --- live perf stats (shown in the debug menu, not a permanent HUD) ----------
 let fps = 0, fpsFrames = 0, fpsLast = performance.now();
 
+// --- Boot safety net ---------------------------------------------------------
+// Surface a readable overlay if startup fails, instead of a silent blank canvas.
+// Fires only BEFORE the first frame renders (`booted`), so a non-fatal mid-game
+// error never throws up a scary full-screen panel. A module-evaluation throw
+// (e.g. the WebGL failure below) also fires the window 'error' event.
+let booted = false;
+let fatalShown = false;
+function showFatal(text: string) {
+  if (fatalShown) return;
+  fatalShown = true;
+  const d = document.createElement('div');
+  d.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;'
+    + 'background:#80a0e0;color:#fff;font:600 18px/1.5 sans-serif;text-align:center;padding:24px;z-index:99999';
+  d.textContent = text;
+  document.body.appendChild(d);
+}
+window.addEventListener('error', (e) => { if (!booted) showFatal('The game failed to start: ' + (e.message || 'unexpected error') + '. See the console for details.'); });
+window.addEventListener('unhandledrejection', () => { if (!booted) showFatal('The game failed to start (async error). See the console for details.'); });
+
 const LOG_DEPTH = false;
 const CAMERA_NEAR = 0.3;
 function createRenderer(): THREE.WebGLRenderer {
@@ -75,12 +94,8 @@ function createRenderer(): THREE.WebGLRenderer {
     // (multisampled render target) since post-processing bypasses this buffer.
     return new THREE.WebGLRenderer({ logarithmicDepthBuffer: LOG_DEPTH, antialias: true });
   } catch (e) {
-    const msg = document.createElement('div');
-    msg.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;'
-      + 'background:#80a0e0;color:#fff;font:600 18px/1.5 sans-serif;text-align:center;padding:24px';
-    msg.textContent = 'This game needs WebGL, which your browser/GPU did not provide.';
-    document.body.appendChild(msg);
-    throw e;
+    showFatal('This game needs WebGL, which your browser/GPU did not provide.');
+    throw e;   // terminal: nothing works without a renderer (the overlay above explains why)
   }
 }
 const renderer = createRenderer();
@@ -282,6 +297,18 @@ function updateWaterColors(cx: number, cz: number) {
 // Setup for player
 const player = new Player(scene);
 const physics = new Physics(scene);
+
+// Spawn AT the surface (deterministic via the sampler — no chunk load needed)
+// instead of free-falling from y=340: that long drop, if the spawn chunk hadn't
+// meshed yet, left the player frozen mid-air with no feedback. Over ocean, spawn at
+// the waterline (sea) rather than the seabed. Snaps both the initial spawn and the
+// R-key respawn (player.spawnPoint).
+{
+  const sx = Math.floor(player.position.x), sz = Math.floor(player.position.z);
+  const surf = Math.max(world.sampler(sx, sz).height, world.params.terrain.waterOffset);
+  player.spawnPoint.set(player.position.x, surf + 3, player.position.z);
+  player.position.copy(player.spawnPoint);
+}
 
 // Minimap + fullscreen 2D world map. The minimap now blits the world's own
 // per-chunk tiles (always in sync, no regeneration); the fullscreen map streams
@@ -704,8 +731,7 @@ function setUltraGraphics(on: boolean) {
 }
 
 setUpLights();
-applyQualityPreset(qualityPreset);   // sets draw distance + shadows + lights + resolution
-updateViewDistance();
+applyQualityPreset(qualityPreset);   // sets draw distance + shadows + lights + resolution (calls updateViewDistance itself)
 
 const menu = createMenu({
   world,
@@ -898,3 +924,4 @@ function animate() {
 }
 
 animate();
+booted = true;   // first frame rendered without throwing → stop arming the boot-fail overlay

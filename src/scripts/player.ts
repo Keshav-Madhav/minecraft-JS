@@ -55,6 +55,10 @@ export class Player {
 
   maxSpeed = 8;   // walking speed (GUI "Speed" slider); sprint scales from this
   baseFov = BASE_FOV;   // user-set field of view (deg); the sprint kick lerps on top
+  // Spawn / respawn point. main.ts snaps this to the actual surface after the world
+  // generates so the player doesn't free-fall ~200 blocks from y=340 (and can't
+  // freeze mid-air if the spawn chunk hasn't meshed yet). Used by both spawns.
+  spawnPoint = SPAWN.clone();
   // velocity is camera-local: x = strafe/right, z = forward, y = vertical. The
   // collision system maps it to world space via #right/#fwd (the camera's own
   // horizontal basis), so wall contacts cancel the matching component exactly.
@@ -104,7 +108,7 @@ export class Player {
   tool = new Tool();
 
   constructor(scene: Three.Scene) {
-    this.camera.position.copy(SPAWN);
+    this.camera.position.copy(this.spawnPoint);
     this.camera.layers.enable(1);
     scene.add(this.camera);
     scene.add(this.cameraHelper);
@@ -376,7 +380,7 @@ export class Player {
       case 'd': this.#kD = true; break;
       case 'Shift': this.sprintKey = true; this.#kDown = true; break;   // descend while flying
       case 'r':
-        this.camera.position.copy(SPAWN);
+        this.camera.position.copy(this.spawnPoint);
         this.velocity.set(0, 0, 0);
         this.onGround = false;
         this.#coyote = COYOTE_TIME + 1;

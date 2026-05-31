@@ -160,7 +160,17 @@ export class WorldMap {
     this.requested.delete(key);
     const canvas = document.createElement('canvas');
     canvas.width = canvas.height = tilePx;
-    canvas.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(buffer), tilePx, tilePx), 0, 0);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;   // context-limit / OOM — slot already freed above, tile re-requests
+    try {
+      // A truncated/wrong-length persisted tile would make ImageData throw
+      // IndexSizeError in the per-frame map update — validate + isolate it.
+      if (buffer.byteLength !== tilePx * tilePx * 4) throw new Error('bad tile length ' + buffer.byteLength);
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(buffer), tilePx, tilePx), 0, 0);
+    } catch (e) {
+      console.warn('map tile decode failed, dropping', key, e);
+      return;   // don't cache/persist a broken tile (slot already freed → re-requested)
+    }
     this.cache.set(key, canvas);
     if (this.cache.size > MAX_CACHE) {
       const oldest = this.cache.keys().next().value as string | undefined;
@@ -237,7 +247,7 @@ export class WorldMap {
 
   // ---- minimap: blit loaded chunk tiles directly (fast, in-sync) ------------
   private compositeMini(px: number, pz: number) {
-    const ctx = this.mini.getContext('2d')!;
+    const ctx = this.mini.getContext('2d'); if (!ctx) return;
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = '#0b0f17';
     ctx.fillRect(0, 0, this.mini.width, this.mini.height);
@@ -258,7 +268,7 @@ export class WorldMap {
 
   // ---- fullscreen map: composite cached tiles; queue missing ones -----------
   private composite(canvas: HTMLCanvasElement, cx: number, cz: number, wpp: number) {
-    const ctx = canvas.getContext('2d')!;
+    const ctx = canvas.getContext('2d'); if (!ctx) return;
     ctx.imageSmoothingEnabled = true;
     ctx.fillStyle = '#0b0f17';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -360,7 +370,7 @@ export class WorldMap {
   // enough that a chunk is a couple of pixels, and bounded to the loaded radius.
   private overlayLoadedChunks(px: number, pz: number) {
     if (this.wpp > 8) return;
-    const ctx = this.big.getContext('2d')!;
+    const ctx = this.big.getContext('2d'); if (!ctx) return;
     ctx.imageSmoothingEnabled = false;
     const W = this.chunkW, wpp = this.wpp, ss = W / wpp;
     const leftW = this.centerX - this.big.width / 2 * wpp;
@@ -379,7 +389,7 @@ export class WorldMap {
   }
 
   private drawPlayerOnMap(px: number, pz: number) {
-    const ctx = this.big.getContext('2d')!;
+    const ctx = this.big.getContext('2d'); if (!ctx) return;
     const sx = this.big.width / 2 + (px - this.centerX) / this.wpp;
     const sy = this.big.height / 2 + (pz - this.centerZ) / this.wpp;
     ctx.fillStyle = '#ff3b3b';

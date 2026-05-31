@@ -306,13 +306,19 @@ export class World extends Three.Group {
       applied++;
     }
     for (const { chunk, msg } of batch) {
-      if (this.hasEditsAround(chunk)) chunk.buildMeshes(this.getWorldBlock, this.getGrassTint);  // also rescans emitters + rebuilds the map tile
-      else {
-        chunk.applyGeometry(payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters), payloadToArrays(msg.plants));
-        chunk.setEmitters(new Float32Array(msg.emitters));
-        chunk.setMapTile(new Uint8Array(msg.mapTile));
+      // Isolate per-chunk apply: a single bad geometry payload skips ONE chunk
+      // (logged) instead of throwing out of the per-frame loop and freezing the game.
+      try {
+        if (this.hasEditsAround(chunk)) chunk.buildMeshes(this.getWorldBlock, this.getGrassTint);  // also rescans emitters + rebuilds the map tile
+        else {
+          chunk.applyGeometry(payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters), payloadToArrays(msg.plants));
+          chunk.setEmitters(new Float32Array(msg.emitters));
+          chunk.setMapTile(new Uint8Array(msg.mapTile));
+        }
+        this.applyFoliageVisibility(chunk);
+      } catch (e) {
+        console.error('chunk apply failed, skipping', msg.key, e);
       }
-      this.applyFoliageVisibility(chunk);
     }
 
     // 2) Request more generation (gated by in-flight = sent-but-not-applied).
@@ -507,6 +513,9 @@ export class World extends Three.Group {
   }
 
   private onWorkerMessage(msg: MeshMessage) {
+    // Shape-guard the reply: a malformed message would otherwise throw deep inside
+    // processQueues (per-frame) and escape animate() → permanent freeze.
+    if (!msg || msg.type !== 'mesh' || typeof msg.version !== 'number' || !(msg.data instanceof ArrayBuffer)) return;
     if (msg.version !== this.worldVersion) return; // stale (outstanding already reset on regenerate)
     // Defer the (costly) mesh creation to processQueues so a fast worker can't
     // flood a single frame. The in-flight slot is freed when it's applied.
@@ -672,12 +681,17 @@ export class World extends Three.Group {
   }
 
   save() {
-    localStorage.setItem('minecraft_world', JSON.stringify(this.params));
-    localStorage.setItem('minecraft_data', JSON.stringify(this.dataStore.data));
     const status = document.getElementById('status');
-    if (status) {
-      status.innerHTML = 'World saved';
-      setTimeout(() => { status.innerHTML = ''; }, 3000);
+    const flash = (msg: string) => { if (status) { status.innerHTML = msg; setTimeout(() => { status.innerHTML = ''; }, 3000); } };
+    try {
+      // Write DATA first, then params: if the data write throws (QuotaExceeded),
+      // params isn't left pointing at a half-written save that load() desyncs on.
+      localStorage.setItem('minecraft_data', JSON.stringify(this.dataStore.data));
+      localStorage.setItem('minecraft_world', JSON.stringify(this.params));
+      flash('World saved');
+    } catch (e) {
+      console.error('world save failed', e);
+      flash('SAVE FAILED (storage full?)');
     }
   }
 
@@ -697,6 +711,9 @@ export class World extends Three.Group {
       }
       const rawData = localStorage.getItem('minecraft_data');
       const data = rawData ? JSON.parse(rawData) : {};
+      // A corrupt blob like "[1,2,3]" or "42" parses fine but rebuildIndex would
+      // produce garbage edits — require a plain object.
+      if (data === null || typeof data !== 'object' || Array.isArray(data)) throw new Error('invalid data blob');
       // Commit only after both parse+validate succeed.
       this.params = params;
       this.dataStore.data = data;

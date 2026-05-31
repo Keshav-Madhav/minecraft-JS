@@ -98,7 +98,9 @@ export class WorldChunk extends THREE.Group {
     const W = this.size.width;
     const c = document.createElement('canvas');
     c.width = c.height = W;
-    c.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(this.mapTile), W, W), 0, 0);
+    const ctx = c.getContext('2d');
+    if (!ctx) return null;   // context-limit / OOM — skip this tile rather than throw in the minimap loop
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(this.mapTile), W, W), 0, 0);
     this.mapTileCanvas = c;
     return c;
   }
