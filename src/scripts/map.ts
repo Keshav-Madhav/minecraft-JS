@@ -44,6 +44,9 @@ export type WorldMapOptions = {
   getPlayer: () => { x: number, z: number, yaw: number },
   // Cached top-down canvas for a loaded chunk, or null if not loaded (minimap).
   getChunkTile: (chunkX: number, chunkZ: number) => HTMLCanvasElement | null,
+  // Monotonic counter bumped whenever a chunk's minimap tile changes (stream-in /
+  // edit). Lets the minimap skip its stationary heartbeat repaint when nothing new.
+  getMapEpoch?: () => number,
   onTeleport: (worldX: number, worldZ: number) => void,
   onOpen?: () => void,
   onClose?: () => void,
@@ -72,6 +75,7 @@ export class WorldMap {
   private miniOx = NaN;
   private miniOz = NaN;
   private miniTick = 0;
+  private lastMiniEpoch = -1;   // map-tile epoch at the last composite (M3 dirty gate)
 
   // minimap
   private miniWrap: HTMLElement;
@@ -344,13 +348,17 @@ export class WorldMap {
     const p = this.opts.getPlayer();
     this.miniMarker.style.transform = `translate(-50%, -50%) rotate(${p.yaw}rad)`;
     // Only recomposite when the result would actually differ: the integer screen
-    // origin (same maths as compositeMini) changed, or the heartbeat fired to pick
-    // up newly-streamed tiles. The marker rotation above stays per-frame so the
-    // compass turns smoothly even when the map itself doesn't need redrawing.
+    // origin (same maths as compositeMini) MOVED, or the heartbeat fired AND a tile
+    // actually changed since the last paint (epoch). So a stationary player over
+    // fully-loaded terrain costs ZERO composites (was a full ~169-tile repaint 5×/s).
+    // The marker rotation above stays per-frame so the compass still turns smoothly.
     const half = this.mini.width / 2;
     const ox = Math.round(half - p.x), oz = Math.round(half - p.z);
-    if (ox !== this.miniOx || oz !== this.miniOz || (this.miniTick++ % 12) === 0) {
-      this.miniOx = ox; this.miniOz = oz;
+    const epoch = this.opts.getMapEpoch ? this.opts.getMapEpoch() : 0;
+    const moved = ox !== this.miniOx || oz !== this.miniOz;
+    const heartbeat = (this.miniTick++ % 12) === 0 && epoch !== this.lastMiniEpoch;
+    if (moved || heartbeat) {
+      this.miniOx = ox; this.miniOz = oz; this.lastMiniEpoch = epoch;
       this.compositeMini(p.x, p.z);
     }
 

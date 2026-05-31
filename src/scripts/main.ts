@@ -322,6 +322,7 @@ const worldMap = new WorldMap({
     return { x: pos.x, z: pos.z, yaw: Math.atan2(_camDir.x, -_camDir.z) };
   },
   getChunkTile: (cx, cz) => world.getChunkMapTileCanvas(cx, cz),
+  getMapEpoch: () => world.mapTileEpoch,
   onTeleport: (x, z) => {
     const surface = world.sampler(Math.floor(x), Math.floor(z));
     player.position.set(x, surface.height + 3, z);

@@ -69,6 +69,9 @@ export class World extends Three.Group {
   foliageDistance = 8;   // chunks
 
   asyncLoading = true;
+  // Bumped whenever any chunk's minimap tile is (re)built (stream-in or edit). The
+  // minimap reads it to skip its stationary heartbeat repaint when nothing changed.
+  mapTileEpoch = 0;
   // three.js already frustum-culls every chunk mesh automatically AND per-pass
   // (main camera for colour, the sun's shadow camera for shadows), using each
   // mesh's bounding sphere. This toggle just lets you force-disable that culling
@@ -320,6 +323,7 @@ export class World extends Three.Group {
         console.error('chunk apply failed, skipping', msg.key, e);
       }
     }
+    if (batch.length) this.mapTileEpoch++;   // new tiles → let the minimap repaint once
 
     // 2) Request more generation (gated by in-flight = sent-but-not-applied).
     if (this.asyncLoading && this.workers.length > 0) {
@@ -345,6 +349,7 @@ export class World extends Three.Group {
       if (chunk.hasData && chunk.parent === this) {
         chunk.buildMeshes(this.getWorldBlock, this.getGrassTint);
         this.applyFoliageVisibility(chunk);
+        this.mapTileEpoch++;   // rebuilt tile (edit/neighbour remesh) → minimap repaint
         builds++;
       }
     }
@@ -534,9 +539,15 @@ export class World extends Three.Group {
   // Chunks within `radius` chunks of a world position — used to restrict
   // raycasting to the player's vicinity instead of the whole world (the block
   // pick ray is only 4 units long).
+  // Returns a SHARED scratch array (no per-call allocation) — this runs every frame
+  // (raycast radius 1) and every light gather (radius 3). Both callers consume the
+  // result synchronously before the other runs, so reuse is safe; do NOT retain the
+  // returned array across another getNearbyChunks call.
+  private _nearby: WorldChunk[] = [];
   getNearbyChunks(position: Three.Vector3, radius = 1): WorldChunk[] {
     const { chunk } = this.worldToChunkCoords(position.x, position.y, position.z);
-    const result: WorldChunk[] = [];
+    const result = this._nearby;
+    result.length = 0;
     for (let dx = -radius; dx <= radius; dx++) {
       for (let dz = -radius; dz <= radius; dz++) {
         const c = this.getChunk(chunk.x + dx, chunk.z + dz);
