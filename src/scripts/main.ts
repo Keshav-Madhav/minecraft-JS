@@ -10,7 +10,7 @@ import { Clouds } from './clouds';
 import { WorldMap } from './map';
 import { Spectator } from './spectator';
 import { biomeTint, biomeWaterHex } from './chunkGen';
-import { updatePlantWind, toggleReferenceTextures, updateCubeUniforms, setFoliageShadows } from './blockArrayMaterial';
+import { updatePlantWind, toggleReferenceTextures, updateCubeUniforms, setFoliageShadows, registerFogShader, updateFogCamera, CYL_FOG_FRAGMENT } from './blockArrayMaterial';
 import { LightManager } from './lightManager';
 import { PostFX } from './ultraGraphics';
 
@@ -206,11 +206,13 @@ waterMaterial.onBeforeCompile = (shader) => {
   shader.uniforms.uReflect = { value: 0 };
   shader.uniforms.uSkyRefl = { value: new THREE.Color(0xbcd6ff) };
   shader.uniforms.uWaterTime = { value: 0 };
+  registerFogShader(shader);   // cylindrical fog (uses vWaterPos)
   shader.vertexShader = shader.vertexShader
     .replace('#include <common>', '#include <common>\nvarying vec3 vWaterPos;')
     .replace('#include <begin_vertex>', '#include <begin_vertex>\nvWaterPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
   shader.fragmentShader = shader.fragmentShader
-    .replace('#include <common>', '#include <common>\nuniform float uReflect;\nuniform vec3 uSkyRefl;\nuniform float uWaterTime;\nvarying vec3 vWaterPos;')
+    .replace('#include <common>', '#include <common>\nuniform float uReflect;\nuniform vec3 uSkyRefl;\nuniform float uWaterTime;\nuniform vec2 uCamXZ;\nvarying vec3 vWaterPos;')
+    .replace('#include <fog_fragment>', CYL_FOG_FRAGMENT('vWaterPos'))
     // Animate the surface normal with crossing ripples → the Phong sun glint and
     // the fresnel sky-reflection shimmer like real moving water (ultra only).
     .replace('#include <normal_fragment_begin>', '#include <normal_fragment_begin>\n  if (uReflect > 0.5) {\n    float wt = uWaterTime; vec2 wp = vWaterPos.xz;\n    float nx = 0.14 * (sin(wp.x * 0.55 + wt * 1.1) + 0.6 * sin(wp.x * 1.7 - wt * 1.7 + wp.y * 0.4));\n    float nz = 0.14 * (cos(wp.y * 0.5 + wt * 0.9) + 0.6 * sin(wp.y * 1.6 + wt * 1.3 + wp.x * 0.4));\n    normal = normalize(normal + vec3(nx, 0.0, nz));\n  }')
@@ -639,34 +641,37 @@ document.addEventListener('mousedown', onMouseDown);
 let qualityPreset: QualityPreset = 'fast';   // default to lowest graphics
 function applyQualityPreset(p: QualityPreset) {
   qualityPreset = p;
+  // NOTE: presets NO LONGER touch ultra graphics — it's an independent ADD-ON
+  // toggle (off by default) that layers onto ANY preset (see setUltraGraphics).
   if (p === 'fast') {
     // Lowest: short view, tight foliage, NO shadow pass, NO dynamic point lights,
     // NO cloud overdraw, downscaled render — the cheapest the engine goes.
     world.drawDistance = 6; world.setFoliage(true, 3);
     applyShadowQuality('off'); lightInterval = 4; lightManager.setEnabled(false);
-    settings.resolutionScale = 0.7; clouds.visible = false; setUltraGraphics(false);
+    settings.resolutionScale = 0.7; clouds.visible = false;
   } else if (p === 'balanced') {
     world.drawDistance = 12; world.setFoliage(true, 7);
     applyShadowQuality('medium'); lightInterval = 2; lightManager.setEnabled(true);
-    settings.resolutionScale = 1; clouds.visible = true; setUltraGraphics(false);
+    settings.resolutionScale = 1; clouds.visible = true;
   } else if (p === 'fancy') {
     world.drawDistance = 16; world.setFoliage(true, 14);
     applyShadowQuality('high'); lightInterval = 1; lightManager.setEnabled(true);
-    settings.resolutionScale = 1; clouds.visible = true; setUltraGraphics(false);
+    settings.resolutionScale = 1; clouds.visible = true;
   } else if (p === 'ultra') {
-    // Max it out: 32-chunk view, foliage everywhere, 8192 soft shadows incl.
-    // foliage/leaf cutout shadows, full post-FX (bloom + god rays), caustics +
-    // water reflections. "Explore your PC."
-    world.drawDistance = 32; world.setFoliage(true, 32);
+    // Max it out: 64-chunk view, foliage far out, 8192 soft shadows. VERY heavy on
+    // RAM (~16k resident chunks) — for strong machines; dial the Render Distance
+    // slider back if it stutters/OOMs. (Ultra Graphics post-FX is a separate toggle.)
+    world.drawDistance = 64; world.setFoliage(true, 48);
     applyShadowQuality('ultra'); lightInterval = 1; lightManager.setEnabled(true);
-    settings.resolutionScale = 1; clouds.visible = true; setUltraGraphics(true);
+    settings.resolutionScale = 1; clouds.visible = true;
   }
   applyResolution();
   updateViewDistance();
 }
 
 // Ultra graphics: post-processing (bloom + god rays), foliage/leaf cutout shadows,
-// underwater caustics, and a glossy fresnel water reflection. Heavy — opt-in.
+// underwater caustics, and a glossy fresnel water reflection. Heavy — opt-in, and
+// INDEPENDENT of the quality preset (layers onto any of them; OFF by default).
 let ultraGraphics = false;
 let postfx: PostFX | null = null;
 function setUltraGraphics(on: boolean) {
@@ -735,7 +740,9 @@ const menu = createMenu({
     getStatsOverlay: () => settings.statsOverlay,
     setStatsOverlay: (v) => { settings.statsOverlay = v; updateHudVisibility(); },
     getUltraGraphics: () => ultraGraphics,
-    setUltraGraphics: (v) => { setUltraGraphics(v); qualityPreset = 'custom'; },
+    // Ultra Graphics is an independent ADD-ON — toggling it does NOT change the
+    // quality preset (it layers onto whichever preset is active).
+    setUltraGraphics: (v) => { setUltraGraphics(v); },
   },
 });
 
@@ -800,8 +807,9 @@ function animate() {
     }
 
     const activeCamera = mode === 'spectator' ? spectator.camera : player.camera;
+    updateFogCamera(activeCamera.position.x, activeCamera.position.z);   // cylindrical fog centre
     if (ultraGraphics && postfx) {
-      postfx.update(activeCamera, sunSprite.position, currentDaylight);   // active camera + god-ray source
+      postfx.update(activeCamera, sunSprite.position, currentDaylight, _sky);   // camera + god-ray source + airlight tint
       postfx.render();
     } else {
       renderer.render(scene, activeCamera);

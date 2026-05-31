@@ -23,10 +23,12 @@ type LayerStyle = {
 // Three layers: low cumulus, mid clumps, high thin cirrus. Opacity/coverage kept
 // in check so three stacked layers read as full, fluffy clouds without washing
 // the sky out solid white.
+// Heights pushed UP above the new tall mountain peaks (~280) so the lowest cloud
+// deck floats over the ranges rather than slicing through them.
 const LAYERS: LayerStyle[] = [
-  { height: 236, planeSize: 4000, repeat: 7,  opacity: 0.62, speed: 0.004,  color: 0xffffff, puffs: 16, minR: 16, maxR: 34 },
-  { height: 292, planeSize: 4500, repeat: 4,  opacity: 0.46, speed: 0.0026, color: 0xeef2ff, puffs: 10, minR: 26, maxR: 56 },
-  { height: 352, planeSize: 5000, repeat: 11, opacity: 0.26, speed: 0.0065, color: 0xffffff, puffs: 26, minR: 7,  maxR: 16 },
+  { height: 300, planeSize: 4000, repeat: 7,  opacity: 0.62, speed: 0.004,  color: 0xffffff, puffs: 16, minR: 16, maxR: 34 },
+  { height: 348, planeSize: 4500, repeat: 4,  opacity: 0.46, speed: 0.0026, color: 0xeef2ff, puffs: 10, minR: 26, maxR: 56 },
+  { height: 392, planeSize: 5000, repeat: 11, opacity: 0.26, speed: 0.0065, color: 0xffffff, puffs: 26, minR: 7,  maxR: 16 },
 ];
 
 // Cloud puff texture (white blobs on transparent, mostly empty), tiled.
@@ -81,7 +83,11 @@ class CloudLayer extends THREE.Mesh {
       transparent: true,
       opacity: style.opacity,
       depthWrite: false,
-      fog: true,
+      // fog OFF: clouds do their OWN horizontal-distance alpha fade below. Leaving
+      // three's planar fog on tinted them by view-space DEPTH, which is inconsistent
+      // with the cylindrical XZ fog the terrain/water now use (see blockArrayMaterial
+      // CYL_FOG_FRAGMENT) — they'd fog on a different metric than everything else.
+      fog: false,
     });
     // Distance-from-camera alpha fade (horizontal distance, since clouds sit
     // overhead). uFadeEnd is kept just inside the camera far plane.

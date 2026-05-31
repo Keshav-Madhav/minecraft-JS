@@ -232,6 +232,7 @@ export const BIOME = {
   meadow: 28,        // cool grassland: flowers + tall grass, very sparse trees
   redwoodForest: 29, // cold+wet old-growth: GIANT spruce (redwood) + spruce, podzol floor
   mangroveSwamp: 30, // warm swamp: mangrove trees with prop roots
+  mountains: 31,     // snow-capped rocky mountain RANGE (very-low-erosion high non-hot terrain)
 } as const;
 
 type SurfCtx = { aboveSea: number, tempEff: number, humid: number, erosion: number, wx: number, wz: number };
@@ -405,6 +406,14 @@ BIOMES[BIOME.warmOcean] = {
 BIOMES[BIOME.iceSpikes] = {
   name: 'iceSpikes', surface: snowSurf, features: { iceSpike: 0.6 },
   mapColor: [200, 220, 240], tint: { sky: 0xd6e8ff, ground: 0xa6bad6, clear: 0xcfe4fb, bright: 1.24 },
+};
+BIOMES[BIOME.mountains] = {
+  // Snow-capped rocky RANGE: bare-stone flanks (the elevation overlay snow-caps the
+  // upper reaches via the lapse line), sparse alpine spruce + the odd packed-ice
+  // formation ("frozen cascade"), and a mossy boulder here and there.
+  name: 'mountains', surface: () => ({ surfaceId: BLOCK_IDS.stone, subId: BLOCK_IDS.stone }),
+  features: { spruce: 0.05, boulder: 0.03, iceSpike: 0.02 },
+  mapColor: [156, 158, 164], tint: { sky: 0xcdd9ec, ground: 0x74787e, clear: 0xa6bcd8, bright: 1.08 },
 };
 // --- expansion biomes (distinct wood + vegetation; selected by the grid/gates) ---
 BIOMES[BIOME.jungle] = {
@@ -848,6 +857,12 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   const iceSpikesMem = sm(tempEff, -0.30, -0.52)
     * sm(fbm(simplex, wx + 44000, wz + 44000, fs * 4, 2), 0.40, 0.58);
 
+  // MOUNTAIN-RANGE biome: genuinely mountain-forming (very low erosion) high terrain
+  // that ISN'T hot → a snow-capped rocky range. All-continuous gates (erosion /
+  // altitude / temp) → smooth borders. Hot regions keep their desert/savanna identity
+  // (bare-rock tops, no snow) so the range only appears where snow makes sense.
+  const mountainsMem = sm(c.erosion, -0.28, -0.60) * sm(aboveSea, 34, 64) * (1 - sm(c.temp, 0.12, 0.34));
+
   // --- biome selection: specials (by gate, priority order) → water bands → grid ---
   // The badlands shells (core → red-desert → desert) are checked before the grid
   // so the nest is guaranteed concentric. The climate grid uses RAW temp (MC
@@ -868,12 +883,19 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   else if (lakeMem > 0.5 && aboveSea <= 0) biome = BIOME.lake;
   else if (height < sea) biome = OCEAN_BY_LEVEL[tempLevel(c.temp)]; // temperature-typed ocean
   else if (aboveSea <= 3) biome = BIOME.beach;
+  else if (mountainsMem > 0.5) biome = BIOME.mountains;            // snow-capped rocky range
   else {
     // Dither temp/humid (grid bucketing only — the gates above keep raw smooth
     // values) so biome borders stipple/interleave instead of being a clean line.
     const dT = (hash01(wx, wz) - 0.5) * BORDER_DITHER * flatness;
     const dH = (hash01(wx + 99991, wz + 57331) - 0.5) * BORDER_DITHER * flatness;
-    biome = selectClimate(c.temp + dT, c.humid + dH, c.weird);
+    // RIVERS AS BIOME SEPARATORS: near a river, nudge the climate sample by which
+    // BANK you're on (sign of the river field) so biome borders tend to fall ALONG
+    // the river — a river separates two biomes, MC-style. Pure fn of (wx,wz) → apron-
+    // safe. Subtle (0.16 < a temp-level width) so it only flips columns already near a
+    // boundary. `riverW` is the same field the river carve uses (computed above).
+    const bankBias = Math.sign(riverW) * (1 - sm(Math.abs(riverW), 0.02, 0.10)) * 0.16 * flatness;
+    biome = selectClimate(c.temp + dT + bankBias, c.humid + dH, c.weird);
   }
 
   const ctx: SurfCtx = { aboveSea, tempEff, humid: c.humid, erosion: c.erosion, wx, wz };
@@ -891,8 +913,13 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   const coloured = biome === BIOME.badlands || biome === BIOME.redDesert
     || biome === BIOME.mushroom || biome === BIOME.swamp || biome === BIOME.mangroveSwamp;
   if (!coloured && biome !== BIOME.ocean && biome !== BIOME.beach) {
-    if (aboveSea > 48) { surfaceId = BLOCK_IDS.stone; subId = BLOCK_IDS.stone; }   // exposed rock
-    if (aboveSea > 66 || tempEff < -0.46) surfaceId = BLOCK_IDS.snow;             // alpine / frozen cap
+    // CLIMATE-AWARE: HOT climates (deserts/savanna/warm) NEVER snow — even on tall
+    // peaks they get bare exposed rock instead ("no snow in deserts"). Cold/temperate
+    // peaks snow (alpine height OR a lapse-cooled freezing summit). The snowy
+    // mountain-range biome ALWAYS snow-caps above the line (it's defined as snowy).
+    const arid = c.temp > 0.20 || c.humid < -0.15;   // hot OR dry → bare rock, no snow
+    if (aboveSea > 48) { surfaceId = BLOCK_IDS.stone; subId = BLOCK_IDS.stone; }   // exposed rock (any climate)
+    if ((biome === BIOME.mountains || !arid) && (aboveSea > 66 || tempEff < -0.46)) surfaceId = BLOCK_IDS.snow;
   }
 
   // Taiga floor: smooth podzol patches (low-freq noise — coherent blobs, not the
@@ -1352,10 +1379,20 @@ function generateFeatures(treeRng: RNG, simplex: SimplexNoise, params: ChunkPara
       // skip cells whose tree can't possibly reach this chunk
       if (x <= -MARGIN || x >= W + MARGIN || z <= -MARGIN || z >= W + MARGIN) continue;
 
-      const biome = colF(wx, wz).biome;
+      const cs = colF(wx, wz);
+      const biome = cs.biome;
       const f = BIOMES[biome].features;
       if (!f) continue;
-      const cold = biome === BIOME.taiga || biome === BIOME.snowy;   // snow-cap conifers (task: snowy taiga)
+      // RIVERS AS SEPARATORS: skip trees/decorations hugging a lowland river channel
+      // so forests don't bleed across the water (deterministic — same river field the
+      // carve uses). Only near sea level (where rivers actually run), so mountain
+      // ranges that the river field happens to cross aren't thinned.
+      if (cs.height - cfg.sea < 14) {
+        const riverW = fbm(simplex, wx + 91000, wz + 91000, cfg.featureScale * 6, 2);
+        if (1 - sm(Math.abs(riverW), 0.02, 0.055) > 0.4) continue;
+      }
+      // snow-cap conifers in cold biomes (taiga / snowy / the new snowy mountains)
+      const cold = biome === BIOME.taiga || biome === BIOME.snowy || biome === BIOME.mountains;
       // CUMULATIVE single-pick dispatch: each feature's probability is a slice of
       // [0,1); we walk the list subtracting slices so a biome with two features
       // (e.g. redwoodForest redwood0.3 + spruce0.42) gets BOTH at their declared
@@ -1603,7 +1640,7 @@ const structGrassy = (b: number) => b === BIOME.plains || b === BIOME.forest || 
   || b === BIOME.coldPlains || b === BIOME.warmForest || b === BIOME.taiga || b === BIOME.cherry || b === BIOME.scrub
   || b === BIOME.meadow || b === BIOME.birchForest || b === BIOME.flowerForest;
 const structCold = (b: number) => b === BIOME.snowy || b === BIOME.iceSpikes || b === BIOME.coldPlains
-  || b === BIOME.taiga || b === BIOME.redwoodForest;
+  || b === BIOME.taiga || b === BIOME.redwoodForest || b === BIOME.mountains;
 const structDryLand = (b: number) => b === BIOME.plains || b === BIOME.savanna || b === BIOME.scrub
   || b === BIOME.coldPlains || b === BIOME.desert || b === BIOME.redDesert;
 const structAnyLand = (b: number) => b !== BIOME.ocean && b !== BIOME.frozenOcean && b !== BIOME.coldOcean

@@ -1,11 +1,13 @@
 :root {
-  --accent: #5b8cff;
-  --accent-2: #4f7cf0;
-  --panel: rgba(18, 22, 30, 0.86);
-  --panel-soft: rgba(255, 255, 255, 0.06);
-  --text: #e6ebf2;
-  --text-dim: #b9c3d0;
-  --line: rgba(255, 255, 255, 0.1);
+  /* Minecraft palette: grass green accent, dark stone panel, off-white text, dark
+     (carved-stone) dividers. The menu's blocky skin overrides live at the bottom. */
+  --accent: #6fcf5f;
+  --accent-2: #4a9e3e;
+  --panel: rgba(26, 26, 26, 0.96);
+  --panel-soft: rgba(255, 255, 255, 0.05);
+  --text: #e9e9e9;
+  --text-dim: #b0b0b0;
+  --line: rgba(0, 0, 0, 0.5);
 }
 
 body {
@@ -486,3 +488,66 @@ body {
 .ui-btn--primary:hover { filter: brightness(1.1); background: linear-gradient(180deg, var(--accent), var(--accent-2)); }
 .ui-applybar { margin: 4px 0 8px; }
 .ui-apply--busy { filter: grayscale(0.4) brightness(0.85); pointer-events: none; }
+
+/* ===========================================================================
+   MINECRAFT SKIN — overrides the smooth/rounded/blue defaults above with a
+   blocky stone look: sharp corners, beveled gray buttons (light top/left + dark
+   bottom/right), a dark solid overlay (no blur), a monospace font, black text
+   shadows, and grass-green accents. Source-order overrides win at equal specificity.
+   =========================================================================== */
+.menu { font-family: 'Courier New', ui-monospace, monospace; letter-spacing: 0.5px; }
+.menu *, .menu *::before, .menu *::after { border-radius: 0 !important; }   /* sharp everywhere */
+.menu__backdrop { background: rgba(0, 0, 0, 0.82); backdrop-filter: none; -webkit-backdrop-filter: none; }
+.menu__panel {
+  background: #3a3a3a;
+  border: 4px solid; border-color: #6a6a6a #1a1a1a #1a1a1a #6a6a6a;     /* beveled stone frame */
+  box-shadow: 0 0 0 2px #000, 0 16px 40px rgba(0, 0, 0, 0.7);
+  animation: none;
+}
+.menu__header { background: #2e2e2e; border-bottom: 3px solid #1a1a1a; }
+.menu__title { color: #fff; text-shadow: 2px 2px 0 #000; }
+/* primary (green) action buttons */
+.menu__resume, .ui-btn--primary {
+  background: #6d8a4f; color: #fff; text-shadow: 1px 1px 0 #000; box-shadow: none;
+  border: 3px solid; border-color: #9bbf78 #2c3a1f #2c3a1f #9bbf78;
+}
+.menu__resume:hover, .ui-btn--primary:hover { background: #7fa05e; filter: none; }
+.menu__resume:active { border-color: #2c3a1f #9bbf78 #9bbf78 #2c3a1f; transform: none; }
+/* neutral stone buttons */
+.ui-btn { background: #7a7a7a; color: #fff; text-shadow: 1px 1px 0 #000; border: 3px solid; border-color: #a5a5a5 #2a2a2a #2a2a2a #a5a5a5; }
+.ui-btn:hover { background: #8a8a8a; }
+.ui-btn:active { border-color: #2a2a2a #a5a5a5 #a5a5a5 #2a2a2a; transform: none; }
+/* tabs */
+.menu__tabs { border-bottom: 3px solid #1a1a1a; gap: 2px; }
+.menu__tab { background: #5a5a5a; color: #d0d0d0; text-shadow: 1px 1px 0 #000; border: 2px solid; border-color: #7d7d7d #2a2a2a #2a2a2a #7d7d7d; border-bottom: none; }
+.menu__tab:hover { background: #6a6a6a; color: #fff; }
+.menu__tab--on { background: #3a3a3a; color: #7bdc6a; }
+/* mode cards */
+.menu__mode { background: #4a4a4a; color: var(--text); text-shadow: 1px 1px 0 #000; border: 3px solid; border-color: #6a6a6a #2a2a2a #2a2a2a #6a6a6a; }
+.menu__mode:hover { background: #565656; }
+.menu__mode--on { background: #3d5230; border-color: #7bdc6a #2c3a1f #2c3a1f #7bdc6a; box-shadow: none; }
+.menu__mode-name { color: #fff; }
+.menu__stat-v { color: #7bdc6a; }
+/* sections + labels */
+.ui-section { border-bottom: 2px solid #1a1a1a; }
+.ui-section__header { color: #7bdc6a; text-shadow: 1px 1px 0 #000; }
+.ui-section__header:hover { color: #9bf08a; }
+.ui-section .ui-section { border-left: 3px solid #1a1a1a; }
+.ui-subhead { color: #7bdc6a; }
+.ui-label, .ui-row__top { color: #d0d0d0; text-shadow: 1px 1px 0 #000; }
+.ui-val { background: #1e1e1e; color: #fff; border: 2px solid; border-color: #0a0a0a #3a3a3a #3a3a3a #0a0a0a; }
+/* chunky slider: blocky inset track + square stone thumb */
+.ui-range { height: 10px; background: #1e1e1e; border: 2px solid; border-color: #0a0a0a #4a4a4a #4a4a4a #0a0a0a; }
+.ui-range::-webkit-slider-thumb { width: 14px; height: 18px; background: #8a8a8a; border: 2px solid; border-color: #b5b5b5 #2a2a2a #2a2a2a #b5b5b5; }
+.ui-range::-moz-range-thumb { width: 12px; height: 16px; background: #8a8a8a; border: 2px solid; border-color: #b5b5b5 #2a2a2a #2a2a2a #b5b5b5; }
+/* toggle: square stone knob (off) → green (on) */
+.ui-switch { width: 44px; height: 22px; }
+.ui-switch__knob { background: #1e1e1e; border: 2px solid; border-color: #0a0a0a #4a4a4a #4a4a4a #0a0a0a; }
+.ui-switch__knob::before { width: 14px; height: 14px; left: 2px; top: 2px; background: #9a9a9a; border: 2px solid; border-color: #c0c0c0 #2a2a2a #2a2a2a #c0c0c0; }
+.ui-switch input:checked + .ui-switch__knob { background: #3d5230; }
+.ui-switch input:checked + .ui-switch__knob::before { transform: translateX(20px); background: #7bdc6a; }
+/* segmented control (presets / shadows) */
+.ui-seg { background: #2a2a2a; border: 2px solid; border-color: #0a0a0a #4a4a4a #4a4a4a #0a0a0a; gap: 2px; }
+.ui-seg__btn { background: #5a5a5a; color: #d0d0d0; text-shadow: 1px 1px 0 #000; border: 2px solid; border-color: #7d7d7d #2a2a2a #2a2a2a #7d7d7d; }
+.ui-seg__btn:hover { background: #6a6a6a; color: #fff; }
+.ui-seg__btn--on { background: #6d8a4f; color: #fff; border-color: #9bbf78 #2c3a1f #2c3a1f #9bbf78; }

@@ -5,9 +5,9 @@ import { blocks } from './blocks';
 import { Tool } from './tool';
 
 const screeCenter=new Three.Vector2();
-// Spawn above the tallest terrain (sea level 128, peaks ~180) so the player
-// drops onto the surface instead of inside solid rock.
-const SPAWN = new Three.Vector3(0, 200, 0);
+// Spawn above the tallest terrain (sea level 128, mountain peaks now reach ~280) so
+// the player drops onto the surface instead of inside a mountain.
+const SPAWN = new Three.Vector3(0, 340, 0);
 // Scratch objects reused every frame to avoid per-frame allocations.
 const _hitInside = new Three.Vector3();
 const _hitOutside = new Three.Vector3();

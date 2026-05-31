@@ -26,7 +26,7 @@ const TOPS_CACHE_MAX = 6144;   // LRU cap on cached per-chunk column-tops (~1.5K
                                // ballooning memory now that several map workers run in parallel.
 
 let params: ChunkParams | null = null;
-let size: ChunkSize = { width: 16, height: 256 };
+let size: ChunkSize = { width: 16, height: 320 };   // must match World.chunkSize.height
 let sampler: WorldSampler | null = null;
 let sea = 64;
 

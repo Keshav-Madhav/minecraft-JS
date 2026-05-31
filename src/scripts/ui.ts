@@ -300,13 +300,13 @@ export function createMenu(opts: MenuOptions): MenuController {
 
   const adv = addSection(q, 'Advanced', true);
   remember(addSlider(adv, 'Render Distance', {
-    min: 2, max: 32, step: 1,
+    min: 2, max: 64, step: 1,   // up to 64 chunks (VERY heavy on RAM — for strong machines)
     get: quality.getRenderDistance, set: quality.setRenderDistance,
     onChange: opts.onViewDistanceChange,
   }));
   remember(addToggle(adv, 'Foliage', quality.getFoliage, quality.setFoliage));
   remember(addSlider(adv, 'Foliage Distance', {
-    min: 1, max: 32, step: 1,
+    min: 1, max: 64, step: 1,
     get: quality.getFoliageDistance, set: quality.setFoliageDistance,
   }));
   remember(addSegmented<ShadowQuality>(adv, 'Shadows',
@@ -365,7 +365,7 @@ export function createMenu(opts: MenuOptions): MenuController {
     remember(addSlider(terrain, label, { min, max, step, get, set, decimals }));
   gen('Seed', 0, 10000, 1, () => world.params.seed, (v) => { world.params.seed = v; });
   gen('Feature Scale', 50, 600, 5, () => world.params.terrain.scale, (v) => { world.params.terrain.scale = v; });
-  gen('Mountain Height', 0, 120, 1, () => world.params.terrain.magnitude, (v) => { world.params.terrain.magnitude = v; });
+  gen('Mountain Height', 0, 220, 1, () => world.params.terrain.magnitude, (v) => { world.params.terrain.magnitude = v; });
   gen('Land Bias', 0, 70, 1, () => world.params.terrain.offset, (v) => { world.params.terrain.offset = v; });
   gen('Water Level', 0, 256, 1, () => world.params.terrain.waterOffset, (v) => { world.params.terrain.waterOffset = v; });
 

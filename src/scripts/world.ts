@@ -28,15 +28,18 @@ function payloadToArrays(p: GeometryPayload): GeometryArrays | null {
 }
 
 export class World extends Three.Group {
-  // 256-tall world with sea level at 128 (128 below water, 128 above).
-  chunkSize = { width: 16, height: 256 };
+  // 320-tall world with sea level at 128 — the extra headroom (vs the old 256) lets
+  // mountain RANGES rise to ~280 (≈150 above sea) for genuinely tall, snow-capped
+  // peaks without clipping flat against the ceiling. (Taller chunks cost ~25% more
+  // gen/mesh/RAM, paid only at high render distances — fine at normal presets.)
+  chunkSize = { width: 16, height: 320 };
   params: ChunkParams = {
     // scale = feature breadth (continents ~3.5x this); magnitude = mountain
     // height; offset = land-height bias above sea (higher => more/larger land).
     // Large scale keeps the world traversible (broad, gentle terrain) instead
-    // of a pretty-but-miniature diorama.
+    // of a pretty-but-miniature diorama. magnitude raised 85→150 for tall ranges.
     seed: 0,
-    terrain: { scale: 260, magnitude: 85, offset: 10, waterOffset: 128 },
+    terrain: { scale: 260, magnitude: 150, offset: 10, waterOffset: 128 },
     trees: {
       trunk: { minHeight: 4, maxHeight: 7 },
       canopy: { minRadius: 2, maxRadius: 3, density: 0.7 },

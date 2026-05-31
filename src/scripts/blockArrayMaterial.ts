@@ -276,12 +276,35 @@ export function updateCubeUniforms(timeSeconds: number, sea: number, caustics: b
   }
 }
 
+// CYLINDRICAL FOG: fog distance = HORIZONTAL world distance from the camera (XZ),
+// not THREE's planar view-space depth. So terrain far BELOW the camera (looking
+// down) stays clear — fog only veils the chunk-streaming edge on the horizon.
+// Replaces three's <fog_fragment>; reuses three's fogColor/fogNear/fogFar uniforms.
+// `worldVar` is the fragment's world-position varying (vWorldPos for cube/plant,
+// vWaterPos for water). All fogged materials share uCamXZ, updated each frame.
+export const CYL_FOG_FRAGMENT = (worldVar: string) => /* glsl */`
+  #ifdef USE_FOG
+    float vFogCyl = length(${worldVar}.xz - uCamXZ);
+    float fogFactor = smoothstep( fogNear, fogFar, vFogCyl );
+    gl_FragColor.rgb = mix( gl_FragColor.rgb, fogColor, fogFactor );
+  #endif
+`;
+const _fogShaders: THREE.WebGLProgramParametersWithUniforms[] = [];   // every material with cylindrical fog
+export function registerFogShader(s: THREE.WebGLProgramParametersWithUniforms) {
+  s.uniforms.uCamXZ = { value: new THREE.Vector2() };
+  _fogShaders.push(s);
+}
+export function updateFogCamera(x: number, z: number) {
+  for (const s of _fogShaders) if (s.uniforms.uCamXZ) s.uniforms.uCamXZ.value.set(x, z);
+}
+
 function injectCubeShader(shader: THREE.WebGLProgramParametersWithUniforms) {
   shader.uniforms.uArray = { value: arrayTexture };
   shader.uniforms.uTime = { value: 0 };
   shader.uniforms.uSea = { value: 128 };
   shader.uniforms.uCaustics = { value: 0 };
   cubeShaders.push(shader);
+  registerFogShader(shader);   // cylindrical fog (uses vWorldPos, declared below)
   shader.vertexShader = shader.vertexShader
     .replace('#include <common>', /* glsl */`
       #include <common>
@@ -309,12 +332,14 @@ function injectCubeShader(shader: THREE.WebGLProgramParametersWithUniforms) {
       uniform float uTime;
       uniform float uSea;
       uniform float uCaustics;
+      uniform vec2 uCamXZ;
       varying vec2 vTileUv;
       varying float vLayer;
       varying vec3 vTintCol;
       varying float vEmis;
       varying vec3 vWorldPos;
     `)
+    .replace('#include <fog_fragment>', CYL_FOG_FRAGMENT('vWorldPos'))
     .replace('#include <map_fragment>', /* glsl */`
       // Flip V: DataArrayTexture stores image rows top-to-bottom, but world V
       // increases upward, so without this side textures appear upside down.
@@ -380,6 +405,7 @@ plantMaterial.onBeforeCompile = (shader) => {
   shader.uniforms.uArray = { value: arrayTexture };
   shader.uniforms.uTime = { value: 0 };
   plantShader = shader;
+  registerFogShader(shader);   // cylindrical fog (uses vWorldPos varying added below)
 
   shader.vertexShader = shader.vertexShader
     .replace('#include <common>', /* glsl */`
@@ -391,6 +417,7 @@ plantMaterial.onBeforeCompile = (shader) => {
       varying vec2 vTileUv;
       varying float vLayer;
       varying vec3 vTint;
+      varying vec3 vWorldPos;
     `)
     .replace('#include <begin_vertex>', /* glsl */`
       #include <begin_vertex>
@@ -402,6 +429,7 @@ plantMaterial.onBeforeCompile = (shader) => {
       // weight (0 at the rooted base, 1 at the tip).
       float sway = plantColor.a;
       vec3 wpos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+      vWorldPos = wpos;           // for cylindrical fog
       float ph = wpos.x * 0.6 + wpos.z * 0.45;
       transformed.x += (sin(uTime * 1.6 + ph) + 0.3 * sin(uTime * 3.1 + ph * 1.7)) * 0.07 * sway;
       transformed.z += cos(uTime * 1.3 + ph * 1.1) * 0.06 * sway;
@@ -411,10 +439,13 @@ plantMaterial.onBeforeCompile = (shader) => {
     .replace('#include <common>', /* glsl */`
       #include <common>
       uniform sampler2DArray uArray;
+      uniform vec2 uCamXZ;
       varying vec2 vTileUv;
       varying float vLayer;
       varying vec3 vTint;
+      varying vec3 vWorldPos;
     `)
+    .replace('#include <fog_fragment>', CYL_FOG_FRAGMENT('vWorldPos'))
     // Force the shading normal UP on BOTH faces. These are DoubleSide billboards;
     // three's normal_fragment_begin flips the normal to point DOWN on back faces
     // (normal *= faceDirection), which lit them from below → pitch black. An up
