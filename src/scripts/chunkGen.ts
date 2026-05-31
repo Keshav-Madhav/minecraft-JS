@@ -55,12 +55,14 @@ export function generateChunkData(
   const rng = new RNG(params.seed);
   const simplex = new SimplexNoise(rng);
 
-  // Per-column surface height + biome, filled by generateTerrain and reused by
-  // generateFoliage (so the foliage pass doesn't re-run columnSurface). 16×16.
+  // Per-column surface height + biome + top-block, filled by generateTerrain and
+  // reused by generateFeatures + generateFoliage (so neither re-runs columnSurface
+  // for in-chunk columns — the heavy noise cost). 16×16.
   const heightMap = new Int16Array(size.width * size.width);
   const biomeMap = new Uint8Array(size.width * size.width);
+  const surfaceMap = new Uint8Array(size.width * size.width);
 
-  generateTerrain(simplex, params, size, worldX, worldZ, set, heightMap, biomeMap, outTint);
+  generateTerrain(simplex, params, size, worldX, worldZ, set, heightMap, biomeMap, outTint, surfaceMap);
   generateResources(rng, size, worldX, worldZ, resources, get, set);
 
   // Features (trees + ground decorations). generateFeatures re-seeds its own
@@ -68,7 +70,7 @@ export function generateChunkData(
   // tree overhangs → seamless borders); we pass the shared simplex for the
   // continuous biome/density fields. The chunk seed below is just a placeholder.
   const treeRng = new RNG((Math.imul(worldX, 73856093) ^ Math.imul(worldZ, 19349663) ^ Math.imul(params.seed, 83492791)) | 0);
-  generateFeatures(treeRng, simplex, params, size, worldX, worldZ, get, set);
+  generateFeatures(treeRng, simplex, params, size, worldX, worldZ, get, set, heightMap, biomeMap, surfaceMap);
 
   // Foliage runs LAST (so it never overwrites a trunk/canopy) and is placed by a
   // PURE function of world (x,z) — hashes + the shared simplex, no per-chunk RNG —
@@ -977,7 +979,7 @@ function generateResources(rng: RNG, size: ChunkSize, worldX: number, worldZ: nu
 const ICE_SURFACE_TEMP = -0.30;   // more cold water freezes over (was -0.45, too rare)
 
 function generateTerrain(simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number,
-  set: SetFn, outHeight: Int16Array, outBiome: Uint8Array, outTint?: Uint8Array) {
+  set: SetFn, outHeight: Int16Array, outBiome: Uint8Array, outTint?: Uint8Array, outSurface?: Uint8Array) {
   const cfg = makeSurfaceConfig(params, size);
   const W = size.width;
   for (let x = 0; x < W; x++) {
@@ -986,6 +988,11 @@ function generateTerrain(simplex: SimplexNoise, params: ChunkParams, size: Chunk
       const idx = x * W + z;
       outHeight[idx] = cs.height;
       outBiome[idx] = cs.biome;
+      // The ACTUAL top block placed at y=cs.height — for `band` biomes (badlands)
+      // that's band(height) (terracotta on a plateau), NOT cs.surfaceId (redSand).
+      // generateFeatures reuses this (avoids re-running columnSurface for in-chunk
+      // columns + roots features on the real surface).
+      if (outSurface) outSurface[idx] = BIOMES[cs.biome].band ? BIOMES[cs.biome].band!(cs.height, cs.height, cfg.sea) : cs.surfaceId;
       if (outTint) {
         const [tr, tg, tb] = climateGrassTint(cs.temp, cs.humid);
         outTint[idx * 3] = (tr * 255 + 0.5) | 0;
@@ -1024,20 +1031,27 @@ const SNOW_ROOT = [BLOCK_IDS.snow] as const;
 const CONIFER_ROOT = [BLOCK_IDS.grass, BLOCK_IDS.podzol, BLOCK_IDS.snow, BLOCK_IDS.dirt] as const;
 const MANGROVE_ROOT = [BLOCK_IDS.mud, BLOCK_IDS.grass, BLOCK_IDS.dirt] as const;
 
-function generateFeatures(treeRng: RNG, simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number, get: GetFn, set: SetFn) {
+function generateFeatures(treeRng: RNG, simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number, get: GetFn, set: SetFn,
+  heightMap: Int16Array, biomeMap: Uint8Array, surfaceMap: Uint8Array) {
   const cfg = makeSurfaceConfig(params, size);
+  const W = size.width;
   // `rng` is reassigned to a per-CELL deterministic RNG inside the feature loop so
   // tree placement is a PURE function of the WORLD cell (see the loop below) — the
   // builder closures all reference this binding.
   let rng = treeRng;
-  // Root-surface lookup via the DETERMINISTIC terrain function (columnSurface), NOT a
-  // scan of THIS chunk's block array — so a tree whose CELL is rooted in a NEIGHBOUR
-  // chunk (reached via the apron margin) still finds its ground height and draws the
-  // slice of its canopy that overhangs into this chunk. columnSurface.surfaceId is the
-  // exact top block generateTerrain placed (incl. snow/podzol overlays), so the root
-  // gate matches the old get()-scan for in-chunk columns. Memoised per column.
+  // Root-surface lookup. For IN-CHUNK columns reuse generateTerrain's per-column
+  // maps (height/biome/top-block) — NO columnSurface re-sample (the heavy noise) and
+  // the REAL placed top block (fixes band biomes: a badlands plateau is terracotta,
+  // not redSand). For APRON columns (outside this chunk — a tree rooted in a
+  // neighbour whose canopy overhangs in) compute columnSurface (memoised). This is
+  // what makes cross-border trees seamless without re-noising the whole chunk.
   const colMemoF = new Map<string, ColumnSurface>();
   const colF = (wx: number, wz: number): ColumnSurface => {
+    const lx = wx - worldX, lz = wz - worldZ;
+    if (lx >= 0 && lx < W && lz >= 0 && lz < W) {
+      const idx = lx * W + lz;
+      return { height: heightMap[idx], surfaceId: surfaceMap[idx], subId: surfaceMap[idx], biome: biomeMap[idx], temp: 0, humid: 0 };
+    }
     const key = wx + ',' + wz;
     let v = colMemoF.get(key);
     if (!v) { v = columnSurface(simplex, cfg, wx, wz); colMemoF.set(key, v); }
@@ -1325,7 +1339,6 @@ function generateFeatures(treeRng: RNG, simplex: SimplexNoise, params: ChunkPara
   // seed, same columnSurface root) and draws only its own slice → seamless canopies,
   // no grid. MARGIN ≥ the widest canopy reach (giant 2×2 + radius-4 crown ≈ 7).
   const MARGIN = 8;
-  const W = size.width;
   const cgx0 = Math.floor((worldX - MARGIN) / CELL), cgx1 = Math.floor((worldX + W + MARGIN) / CELL);
   const cgz0 = Math.floor((worldZ - MARGIN) / CELL), cgz1 = Math.floor((worldZ + W + MARGIN) / CELL);
   for (let cgx = cgx0; cgx <= cgx1; cgx++) {

@@ -28,6 +28,17 @@ type collisionType = {
   overlap: number
 }
 
+// Zero-allocation scratch for the 200 Hz collision loop (the old code allocated a
+// new Vector3 per collision normal + an object literal per candidate every substep
+// → GC churn / frame hitches). Normals + contact points are POOLED (consumed within
+// the same substep, so reuse across substeps/calls is safe); resolve uses 2 scratch
+// vectors. The pools grow once to the max candidate count and are reused forever.
+const _normalPool: Three.Vector3[] = [];
+const _cpPool: { x: number, y: number, z: number }[] = [];
+const _cpTest = { x: 0, y: 0, z: 0 };
+const _rcA = new Three.Vector3();
+const _rcB = new Three.Vector3();
+
 export class Physics {
   simRate = 200;
   timeStep = 1 / this.simRate;
@@ -164,8 +175,7 @@ export class Physics {
     for(const collision of collisions){
       if(!this.pointInPlayerBoundingCylinder(collision.contactPoint, player)) continue;
 
-      let deltaPos = collision.normal.clone()
-      deltaPos.multiplyScalar(collision.overlap);
+      const deltaPos = _rcA.copy(collision.normal).multiplyScalar(collision.overlap);
       player.position.add(deltaPos);
 
       // Only cancel the velocity component driving INTO the surface. Without this
@@ -176,7 +186,7 @@ export class Physics {
       // still separates the bodies.
       const magnitude = player.worldVelocity.dot(collision.normal);
       if (magnitude < 0) {
-        const velocityAdjustment = collision.normal.clone().multiplyScalar(magnitude);
+        const velocityAdjustment = _rcB.copy(collision.normal).multiplyScalar(magnitude);
         player.applyWorldDeltaVelocity(velocityAdjustment.negate());
       }
     }
@@ -219,6 +229,7 @@ export class Physics {
     const collisions: collisionType[] = [];
     const p = player.position;
     const bodyY = p.y - (player.height / 2);
+    let np = 0;   // pooled normal/contact-point index (reset each call; reused safely)
 
     for(const candidate of candidates){
       // Each block contributes one or more AABBs (full cube by default; slab/stair/
@@ -226,23 +237,23 @@ export class Physics {
       for(const box of collisionBoxes(candidate.id)){
         const bx0 = candidate.x - 0.5 + box[0], by0 = candidate.y - 0.5 + box[1], bz0 = candidate.z - 0.5 + box[2];
         const bx1 = candidate.x - 0.5 + box[3], by1 = candidate.y - 0.5 + box[4], bz1 = candidate.z - 0.5 + box[5];
-        const closestPoint = {
-          x: Math.max(bx0, Math.min(p.x, bx1)),
-          y: Math.max(by0, Math.min(bodyY, by1)),
-          z: Math.max(bz0, Math.min(p.z, bz1)),
-        };
-        const dx = closestPoint.x - p.x;
-        const dy = closestPoint.y - bodyY;
-        const dz = closestPoint.z - p.z;
+        // closest point on the box to the player — into a scratch object (no alloc)
+        _cpTest.x = Math.max(bx0, Math.min(p.x, bx1));
+        _cpTest.y = Math.max(by0, Math.min(bodyY, by1));
+        _cpTest.z = Math.max(bz0, Math.min(p.z, bz1));
+        const dx = _cpTest.x - p.x;
+        const dy = _cpTest.y - bodyY;
+        const dz = _cpTest.z - p.z;
 
-        if(this.pointInPlayerBoundingCylinder(closestPoint, player)){
+        if(this.pointInPlayerBoundingCylinder(_cpTest, player)){
           const overlapY = (player.height / 2) - Math.abs(dy);
           const overlapXZ = player.radius - Math.sqrt(dx * dx + dz * dz);
 
-          let overlap, normal;
+          const normal = (_normalPool[np] ??= new Three.Vector3());
+          let overlap;
           if(overlapY < overlapXZ){
             overlap = overlapY;
-            normal = new Three.Vector3(0, -Math.sign(dy), 0);
+            normal.set(0, -Math.sign(dy), 0);
             // Ground only when supported from BELOW (contact point under the body
             // centre → normal points up). A ceiling contact (dy > 0) must NOT count
             // as grounded — otherwise bonking your head resets coyote/jump, and a
@@ -250,10 +261,14 @@ export class Physics {
             if(dy < 0) player.onGround = true;
           } else {
             overlap = overlapXZ;
-            normal = new Three.Vector3(-dx, 0, -dz).normalize();
+            normal.set(-dx, 0, -dz).normalize();
           }
+          // pooled contact point (copied from the scratch test point)
+          const cp = (_cpPool[np] ??= { x: 0, y: 0, z: 0 });
+          cp.x = _cpTest.x; cp.y = _cpTest.y; cp.z = _cpTest.z;
+          np++;
 
-          collisions.push({ block: candidate, contactPoint: closestPoint, normal, overlap });
+          collisions.push({ block: candidate, contactPoint: cp, normal, overlap });
         }
       }
     }

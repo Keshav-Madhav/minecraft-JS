@@ -224,19 +224,42 @@ scene.add(waterMesh);
 
 const _W_SHALLOW = new THREE.Color(0x86d0d8);
 const _wcDeep = new THREE.Color(), _wcShallow = new THREE.Color(), _wcOut = new THREE.Color();
+// Coarse colour grid (stride WC_STRIDE): the per-vertex water colour was 49² = 2401
+// world.sampler() calls on every snap-move (a ~5ms hitch over water). We sample a
+// stride-2 grid (25² = 625 calls, ~4× fewer) and BILINEARLY interpolate the colour
+// into the full vertex grid — even vertices stay exact, the rest blend smoothly
+// (water colour is a smooth field, so this is visually identical / nicer at biome
+// edges). The grid is pre-allocated once.
+const WC_STRIDE = 2;
+const WC_N = (WATER_SEG / WC_STRIDE) + 1;            // 25 coarse points per side
+const _waterCoarse = new Float32Array(WC_N * WC_N * 3);
 function updateWaterColors(cx: number, cz: number) {
   const seaY = world.params.terrain.waterOffset;
   const col = waterGeo.attributes.color.array as Float32Array;
-  const n = WATER_SEG + 1, span = waterSpanCur;
-  for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+  const n = WATER_SEG + 1, span = waterSpanCur, cg = _waterCoarse;
+  // 1) sample the coarse grid
+  for (let cj = 0; cj < WC_N; cj++) for (let ci = 0; ci < WC_N; ci++) {
+    const i = ci * WC_STRIDE, j = cj * WC_STRIDE;
     const wx = cx + (i / WATER_SEG - 0.5) * span, wz = cz + (j / WATER_SEG - 0.5) * span;
     const s = world.sampler(Math.floor(wx), Math.floor(wz));
     _wcDeep.setHex(biomeWaterHex(s.biome));
     _wcShallow.copy(_wcDeep).lerp(_W_SHALLOW, 0.55);
     const t = Math.min(1, Math.max(0, seaY - s.height) / 36);
     _wcOut.copy(_wcShallow).lerp(_wcDeep, t).multiplyScalar(1 - 0.32 * t);
-    const k = (j * n + i) * 3;
-    col[k] = _wcOut.r; col[k + 1] = _wcOut.g; col[k + 2] = _wcOut.b;
+    const k = (cj * WC_N + ci) * 3;
+    cg[k] = _wcOut.r; cg[k + 1] = _wcOut.g; cg[k + 2] = _wcOut.b;
+  }
+  // 2) bilinear-interpolate the coarse colours into every vertex
+  for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+    const fi = i / WC_STRIDE, fj = j / WC_STRIDE;
+    const ci0 = Math.min(WC_N - 2, fi | 0), cj0 = Math.min(WC_N - 2, fj | 0);
+    const tx = fi - ci0, tz = fj - cj0;
+    const a = (cj0 * WC_N + ci0) * 3, b = a + 3, c = a + WC_N * 3, d = c + 3, k = (j * n + i) * 3;
+    for (let ch = 0; ch < 3; ch++) {
+      const top = cg[a + ch] * (1 - tx) + cg[b + ch] * tx;
+      const bot = cg[c + ch] * (1 - tx) + cg[d + ch] * tx;
+      col[k + ch] = top * (1 - tz) + bot * tz;
+    }
   }
   waterGeo.attributes.color.needsUpdate = true;
 }
@@ -594,6 +617,17 @@ function onMouseDown(event: MouseEvent) {
     } else {
       world.setBlock(c.x, c.y, c.z, player.activeBlockId);
       if (player.activeBlockId === BLOCK_IDS.oakDoorLowerClosed) world.setBlock(c.x, c.y + 1, c.z, BLOCK_IDS.oakDoorUpperClosed);
+      // Beds are 2 cells (foot + head): auto-place the matching half one cell along
+      // the player's facing (cardinal) so a hotbar-placed bed is a complete bed, not
+      // an orphan half. Skip if that cell is occupied.
+      else if (player.activeBlockId === BLOCK_IDS.bedFoot || player.activeBlockId === BLOCK_IDS.bedHead) {
+        const d = player.camera.getWorldDirection(_camDir);
+        const dx = Math.abs(d.x) > Math.abs(d.z) ? Math.sign(d.x) : 0;
+        const dz = dx === 0 ? Math.sign(d.z) || 1 : 0;
+        const other = player.activeBlockId === BLOCK_IDS.bedFoot ? BLOCK_IDS.bedHead : BLOCK_IDS.bedFoot;
+        if ((world.getBlock(c.x + dx, c.y, c.z + dz)?.id ?? blocks.air.id) === blocks.air.id)
+          world.setBlock(c.x + dx, c.y, c.z + dz, other);
+      }
     }
   }
 }
