@@ -1615,9 +1615,12 @@ function generateFoliage(simplex: SimplexNoise, params: ChunkParams, size: Chunk
 
       // --- sugar cane on a waterside bank (grass/sand right next to water) ---
       if ((top === BLOCK_IDS.grass || top === BLOCK_IDS.sand) && h - sea <= 3) {
-        // waterside if any in-chunk OR apron-deterministic neighbour column is below sea
+        // waterside if any neighbour column is below sea. Off-chunk neighbours sample
+        // the REAL deterministic surface (was faked as h-1, which is >= sea for a bank
+        // at h>=sea+1 → the <sea test never fired off-chunk, leaving a ~16-block gap in
+        // cane along every chunk-border shoreline). columnSurface is pure → seamless.
         const wAt = (nx: number, nz: number) =>
-          (nx >= 0 && nx < W && nz >= 0 && nz < W) ? heightMap[nx * W + nz] : (h - 1); // off-chunk: assume steppable
+          (nx >= 0 && nx < W && nz >= 0 && nz < W) ? heightMap[nx * W + nz] : columnSurface(simplex, cfg, worldX + nx, worldZ + nz).height;
         const waterside = wAt(x - 1, z) < sea || wAt(x + 1, z) < sea || wAt(x, z - 1) < sea || wAt(x, z + 1) < sea;
         if (waterside && fbm(simplex, wx + 5500, wz + 5500, 16, 2) > -0.1 && r < 0.7) {
           const ch = 1 + (hash01(wx + 3, wz + 8) < 0.55 ? 1 : 0) + (hash01(wx + 5, wz + 2) < 0.25 ? 1 : 0);  // 1-3 tall
@@ -1753,8 +1756,7 @@ export function structureFitsBiome(kind: number, biome: number): boolean {
   switch (kind) {
     case ST_PYRAMID: return biome === BIOME.desert || biome === BIOME.redDesert;
     case ST_VILLAGE: case ST_HOUSE: return structGrassy(biome);
-    case ST_MANSION: return biome === BIOME.forest || biome === BIOME.warmForest || biome === BIOME.taiga
-      || biome === BIOME.darkForest || biome === BIOME.redwoodForest;
+    case ST_MANSION: return biome === BIOME.darkForest;   // woodland mansion is dark-forest-exclusive (MC)
     case ST_IGLOO: return structCold(biome);
     case ST_CAMPSITE: return structGrassy(biome) || structCold(biome);
     case ST_RUINS: return structAnyLand(biome) && biome !== BIOME.mushroom && biome !== BIOME.beach;
