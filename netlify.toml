@@ -1,0 +1,9 @@
+# Netlify build config for this Vite + TypeScript app.
+# Connect the repo at https://app.netlify.com → "Add new site" → import from Git;
+# these settings are picked up automatically (no dashboard config needed).
+[build]
+  command = "npm run build"   # tsc + vite build
+  publish = "dist"            # Vite's output dir
+
+[build.environment]
+  NODE_VERSION = "20"         # Vite 5 needs Node 18+; 20 is the current LTS

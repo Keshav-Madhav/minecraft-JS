@@ -8,7 +8,9 @@ export class ModelLoader {
   }
 
   loadModels(onLoad: (models: { [key: string]: any }) => void){
-    this.loader.load('/pickaxe.glb', (gltf) => {
+    // BASE_URL-prefixed (not a hardcoded '/') so the model resolves under whatever
+    // path the app is deployed at — root on Vercel/Netlify, a sub-path on Pages.
+    this.loader.load(import.meta.env.BASE_URL + 'pickaxe.glb', (gltf) => {
       const mesh = gltf.scene;
       this.models.pickaxe = mesh;
 

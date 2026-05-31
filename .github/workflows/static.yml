@@ -2,11 +2,11 @@
 name: Deploy static content to Pages
 
 on:
-  # Runs on pushes targeting the default branch
-  push:
-    branches: ["main"]
-
-  # Allows you to run this workflow manually from the Actions tab
+  # MANUAL-ONLY. This GitHub Pages deploy no longer runs on every push — that
+  # consumed Actions minutes (the cost you wanted to avoid). Deployment is now
+  # handled by Vercel/Netlify, which build on push via their own free git
+  # integration. Run this from the Actions tab only if you still want a Pages
+  # build; otherwise it's safe to delete this file entirely.
   workflow_dispatch:
 
 # Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
