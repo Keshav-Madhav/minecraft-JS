@@ -353,34 +353,31 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
   };
 
   // Thin SLAB (snow layers): a top quad + short side walls (culled where a same-id
-  // slab abuts at the SAME y → flush sheet; exposed → a visible step). Gives the
-  // snow a real 1/8-block height + variable surface instead of a flat decal.
+  // slab abuts at the SAME y → flush sheet; exposed → a visible step). Emitted into
+  // the CASTERS group with CORRECT per-face normals (via DIR_META/pushVert, exactly
+  // like a cube face) — NOT the plant material, whose forced up-normal made the side
+  // walls shade view-dependently (they visibly shifted hue as the camera moved while
+  // the snow BLOCK stayed stable). Now the sheet shades identically to a snow block.
+  const emitSlabFace = (bnd: [number, number][], d: number, layer: number) => {
+    const meta = DIR_META[d];
+    const aCoord = meta.sign > 0 ? bnd[meta.aAxis][1] : bnd[meta.aAxis][0];
+    const p0 = bnd[meta.pAxis][0], p1 = bnd[meta.pAxis][1], q0 = bnd[meta.qAxis][0], q1 = bnd[meta.qAxis][1];
+    const base = casters.pos.length / 3;
+    pushVert(casters, meta, aCoord, p0, q0, layer, 1, 1, 1, 0);
+    pushVert(casters, meta, aCoord, p1, q0, layer, 1, 1, 1, 0);
+    pushVert(casters, meta, aCoord, p1, q1, layer, 1, 1, 1, 0);
+    pushVert(casters, meta, aCoord, p0, q1, layer, 1, 1, 1, 0);
+    casters.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  };
   const emitSlab = (x: number, y: number, z: number, id: number, layer: number, off: number) => {
-    const yB = y - 0.5, yT = y - 0.5 + off;
-    let base = plants.pos.length / 3;
-    pushPlantVert(plants, x - 0.5, yT, z - 0.5, 0, 0, layer, 1, 1, 1, 0);
-    pushPlantVert(plants, x + 0.5, yT, z - 0.5, 1, 0, layer, 1, 1, 1, 0);
-    pushPlantVert(plants, x + 0.5, yT, z + 0.5, 1, 1, layer, 1, 1, 1, 0);
-    pushPlantVert(plants, x - 0.5, yT, z + 0.5, 0, 1, layer, 1, 1, 1, 0);
-    plants.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
-    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+    const bnd: [number, number][] = [[x - 0.5, x + 0.5], [y - 0.5, y - 0.5 + off], [z - 0.5, z + 0.5]];
+    emitSlabFace(bnd, 2, layer);   // top (+y) — always visible
+    // sides (+x,-x,+z,-z = DIR_META 0,1,4,5) — only where the neighbour isn't a flush
+    // same-id slab at the same y; the bottom (-y) sits on the block below, so skip it.
+    for (const [d, dx, dz] of [[0, 1, 0], [1, -1, 0], [4, 0, 1], [5, 0, -1]] as const) {
       const nx = x + dx, nz = z + dz;
       if (nx >= 0 && nx < W && nz >= 0 && nz < W && idAt(nx, y, nz) === id) continue; // flush with neighbour
-      base = plants.pos.length / 3;
-      if (dx !== 0) {
-        const px = x + dx * 0.5;
-        pushPlantVert(plants, px, yB, z - 0.5, 0, 0, layer, 1, 1, 1, 0);
-        pushPlantVert(plants, px, yB, z + 0.5, 1, 0, layer, 1, 1, 1, 0);
-        pushPlantVert(plants, px, yT, z + 0.5, 1, off, layer, 1, 1, 1, 0);
-        pushPlantVert(plants, px, yT, z - 0.5, 0, off, layer, 1, 1, 1, 0);
-      } else {
-        const pz = z + dz * 0.5;
-        pushPlantVert(plants, x - 0.5, yB, pz, 0, 0, layer, 1, 1, 1, 0);
-        pushPlantVert(plants, x + 0.5, yB, pz, 1, 0, layer, 1, 1, 1, 0);
-        pushPlantVert(plants, x + 0.5, yT, pz, 1, off, layer, 1, 1, 1, 0);
-        pushPlantVert(plants, x - 0.5, yT, pz, 0, off, layer, 1, 1, 1, 0);
-      }
-      plants.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      emitSlabFace(bnd, d, layer);
     }
   };
 

@@ -109,6 +109,10 @@ export const BLOCK_IDS = {
   woolBrown: 170, woolGreen: 171, woolRed: 172, woolBlack: 173,
   // --- light-emitting blocks ---
   lantern: 174, torch: 175, campfire: 176, jackOLantern: 177,
+  // --- interior furniture ---
+  furnace: 178, furnaceLit: 179, craftingTable: 180, chest: 181,
+  bedFoot: 182, bedHead: 183, barrel: 184,
+  flowerPot: 185,   // a potted-flower CROSS billboard (plant), placed on tables/floors
 } as const;
 
 // Settings used by procedural resource (ore) generation. Plain data so it can
@@ -233,6 +237,13 @@ export const TEXTURE_LAYER = {
   woolBrown: 160, woolGreen: 161, woolRed: 162, woolBlack: 163,
   // --- light-emitting blocks ---
   lantern: 164, torch: 165, campfireTop: 166, campfireSide: 167, jackLanternSide: 168, jackLanternTop: 169,
+  // --- interior furniture ---
+  furnaceSide: 170, furnaceFront: 171, furnaceFrontLit: 172, furnaceTop: 173,
+  craftingTableTop: 174, craftingTableSide: 175,
+  chestFront: 176, chestSide: 177, chestTop: 178,
+  bedFootTop: 179, bedHeadTop: 180, bedSide: 181,
+  barrelTop: 182, barrelSide: 183,
+  flowerPot: 184,
 } as const;
 
 // Derived so it can never drift out of sync when a layer is added.
@@ -292,6 +303,12 @@ export const BLOCK_FACE_LAYERS: { [id: number]: readonly number[] } = {
   [BLOCK_IDS.smoothStone]: [T.smoothStone, T.smoothStone, T.smoothStone, T.smoothStone, T.smoothStone, T.smoothStone],
   [BLOCK_IDS.bookshelf]: [T.bookshelf, T.bookshelf, T.oakPlanks, T.oakPlanks, T.bookshelf, T.bookshelf],
   [BLOCK_IDS.glowstone]: [T.glowstone, T.glowstone, T.glowstone, T.glowstone, T.glowstone, T.glowstone],
+  // --- interior furniture (per-face: front on -z) ---
+  [BLOCK_IDS.furnace]:    [T.furnaceSide, T.furnaceSide, T.furnaceTop, T.furnaceTop, T.furnaceSide, T.furnaceFront],
+  [BLOCK_IDS.furnaceLit]: [T.furnaceSide, T.furnaceSide, T.furnaceTop, T.furnaceTop, T.furnaceSide, T.furnaceFrontLit],
+  [BLOCK_IDS.craftingTable]: [T.craftingTableSide, T.craftingTableSide, T.craftingTableTop, T.oakPlanks, T.craftingTableSide, T.craftingTableSide],
+  [BLOCK_IDS.chest]:      [T.chestSide, T.chestSide, T.chestTop, T.chestTop, T.chestSide, T.chestFront],
+  [BLOCK_IDS.barrel]:     [T.barrelSide, T.barrelSide, T.barrelTop, T.barrelTop, T.barrelSide, T.barrelSide],
 };
 
 // Expansion set: uniform single-texture cubes (all six faces identical).
@@ -378,6 +395,14 @@ for (const [id, shape] of [
 for (const [id, shape] of [[I.oakTrapdoorClosed, TRAP_CLOSED_SHAPE], [I.oakTrapdoorOpen, TRAP_OPEN_SHAPE]] as const) {
   BLOCK_SHAPES[id] = shape; SHAPED_LOOKUP[id] = 1; BLOCK_FACE_LAYERS[id] = sixOf(T.oakTrapdoor);
 }
+// Bed halves: a 9/16-tall mattress box (foot=blanket top, head=pillow top); wood
+// legs on the bottom face. Two adjacent halves read as one 2-long bed. Shaped →
+// collides as the low box (you step onto it) + emitted by the plant pass.
+const BED_SHAPE: AABB[] = [[0, 0, 0, 1, 0.5625, 1]];
+for (const [id, top] of [[I.bedFoot, T.bedFootTop], [I.bedHead, T.bedHeadTop]] as const) {
+  BLOCK_SHAPES[id] = BED_SHAPE; SHAPED_LOOKUP[id] = 1;
+  BLOCK_FACE_LAYERS[id] = [T.bedSide, T.bedSide, top, T.oakPlanks, T.bedSide, T.bedSide];
+}
 export const isShaped = (id: number): boolean => SHAPED_LOOKUP[id] === 1;
 export const isFence = (id: number): boolean => FENCE_LOOKUP[id] === 1;
 const FULL_CUBE: AABB[] = [[0, 0, 0, 1, 1, 1]];
@@ -457,6 +482,8 @@ export const PLANTS: { readonly [id: number]: PlantDef } = {
   // margin so it reads as a thin torch); no wind sway; rendered emissive (the
   // plant material self-detects the torch layer — see plantMaterial).
   [BLOCK_IDS.torch]:             { layer: PT.torch,              kind: 'cross', tint: 'none', off: 0, swayLo: 0, swayHi: 0 },
+  // potted flower (interior decoration): a small terracotta pot + bloom, no sway.
+  [BLOCK_IDS.flowerPot]:         { layer: PT.flowerPot,          kind: 'cross', tint: 'none', off: 0, swayLo: 0, swayHi: 0 },
 };
 
 // O(1) "is this id a plant?" for the mesher's hot loops & physics broadphase —
@@ -501,6 +528,7 @@ export const LIGHT_SOURCES: { readonly [id: number]: LightSpec } = {
   [BLOCK_IDS.glowstone]:  { r: 1.00, g: 0.89, b: 0.64, intensity: 14, range: 15, flicker: 0 },
   [BLOCK_IDS.seaLantern]: { r: 0.80, g: 0.95, b: 0.96, intensity: 14, range: 15, flicker: 0 },
   [BLOCK_IDS.magma]:      { r: 1.00, g: 0.50, b: 0.22, intensity: 6, range: 7, flicker: 0.12 },
+  [BLOCK_IDS.furnaceLit]: { r: 1.00, g: 0.60, b: 0.28, intensity: 9, range: 12, flicker: 0.14 },
 };
 // O(1) "is this id a light emitter?" — also the EMISSIVE set (rendered full-bright).
 export const EMITTER_LOOKUP = new Uint8Array(256);

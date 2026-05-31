@@ -110,6 +110,28 @@ spectator.camera.layers.enable(1);
 spectator.controls.target.set(8, 130, 8);
 spectator.controls.update();
 
+// XYZ orientation gizmo pinned to the spectator's orbit pivot — a placement
+// reference (which way is +X/+Y/+Z, and where the camera is orbiting). Shown only
+// while spectating; rendered on top (depthTest off) so it stays visible even when
+// the pivot sits inside terrain.
+const orbitGizmo = new THREE.Group();
+{
+  const L = 3, mkArrow = (dir: THREE.Vector3, color: number) => {
+    const a = new THREE.ArrowHelper(dir, new THREE.Vector3(0, 0, 0), L, color, L * 0.32, L * 0.2);
+    a.traverse((o) => {
+      o.renderOrder = 999;
+      const m = (o as THREE.Mesh).material as THREE.Material | undefined;
+      if (m) { m.depthTest = false; m.transparent = true; }
+    });
+    return a;
+  };
+  orbitGizmo.add(mkArrow(new THREE.Vector3(1, 0, 0), 0xff5050));   // +X red
+  orbitGizmo.add(mkArrow(new THREE.Vector3(0, 1, 0), 0x50ff50));   // +Y green
+  orbitGizmo.add(mkArrow(new THREE.Vector3(0, 0, 1), 0x5090ff));   // +Z blue
+}
+orbitGizmo.visible = false;
+scene.add(orbitGizmo);
+
 // Localized block lighting: a pool of point lights snapped to nearby emitters.
 const lightManager = new LightManager(scene);
 let lightInterval = 2;   // frames between point-light gathers (quality preset)
@@ -705,6 +727,9 @@ function animate() {
     player.update(world);
     physics.update(delta, player, world);
   }
+  // Orbit gizmo follows the pivot; only visible while actively spectating.
+  orbitGizmo.visible = mode === 'spectator' && playing;
+  if (orbitGizmo.visible) orbitGizmo.position.copy(spectator.controls.target);
 
   updateSky(playing ? delta : 0);   // freeze the day/night clock while paused
   if (sun.castShadow) updateSunShadow();   // skip the frustum maths entirely when shadows are off

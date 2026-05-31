@@ -17,6 +17,7 @@ export class Spectator {
   private fwd = new THREE.Vector3();
   private right = new THREE.Vector3();
   private move = new THREE.Vector3();
+  private dolly = new THREE.Vector3();
   private readonly worldUp = new THREE.Vector3(0, 1, 0);
 
   constructor(camera: THREE.PerspectiveCamera, dom: HTMLElement) {
@@ -25,18 +26,30 @@ export class Spectator {
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.12;
     this.controls.enablePan = false;        // WASD handles translation; reserve drag for orbit
-    this.controls.enableZoom = false;       // scroll adjusts FLY SPEED instead of dollying
+    // We drive zoom + fly-speed from our OWN wheel handler (enableZoom off so
+    // OrbitControls doesn't also grab the wheel and double-dolly).
+    this.controls.enableZoom = false;
     this.controls.minDistance = 1;
     this.controls.maxDistance = 600;
     this.controls.enabled = false;          // off until spectator mode activates
 
     window.addEventListener('keydown', (e) => this.onKey(e, true));
     window.addEventListener('keyup', (e) => this.onKey(e, false));
-    // Scroll = fly-speed (faster up, slower down), exponential so it ranges widely.
+    // Wheel: PLAIN scroll = ZOOM (dolly toward/away from the orbit target — the
+    // restored behaviour); SHIFT+scroll = FLY SPEED (exponential, wide range).
     dom.addEventListener('wheel', (e) => {
       if (!this.enabled) return;
       e.preventDefault();
-      this.speed = Math.min(240, Math.max(4, this.speed * Math.exp(-e.deltaY * 0.0015)));
+      if (e.shiftKey) {
+        this.speed = Math.min(240, Math.max(4, this.speed * Math.exp(-e.deltaY * 0.0015)));
+      } else {
+        // dolly: scale the camera→target distance (scroll up = closer)
+        const off = this.dolly.copy(this.camera.position).sub(this.controls.target);
+        const dist = off.length() || 1;
+        const nd = Math.min(this.controls.maxDistance, Math.max(this.controls.minDistance, dist * Math.exp(e.deltaY * 0.001)));
+        this.camera.position.copy(this.controls.target).addScaledVector(off.normalize(), nd);
+        this.controls.update();
+      }
     }, { passive: false });
   }
 

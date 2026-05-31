@@ -9,10 +9,16 @@ import { World } from './world';
 const STEP_HEIGHT = 0.6;
 
 // --- swimming tuning --------------------------------------------------------
-const SWIM_RISE = 6;        // blocks/s upward while holding Space underwater
-const SWIM_SINK = 1.8;      // blocks/s gentle sink with no input (lets you dive)
-const SWIM_RESPONSE = 9;    // how fast vertical velocity eases to the swim target
+const SWIM_RISE = 7;        // blocks/s upward while holding Space (brisk — can breach to climb out)
+const SWIM_DIVE = 5;        // blocks/s downward while holding Shift (dive)
+const SWIM_SINK = 0.8;      // gentle settle toward the float line with no input
+const SWIM_RESPONSE = 10;   // how fast vertical velocity eases to the swim target
 const WATER_DRAG = 3.2;     // horizontal damping in water (weighty, slower swimming)
+const FLOAT_DEPTH = 0.55;   // at rest the body-centre floats this far below the surface (head out)
+const BUOY_SPRING = 5;      // how strongly buoyancy pulls the body back to the float line
+const BOB_AMP = 0.5;        // amplitude (blocks/s) of the gentle surface bob
+const BOB_FREQ = 2.2;       // bob oscillation rate (rad/s)
+const WATER_STEP = 1.15;    // ledge height the player can auto-climb OUT of water
 
 type Candidate = { x: number, y: number, z: number, id: number };
 type collisionType = {
@@ -26,6 +32,7 @@ export class Physics {
   simRate = 200;
   timeStep = 1 / this.simRate;
   accumulator = 0;
+  swimClock = 0;        // advances each in-water substep — drives the surface bob
 
   gravity = 32;
 
@@ -52,19 +59,34 @@ export class Physics {
       const inWater = !player.flying && bodyCenterY < sea &&
         world.getBlockId(Math.floor(player.position.x), sea, Math.floor(player.position.z)) === blocks.air.id;
 
+      player.inWater = inWater;
       // Flight (Creative / Survival-flight): no gravity, vertical from input.
       if (!player.flying) {
         if (inWater) {
-          // Swimming: gravity is cancelled and replaced by a controlled vertical
-          // glide — hold Space to rise, otherwise sink gently — with heavy drag so
-          // it feels weighty, not bouncy (no buoyancy spring → no surface bobbing).
-          const target = player.wantsUp ? SWIM_RISE : -SWIM_SINK;
+          // Swimming: gravity is replaced by a controlled vertical glide.
+          //  • Space  → rise briskly (SWIM_RISE) — fast enough to surface and breach
+          //    so the auto-step can lift you OUT onto a shore ledge.
+          //  • Shift  → dive (SWIM_DIVE).
+          //  • idle   → buoyancy springs the body back to the FLOAT line (head out of
+          //    the water) plus a gentle sinusoidal BOB so you bob on the surface
+          //    instead of being hard-pinned at the waterline (the old "no bob" feel).
+          this.swimClock += this.timeStep;
+          let target: number;
+          if (player.wantsUp) target = SWIM_RISE;
+          else if (player.sprintKey) target = -SWIM_DIVE;
+          else {
+            const err = (sea - FLOAT_DEPTH) - bodyCenterY;           // >0 if below the float line
+            const buoy = Math.max(-SWIM_SINK, Math.min(SWIM_RISE, err * BUOY_SPRING));
+            target = buoy + Math.sin(this.swimClock * BOB_FREQ) * BOB_AMP;
+          }
           player.velocity.y += (target - player.velocity.y) * Math.min(1, SWIM_RESPONSE * this.timeStep);
-          // Ease to a stop right at the waterline when surfacing, so the head rests
-          // at the surface (you can breathe / walk out) instead of launching out.
+          // Soft surface ease: when rising near the waterline, taper the rise (so you
+          // surface and bob with your head out rather than rocketing into the air) —
+          // but keep a little residual so the bob lives. Climbing onto land is handled
+          // by the in-water auto-step, NOT by launching vertically.
           if (player.velocity.y > 0) {
-            const room = Math.max(0, sea - bodyCenterY);
-            player.velocity.y = Math.min(player.velocity.y, room / this.timeStep * 0.5);
+            const room = Math.max(0, sea - bodyCenterY);             // distance to the surface
+            player.velocity.y = Math.min(player.velocity.y, room * 6 + 0.4);
           }
           // Water resistance on horizontal motion (slower, weightier swimming).
           const hdamp = Math.exp(-WATER_DRAG * this.timeStep);
@@ -108,13 +130,18 @@ export class Physics {
     // taller wall or a low ceiling), so we never clip into geometry. Never while
     // flying — the player controls Y directly there, so snapping onto a ledge would
     // fight the input and make low passes jerky.
-    if(horizontal.length > 0 && player.onGround && preSpeed > 0.4 && !player.flying){
+    // In water near the surface, allow the SAME ledge-lift so swimming into a 1-block
+    // shore climbs you out (MC-style), using a taller WATER_STEP limit. Otherwise the
+    // usual grounded auto-step for slabs/stairs/structure steps.
+    const canStep = !player.flying && preSpeed > 0.4 && (player.onGround || player.inWater);
+    const stepLimit = player.inWater && !player.onGround ? WATER_STEP : STEP_HEIGHT;
+    if(horizontal.length > 0 && canStep){
       const feet = player.position.y - player.height;
       let stepTop = -Infinity;
       for(const c of horizontal){
         for(const box of collisionBoxes(c.block.id)){
           const top = c.block.y - 0.5 + box[4];   // world Y of this box's top face
-          if(top > feet + 0.02 && top <= feet + STEP_HEIGHT + 1e-3 && top > stepTop) stepTop = top;
+          if(top > feet + 0.02 && top <= feet + stepLimit + 1e-3 && top > stepTop) stepTop = top;
         }
       }
       if(stepTop > -Infinity){
@@ -123,7 +150,10 @@ export class Physics {
         const blocked = this.narrowPhase(player, this.broadPhase(player, world))
           .some(c => c.overlap > 0.02);                       // any wall/ceiling intrusion at the new height
         if(blocked) player.position.y = savedY;               // not a valid step → stay put (needs a jump)
-        player.onGround = true;                               // grounded either way (probe's side effect overwritten)
+        // Grounded if we were already grounded, or we successfully lifted onto a ledge.
+        // Do NOT claim grounded when a SUBMERGED lift was reverted (still swimming) —
+        // that would let a buffered Space leak a full jump impulse (launch out of water).
+        player.onGround = !player.inWater || !blocked;
       }
     }
   }

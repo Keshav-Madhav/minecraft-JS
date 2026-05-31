@@ -63,12 +63,11 @@ export function generateChunkData(
   generateTerrain(simplex, params, size, worldX, worldZ, set, heightMap, biomeMap, outTint);
   generateResources(rng, size, worldX, worldZ, resources, get, set);
 
-  // Features use a per-chunk RNG for placement (a shared rng repeats the same
-  // sequence every chunk → a visible grid), but the shared simplex for the
-  // continuous biome/density fields so woods/clearings span chunk borders.
-  const treeRng = new RNG(
-    (Math.imul(worldX, 73856093) ^ Math.imul(worldZ, 19349663) ^ Math.imul(params.seed, 83492791)) | 0
-  );
+  // Features (trees + ground decorations). generateFeatures re-seeds its own
+  // per-WORLD-CELL RNG internally (so placement is identical in every chunk that a
+  // tree overhangs → seamless borders); we pass the shared simplex for the
+  // continuous biome/density fields. The chunk seed below is just a placeholder.
+  const treeRng = new RNG((Math.imul(worldX, 73856093) ^ Math.imul(worldZ, 19349663) ^ Math.imul(params.seed, 83492791)) | 0);
   generateFeatures(treeRng, simplex, params, size, worldX, worldZ, get, set);
 
   // Foliage runs LAST (so it never overwrites a trunk/canopy) and is placed by a
@@ -643,6 +642,8 @@ for (const [id, col] of [
   [B.woolLightGray, [142, 142, 134]], [B.woolCyan, [21, 137, 145]], [B.woolPurple, [121, 42, 172]], [B.woolBlue, [53, 57, 157]],
   [B.woolBrown, [114, 71, 40]], [B.woolGreen, [84, 109, 27]], [B.woolRed, [161, 39, 34]], [B.woolBlack, [20, 21, 25]],
   [B.lantern, [232, 196, 110]], [B.torch, [228, 176, 86]], [B.campfire, [198, 96, 44]], [B.jackOLantern, [222, 132, 42]],
+  [B.furnace, [96, 96, 100]], [B.furnaceLit, [150, 96, 50]], [B.craftingTable, [150, 116, 70]],
+  [B.chest, [150, 108, 58]], [B.bedFoot, [176, 46, 44]], [B.bedHead, [200, 90, 86]], [B.barrel, [128, 98, 58]],
 ] as const) {
   BLOCK_MAP_COLOR[id] = col;
 }
@@ -799,8 +800,15 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   // terrain and bloomed beach inland ...
   const valleyMem = valleyBand * rgate * (1 - sm(relief, 4, 16));
   if (valleyMem > 0) height += valleyMem * ((sea + 4) - baseH) * 0.5;
-  // ... then the narrow channel still carves the floor to sea-2 (continuous water).
-  const riverMem = channelBand * rgate;
+  // ... then the narrow channel carves the floor to sea-2 (continuous water). The
+  // channel uses its OWN coast gate (NOT onLand): onLand faded to 0 at baseH=sea-1,
+  // so the carve stopped ~1 block above sea and left the beach band (aboveSea 0..3)
+  // as an unbroken SAND BAR that dammed every river mouth. The channel gate instead
+  // stays full strength inland and only fades once already in genuine ocean
+  // (baseH ≤ ~sea-4) — so the channel punches THROUGH the beach to meet the sea
+  // (no open-ocean trenches, since it's 0 in deep water).
+  const channelGate = (1 - mtn) * (1 - badlandsMem) * (1 - swampCore) * sm(baseH, sea - 4, sea + 2);
+  const riverMem = channelBand * channelGate;
   if (riverMem > 0) height += riverMem * ((sea - 2) - height);    // from the post-valley floor
 
   // LAKES — rare lowland basins carved to sea-3 so the plane floods them. Confined
@@ -1016,13 +1024,28 @@ const SNOW_ROOT = [BLOCK_IDS.snow] as const;
 const CONIFER_ROOT = [BLOCK_IDS.grass, BLOCK_IDS.podzol, BLOCK_IDS.snow, BLOCK_IDS.dirt] as const;
 const MANGROVE_ROOT = [BLOCK_IDS.mud, BLOCK_IDS.grass, BLOCK_IDS.dirt] as const;
 
-function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number, get: GetFn, set: SetFn) {
+function generateFeatures(treeRng: RNG, simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number, get: GetFn, set: SetFn) {
+  const cfg = makeSurfaceConfig(params, size);
+  // `rng` is reassigned to a per-CELL deterministic RNG inside the feature loop so
+  // tree placement is a PURE function of the WORLD cell (see the loop below) — the
+  // builder closures all reference this binding.
+  let rng = treeRng;
+  // Root-surface lookup via the DETERMINISTIC terrain function (columnSurface), NOT a
+  // scan of THIS chunk's block array — so a tree whose CELL is rooted in a NEIGHBOUR
+  // chunk (reached via the apron margin) still finds its ground height and draws the
+  // slice of its canopy that overhangs into this chunk. columnSurface.surfaceId is the
+  // exact top block generateTerrain placed (incl. snow/podzol overlays), so the root
+  // gate matches the old get()-scan for in-chunk columns. Memoised per column.
+  const colMemoF = new Map<string, ColumnSurface>();
+  const colF = (wx: number, wz: number): ColumnSurface => {
+    const key = wx + ',' + wz;
+    let v = colMemoF.get(key);
+    if (!v) { v = columnSurface(simplex, cfg, wx, wz); colMemoF.set(key, v); }
+    return v;
+  };
   const surfaceYOf = (x: number, z: number, roots: readonly number[]): number => {
-    for (let y = size.height - 1; y >= 0; y--) {
-      const id = get(x, y, z);
-      if (id !== BLOCK_IDS.air && roots.includes(id)) return y;
-    }
-    return -1;
+    const cs = colF(worldX + x, worldZ + z);
+    return roots.includes(cs.surfaceId) ? cs.height : -1;
   };
   const setIfAir = (x: number, y: number, z: number, id: number) => {
     if (get(x, y, z) === BLOCK_IDS.air) set(x, y, z, id);
@@ -1097,7 +1120,22 @@ function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, 
   // --- distinct tree shapes (use the existing biome wood palette) -----------
   // Conical conifer: straight trunk + diamond leaf rings widening downward from a
   // pointed tip → reads as a pine/spruce, not a round oak blob.
-  const conifer = (x: number, z: number, roots: readonly number[], logId: number, leafId: number, minH: number, maxH: number) => {
+  // Dust a snow SHEET on the TOP of a leaf canopy (taiga / snowy conifers) so the
+  // forest reads as "it snowed". For each column in the crown footprint, finds the
+  // highest leaf with air above and lays a snowLayer on it. Uses get()/set() (the
+  // in-chunk data), so apron conifers rooted in a neighbour cap only their in-chunk
+  // leaves — the neighbour chunk caps the rest identically → seamless.
+  const snowCapCanopy = (cx: number, cz: number, r: number, topY: number, leafId: number) => {
+    for (let i = -r; i <= r + 1; i++) for (let k = -r; k <= r + 1; k++) {
+      for (let yy = topY + 1; yy > topY - 8 && yy > 0; yy--) {
+        if (get(cx + i, yy, cz + k) === leafId && get(cx + i, yy + 1, cz + k) === BLOCK_IDS.air) {
+          set(cx + i, yy + 1, cz + k, BLOCK_IDS.snowLayer);
+          break;                                                     // only the topmost leaf of this column
+        }
+      }
+    }
+  };
+  const conifer = (x: number, z: number, roots: readonly number[], logId: number, leafId: number, minH: number, maxH: number, snowy = false) => {
     const y0 = surfaceYOf(x, z, roots);
     if (y0 < 0) return;
     const h = Math.round(minH + (maxH - minH) * rng.random());
@@ -1112,15 +1150,16 @@ function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, 
       }
       ring++;
     }
+    if (snowy) snowCapCanopy(x, z, 3, top + 1, leafId);
   };
-  const spruce = (x: number, z: number) => conifer(x, z, CONIFER_ROOT, BLOCK_IDS.spruceLog, BLOCK_IDS.spruceLeaves, 6, 11);
+  const spruce = (x: number, z: number, snowy = false) => conifer(x, z, CONIFER_ROOT, BLOCK_IDS.spruceLog, BLOCK_IDS.spruceLeaves, 6, 11, snowy);
 
   // GIANT redwood: 2×2 spruce trunk, podzol skirt, big conical crown. The
   // centrepiece of the redwood forest.
   const redwood = (x: number, z: number) => {
-    // No room for the 2×2 trunk + radius-4 crown near a chunk edge → plant a regular
-    // spruce instead, so borders stay forested without a half-clipped giant crown.
-    if (x < 4 || x > size.width - 6 || z < 4 || z > size.width - 6) { spruce(x, z); return; }
+    // The feature loop now iterates an apron of neighbour cells with a per-CELL
+    // deterministic RNG, so a giant rooted near (or past) the border is drawn IN
+    // FULL by every chunk it touches — no edge fallback / clipped crown needed.
     const y0 = surfaceYOf(x, z, CONIFER_ROOT);
     if (y0 < 0) return;
     const h = 14 + Math.floor(rng.random() * 11);                    // 14..24 tall
@@ -1147,9 +1186,8 @@ function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, 
   // form only spawns with room for its big crown (else a small jungle tree fills
   // the spot) so chunk-edge crowns aren't clipped to a flat half.
   const jungleTree = (x: number, z: number) => {
-    const giant = rng.random() < 0.18;   // always drawn (keeps the rng sequence stable)
-    const canGiant = x >= 4 && x <= size.width - 6 && z >= 4 && z <= size.width - 6;
-    if (giant && canGiant) {
+    const giant = rng.random() < 0.18;   // apron + per-cell RNG → giants draw in full at borders
+    if (giant) {
       const y0 = surfaceYOf(x, z, GRASS_ROOT);
       if (y0 < 0) return;
       const h = 12 + Math.floor(rng.random() * 8);                   // 12..19
@@ -1193,12 +1231,10 @@ function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, 
     const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
     const [dx, dz] = dirs[Math.floor(rng.random() * 4)];
     const slant = 2 + Math.floor(rng.random() * 2);
-    // Walk the kink, but stop before the canopy anchor would leave the chunk —
-    // otherwise the trunk-top + its whole umbrella fell out of bounds (no canopy).
+    // Walk the kink freely — the apron draws the umbrella in full even when the
+    // anchor lands in (or past) a neighbour chunk, so no edge clamp is needed.
     for (let i = 0; i < slant; i++) {
-      const nx = cx + dx, nz = cz + dz;
-      if (nx < 3 || nx > size.width - 4 || nz < 3 || nz > size.width - 4) break;
-      cx = nx; cz = nz; set(cx, ty, cz, BLOCK_IDS.acaciaLog); ty++;
+      cx += dx; cz += dz; set(cx, ty, cz, BLOCK_IDS.acaciaLog); ty++;
     }
     for (let i = -3; i <= 3; i++) for (let k = -3; k <= 3; k++) {     // flat umbrella
       const d2 = i * i + k * k;
@@ -1276,19 +1312,37 @@ function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, 
     }
   };
 
-  const cfg = makeSurfaceConfig(params, size);
-  // CELL 4 (was 6) → ~16 feature cells per chunk, so dense biomes (forest, jungle,
-  // dark/redwood forest) reach MC-like tree counts (forest ≈ oak0.6×16 ≈ 10/chunk).
+  // CELL 4 → ~16 feature cells per chunk, so dense biomes (forest, jungle, dark/
+  // redwood forest) reach MC-like tree counts (forest ≈ oak0.6×16 ≈ 10/chunk).
   const CELL = 4;
-  for (let gx = 0; gx < size.width; gx += CELL) {
-    for (let gz = 0; gz < size.width; gz += CELL) {
-      const x = gx + Math.floor(rng.random() * CELL);
-      const z = gz + Math.floor(rng.random() * CELL);
-      if (x < 1 || x >= size.width - 1 || z < 1 || z >= size.width - 1) continue;
+  // APRON-ITERATED, WORLD-CELL-SEEDED placement (fixes trees clipped at chunk
+  // borders — the visible grid + half-trees). The OLD loop iterated this chunk's
+  // local cells with the per-CHUNK rng, so a tree rooted near the edge had its
+  // overhang dropped and the neighbour chunk (different rng) never redrew it.
+  // NOW: iterate every WORLD cell that overlaps this chunk PLUS a MARGIN ring, seed
+  // a fresh RNG from the cell's WORLD coords, and let set()/setIfAir() clip to this
+  // chunk. Every chunk a tree touches computes the byte-identical tree (same cell
+  // seed, same columnSurface root) and draws only its own slice → seamless canopies,
+  // no grid. MARGIN ≥ the widest canopy reach (giant 2×2 + radius-4 crown ≈ 7).
+  const MARGIN = 8;
+  const W = size.width;
+  const cgx0 = Math.floor((worldX - MARGIN) / CELL), cgx1 = Math.floor((worldX + W + MARGIN) / CELL);
+  const cgz0 = Math.floor((worldZ - MARGIN) / CELL), cgz1 = Math.floor((worldZ + W + MARGIN) / CELL);
+  for (let cgx = cgx0; cgx <= cgx1; cgx++) {
+    for (let cgz = cgz0; cgz <= cgz1; cgz++) {
+      // per-CELL deterministic RNG (pure fn of world cell + seed) → the builder
+      // closures (which all reference `rng`) produce identical output everywhere.
+      rng = new RNG((Math.imul(cgx, 73856093) ^ Math.imul(cgz, 19349663) ^ Math.imul(params.seed, 83492791)) | 0);
+      const wx = cgx * CELL + Math.floor(rng.random() * CELL);
+      const wz = cgz * CELL + Math.floor(rng.random() * CELL);
+      const x = wx - worldX, z = wz - worldZ;          // local (may be <0 or ≥W; set() drops OOB)
+      // skip cells whose tree can't possibly reach this chunk
+      if (x <= -MARGIN || x >= W + MARGIN || z <= -MARGIN || z >= W + MARGIN) continue;
 
-      const { biome } = columnSurface(simplex, cfg, worldX + x, worldZ + z);
+      const biome = colF(wx, wz).biome;
       const f = BIOMES[biome].features;
       if (!f) continue;
+      const cold = biome === BIOME.taiga || biome === BIOME.snowy;   // snow-cap conifers (task: snowy taiga)
       // CUMULATIVE single-pick dispatch: each feature's probability is a slice of
       // [0,1); we walk the list subtracting slices so a biome with two features
       // (e.g. redwoodForest redwood0.3 + spruce0.42) gets BOTH at their declared
@@ -1306,7 +1360,7 @@ function generateFeatures(rng: RNG, simplex: SimplexNoise, params: ChunkParams, 
         pick(f.cherry, () => buildTree(x, z, GRASS_ROOT, BLOCK_IDS.cherryLog, BLOCK_IDS.cherryLeaves, 4, 6, 2, 3, 0.72)) ||
         pick(f.giantMushroom, () => buildGiantMushroom(x, z)) ||
         pick(f.redwood, () => redwood(x, z)) ||
-        pick(f.spruce, () => spruce(x, z)) ||
+        pick(f.spruce, () => spruce(x, z, cold)) ||
         pick(f.jungleTree, () => jungleTree(x, z)) ||
         pick(f.darkOak, () => darkOak(x, z)) ||
         pick(f.acacia, () => acacia(x, z)) ||
@@ -1860,11 +1914,13 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     // SIDE / BACK WINDOWS
     place(x0, base + 3, oz, B.glass); place(x1, base + 3, oz, B.glass);
     place(ox, base + 3, z1, B.glass); place(ox - 2, base + 3, z1, B.glass);
-    // BED (red wool + white pillow) in the back corner
-    place(x0 + 1, base + 2, z1 - 1, B.woolRed);
-    place(x0 + 2, base + 2, z1 - 1, B.woolRed);
-    place(x0 + 1, base + 2, z1 - 2, B.woolWhite);
-    place(x0 + 2, base + 2, z1 - 2, B.woolWhite);
+    // BED (real bed block) in the back corner + a chest, a crafting table, a small
+    // bookshelf and a potted flower — a furnished one-room cabin.
+    place(x0 + 1, base + 2, z1 - 1, B.bedHead); place(x0 + 1, base + 2, z1 - 2, B.bedFoot);
+    place(x0 + 2, base + 2, z1 - 1, B.chest);
+    place(x1 - 1, base + 2, z1 - 1, B.craftingTable); place(x1 - 1, base + 2, z1 - 2, B.bookshelf);
+    place(x1 - 1, base + 2, oz, B.furnace);
+    place(x0 + 1, base + 2, oz, B.barrel); place(x0 + 1, base + 3, oz, B.flowerPot);
     // FENCE-SUPPORTED FRONT PORCH AWNING: 2 fence posts + a roof slab plate
     place(ox - 2, base + 2, z0 - 1, B.oakFence);
     place(ox + 2, base + 2, z0 - 1, B.oakFence);
@@ -1931,11 +1987,15 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     }
     // INTERIOR STAIRCASE up to the upper floor (along +x wall, going -x)
     flight(x1 - 1, oz - 1, -1, 0, base + 2, 4, B.oakStairsNX, base + 5);
-    // UPSTAIRS BEDS (red wool + white pillow), two of them
-    place(x0 + 1, base + 6, z1 - 1, B.woolRed); place(x0 + 2, base + 6, z1 - 1, B.woolRed);
-    place(x0 + 1, base + 6, z1 - 2, B.woolWhite); place(x0 + 2, base + 6, z1 - 2, B.woolWhite);
-    place(x1 - 1, base + 6, z0 + 1, B.woolRed); place(x1 - 2, base + 6, z0 + 1, B.woolRed);
-    place(x1 - 1, base + 6, z0 + 2, B.woolWhite); place(x1 - 2, base + 6, z0 + 2, B.woolWhite);
+    // UPSTAIRS BEDS (real bed blocks), two of them, each with a chest
+    place(x0 + 1, base + 6, z1 - 1, B.bedHead); place(x0 + 1, base + 6, z1 - 2, B.bedFoot);
+    place(x0 + 2, base + 6, z1 - 1, B.chest); place(x0 + 2, base + 7, z1 - 1, B.flowerPot);
+    place(x1 - 1, base + 6, z0 + 1, B.bedHead); place(x1 - 1, base + 6, z0 + 2, B.bedFoot);
+    place(x1 - 2, base + 6, z0 + 1, B.chest);
+    // GROUND-FLOOR KITCHEN / WORKSHOP nook: furnace, crafting table, bookshelf
+    place(x0 + 1, base + 2, z1 - 1, B.furnace); place(x0 + 2, base + 2, z1 - 1, B.craftingTable);
+    place(x0 + 1, base + 2, z1 - 2, B.bookshelf); place(x1 - 1, base + 2, z1 - 1, B.barrel);
+    place(x1 - 1, base + 3, z1 - 1, B.flowerPot);
     // SMALL BACK BALCONY: slab platform + fence railing
     for (let dx = -1; dx <= 1; dx++) place(ox + dx, base + 6, z1 + 1, B.oakSlab);
     place(ox - 1, base + 7, z1 + 1, B.oakFence); place(ox + 1, base + 7, z1 + 1, B.oakFence);
@@ -2183,9 +2243,17 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     lay(ox, oz, rBase + 1, base, B.stoneBricks, top + 12);
     const sx0 = ox - rShaft, sx1 = ox + rShaft, sz0 = oz - rShaft, sz1 = oz + rShaft;
     const bx0 = ox - rBase,  bx1 = ox + rBase,  bz0 = oz - rBase,  bz1 = oz + rBase;
-    // INTERIOR FLOOR — smooth stone disc inside the shaft
+    // INTERIOR FLOOR — WOODEN (dark-oak plank) disc inside the shaft (was bare
+    // smooth stone). A furnished ground-floor nook is laid below, clear of the
+    // spiral's cells (the spiral only reaches base+2 at the door cell ox,oz-2).
     for (let wx = sx0; wx <= sx1; wx++) for (let wz = sz0; wz <= sz1; wz++)
-      place(wx, base + 1, wz, B.smoothStone);
+      place(wx, base + 1, wz, B.darkOakPlanks);
+    // GROUND-FLOOR FURNISHINGS against the back (+z) wall: a small library shelf,
+    // a chest, a crafting table and a potted flower — reads as a warden's quarters.
+    place(ox - 2, base + 2, oz + 2, B.bookshelf); place(ox - 1, base + 2, oz + 2, B.bookshelf);
+    place(ox + 2, base + 2, oz + 2, B.chest); place(ox + 1, base + 2, oz + 2, B.craftingTable);
+    place(ox - 2, base + 2, oz + 1, B.barrel); place(ox - 2, base + 3, oz + 1, B.flowerPot);
+    place(ox + 2, base + 5, oz, B.torch); place(ox - 2, base + 5, oz, B.torch);   // wall torches for light
     // PLINTH (9×9 × 2 high, weathered stone bricks)
     for (let wy = base + 1; wy <= base + 2; wy++) for (let wx = bx0; wx <= bx1; wx++) for (let wz = bz0; wz <= bz1; wz++) {
       if (wx === bx0 || wx === bx1 || wz === bz0 || wz === bz1)
@@ -2477,12 +2545,24 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     for (let i = 0; i < FOUNDATION; i++) {
       for (let dx = -1; dx <= 1; dx++) place(ox + dx, base + 1 + i, oz - r - 1 + i, SS_ST[2]);
     }
+    // OPEN THE STAIRWELL: steps i≥1 land INSIDE the foundation footprint, which the
+    // plinth fill packs solid up to FLOOR — so without this carve the staircase was
+    // buried in sandstone and the entrance read as a blank wall (the reported bug).
+    // Clear headroom above every step (and through to the corridor) so the climb
+    // from the desert up to the hall floor is actually walkable. All above `base`
+    // (above max ground) → apron-safe.
+    for (let i = 0; i < FOUNDATION; i++) {
+      for (let dx = -1; dx <= 1; dx++)
+        for (let wy = base + 2 + i; wy <= FLOOR + 4; wy++) place(ox + dx, wy, oz - r - 1 + i, B.air);
+    }
     // SIDE WALLS of the entry stair: sandstone curbs on either side so the
     // stair reads as a flanked grand approach (not a stair stranded on bare
-    // ground).
+    // ground). Placed AFTER the carve so the curbs aren't cleared.
     for (let i = 0; i < FOUNDATION; i++) {
       place(ox - 2, base + 1 + i, oz - r - 1 + i, B.smoothSandstone);
       place(ox + 2, base + 1 + i, oz - r - 1 + i, B.smoothSandstone);
+      place(ox - 2, base + 2 + i, oz - r - 1 + i, B.smoothSandstone);   // taller curb walls flank the open run
+      place(ox + 2, base + 2 + i, oz - r - 1 + i, B.smoothSandstone);
     }
     // DOOR + lintel at the inner end of the corridor
     place(ox, FLOOR + 1, oz - 4, B.oakDoorLowerClosed);
@@ -2555,8 +2635,10 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
   const mansion = (ox: number, oz: number) => {
     // Footprint: main rectangle ox±MX, oz∈[oz-MZ_S, oz+MZ_N]; wing extends
     // further on +z, tower attaches at NE corner (extending +z and +x).
-    const MX = 10, MZ_S = 8, MZ_N = 12;        // main block half-extents (asymmetric N/S)
-    const r = Math.max(MX, MZ_N) + 2;          // platform radius
+    // WIDER + THICKER (not taller): the footprint grew ~40% (21×21 → 29×28) while the
+    // storey heights (F0..F3/ROOF) are unchanged — bigger rooms, same silhouette.
+    const MX = 14, MZ_S = 11, MZ_N = 16;       // main block half-extents (asymmetric N/S)
+    const r = Math.max(MX, MZ_N) + 2;          // platform radius (18 ≪ STRUCT_MAX_R 56)
     const base = platform(ox, oz, r);
     if (base === null) return;
     lay(ox, oz, r, base, B.cobblestone, 26);
@@ -2613,21 +2695,14 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     chimney(mx0 + 2, oz, F0 + 2, ROOF + 8);
     chimney(mx1 - 2, oz, F0 + 2, ROOF + 8);
     chimney(ox, mz1 - 2, F0 + 2, ROOF + 8);
-    // ===== HUGE WINDOWS — clerestory rows on each storey =====
+    // ===== HUGE WINDOWS — clerestory rows on each storey (span the full wider walls) =====
     for (const fy of [F0, F1, F2]) {
-      for (let dx = -7; dx <= 7; dx += 3) {
-        if (((dx % 4) | 0) !== 0) {                                  // skip the timber posts
-          place(ox + dx, fy + 3, mz0, B.glass); place(ox + dx, fy + 3, mz1, B.glass);
-        }
+      for (let wx = mx0 + 2; wx <= mx1 - 2; wx += 3) {
+        place(wx, fy + 3, mz0, B.glass); place(wx, fy + 3, mz1, B.glass);
+        place(wx, fy + 4, mz0, OAK_ST[3]); place(wx, fy + 4, mz1, OAK_ST[2]);   // stair lintels
       }
-      for (let dz = -5; dz <= 9; dz += 3) {
-        if (((dz % 4) | 0) !== 0) {
-          place(mx0, fy + 3, oz + dz, B.glass); place(mx1, fy + 3, oz + dz, B.glass);
-        }
-      }
-      // Stair lintels above windows for medieval depth
-      for (let dx = -7; dx <= 7; dx += 3) if (((dx % 4) | 0) !== 0) {
-        place(ox + dx, fy + 4, mz0, OAK_ST[3]); place(ox + dx, fy + 4, mz1, OAK_ST[2]);
+      for (let wz = mz0 + 2; wz <= mz1 - 2; wz += 3) {
+        place(mx0, fy + 3, wz, B.glass); place(mx1, fy + 3, wz, B.glass);
       }
     }
     // ===== GRAND ENTRANCE on -z side — 3-wide stone-arched doorway with porch =====
@@ -2685,17 +2760,30 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     walls(mx0 + 1, mz0 + 1, PX_L - 1, oz - 1, F0 + 2, F0 + 4, B.bookshelf);
     place(PX_L - 1, F0 + 2, oz - 2, B.air);                          // door clear
     place(mx0 + 2, F0 + 2, mz0 + 2, B.darkOakLog); place(mx0 + 2, F0 + 3, mz0 + 2, B.oakSlab);  // lectern
+    place(mx0 + 2, F0 + 4, mz0 + 2, B.flowerPot);                    // bloom atop the lectern
+    place(mx0 + 4, F0 + 2, mz0 + 2, B.bookshelf); place(mx0 + 4, F0 + 2, mz0 + 3, B.chest);     // reading nook + chest
     place(mx0 + 3, F0 + 5, oz - 3, B.lantern);                       // hanging lantern (overworld light)
     // Dining hall (right side ground): long oak-slab table with bench seating
-    for (let wz = mz0 + 2; wz <= oz - 2; wz++) {
+    for (let wz = mz0 + 4; wz <= oz - 2; wz++) {
       place(PX_R + 2, F0 + 2, wz, B.oakSlab);                        // table
       place(PX_R + 1, F0 + 2, wz, OAK_ST[0]); place(PX_R + 3, F0 + 2, wz, OAK_ST[1]);  // benches
     }
+    place(PX_R + 2, F0 + 3, oz - 3, B.flowerPot);                    // centrepiece on the table
     place(PX_R + 2, F0 + 5, oz - 3, B.lantern);                      // hanging lantern
+    // KITCHEN nook at the front of the dining wing — a working hearth (lit furnace),
+    // crafting table, a second furnace, barrels and a supply chest.
+    place(PX_R + 1, F0 + 2, mz0 + 2, B.furnaceLit); place(PX_R + 2, F0 + 2, mz0 + 2, B.craftingTable);
+    place(PX_R + 3, F0 + 2, mz0 + 2, B.furnace);
+    place(PX_R + 1, F0 + 2, mz0 + 3, B.barrel); place(PX_R + 3, F0 + 2, mz0 + 3, B.chest);
+    place(PX_R + 1, F0 + 3, mz0 + 3, B.flowerPot);
     // Throne room / great hall (centre ground): high ceiling (no upper floor here)
     for (let wx = PX_L + 1; wx <= PX_R - 1; wx++) for (let wz = mz0 + 1; wz <= oz - 1; wz++) {
       place(wx, F1, wz, B.air);                                      // open up to floor 2
     }
+    // CATWALK: re-lay the F1 floor on the 2 central staircase columns across the
+    // open hall so the grand stair is CONTINUOUS — the open-to-F2 clear above would
+    // otherwise delete the floor the F1→F2 flight boards from, dead-ending the climb.
+    for (let wz = mz0 + 1; wz <= oz; wz++) { place(ox - 1, F1, wz, B.darkOakPlanks); place(ox, F1, wz, B.darkOakPlanks); }
     place(ox, F0 + 1, oz - 4, B.smoothStone); place(ox - 1, F0 + 1, oz - 4, B.oakStairsPX); place(ox + 1, F0 + 1, oz - 4, B.oakStairsNX);
     place(ox, F0 + 2, oz - 4, B.woolRed);    // throne (red wool seat) on smooth-stone dais
     place(ox - 1, F0 + 2, oz - 4, B.darkOakLog); place(ox + 1, F0 + 2, oz - 4, B.darkOakLog);
@@ -2704,19 +2792,21 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     for (let wz = mz0 + 1; wz <= oz - 4; wz++) place(ox, F0 + 1, wz, B.woolRed);
     // GRAND CHANDELIER over the great hall — a lantern hung from a log post
     place(ox, F1 + 4, oz - 2, B.darkOakLog); place(ox, F1 + 3, oz - 2, B.lantern);
-    // ===== BEDROOMS upstairs (F1 + F2) — beds in side rooms =====
+    // ===== BEDROOMS upstairs (F1 + F2) — REAL beds + chest/barrel nightstands =====
     for (const fy of [F1 + 1, F2 + 1]) {
-      // Left wing bedrooms
-      for (const cz of [mz0 + 2, mz0 + 5]) {
-        place(mx0 + 1, fy, cz, B.woolRed); place(mx0 + 2, fy, cz, B.woolRed);
-        place(mx0 + 1, fy, cz + 1, B.woolWhite); place(mx0 + 2, fy, cz + 1, B.woolWhite);
+      // Left-wing beds (head against the -x wall, foot toward the room) + a chest
+      // and a barrel nightstand with a potted flower on top.
+      for (const cz of [mz0 + 2, mz0 + 7]) {
+        place(mx0 + 1, fy, cz, B.bedHead); place(mx0 + 2, fy, cz, B.bedFoot);
+        place(mx0 + 1, fy, cz + 1, B.chest);
+        place(mx0 + 2, fy, cz + 1, B.barrel); place(mx0 + 2, fy + 1, cz + 1, B.flowerPot);
       }
-      // Right wing bedrooms
-      for (const cz of [mz0 + 2, mz0 + 5]) {
-        place(mx1 - 1, fy, cz, B.woolRed); place(mx1 - 2, fy, cz, B.woolRed);
-        place(mx1 - 1, fy, cz + 1, B.woolWhite); place(mx1 - 2, fy, cz + 1, B.woolWhite);
+      // Right-wing beds (head against the +x wall)
+      for (const cz of [mz0 + 2, mz0 + 7]) {
+        place(mx1 - 1, fy, cz, B.bedHead); place(mx1 - 2, fy, cz, B.bedFoot);
+        place(mx1 - 1, fy, cz + 1, B.chest);
+        place(mx1 - 2, fy, cz + 1, B.barrel); place(mx1 - 2, fy + 1, cz + 1, B.flowerPot);
       }
-      // Lights in each side room — hanging lanterns (overworld light)
       place(mx0 + 2, fy + 3, oz - 3, B.lantern);
       place(mx1 - 2, fy + 3, oz - 3, B.lantern);
     }
@@ -2791,69 +2881,61 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     place(ox + (R - 1), base + 2, oz, B.ice); place(ox - (R - 1), base + 2, oz, B.ice);   // ice windows
     place(ox, base + 2, oz + (R - 1), B.ice);
     place(ox, base + R, oz, B.lantern);                           // apex hanging lantern
-    place(ox + 1, base + 1, oz + 1, B.woolRed); place(ox + 2, base + 1, oz + 1, B.woolWhite); // a fur bed
+    place(ox + 1, base + 1, oz + 1, B.bedFoot); place(ox + 2, base + 1, oz + 1, B.bedHead);   // a real bed
+    place(ox - 2, base + 1, oz + 1, B.chest); place(ox - 2, base + 1, oz - 1, B.craftingTable);   // supplies
   };
   // ===========================================================================
   //  COMMUNITY-STYLE NEW STRUCTURES
   // ===========================================================================
 
-  // Campsite: a small wilderness camp — log seats around a proper campfire
-  // (the campfire block, NOT magma + glowstone — overworld light source),
-  // a wool tent (red+white), a log-pile, a small stack of crates (oak planks),
-  // and a few flowers. Reads as "people travelled here".
+  // Campsite: a wilderness camp at REAL in-game scale — a ridge tent a 2-block
+  // player can walk into and stand up in (7-wide A-frame, ridge 3 blocks of head-
+  // room over a plank floor, a bed + chest inside), a proper campfire on a stone
+  // hearth ringed by log seats, a crafting table + barrel + flower pot, a log pile,
+  // and a trail. The old camp was a 3-wide solid-wool prop you couldn't enter.
   const campsite = (ox: number, oz: number, rng: RNG) => {
-    const r = 4, base = platform(ox, oz, r);
+    const r = 7, base = platform(ox, oz, r);
     if (base === null) return;
-    // Light dirt fill into terrain hollows (so tent / log seats / log pile
-    // don't float over a dip in the ground) — natural surface tiles at the
-    // platform max are preserved.
-    lay(ox, oz, r, base, B.dirt, 4);
-    // CAMPFIRE: a real campfire block (warm overworld light, flickers) atop a
-    // cobble + mossy-cobble fire ring. Replaces the magma + glowstone "fake fire"
-    // — campfire is the proper overworld block for this.
-    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const)
-      place(ox + dx, base, oz + dz, B.cobblestone);
-    for (const [dx, dz] of [[1, 1], [-1, 1], [1, -1], [-1, -1]] as const)
-      place(ox + dx, base, oz + dz, B.mossyCobblestone);
-    place(ox, base, oz, B.cobblestone);                         // hearth stone under the campfire
-    place(ox, base + 1, oz, B.campfire);                        // actual campfire block ("the fire")
-    // LOG SEATS around the fire (at 3 of the 4 cardinals)
-    place(ox + 2, base + 1, oz, B.strippedOakLog);
-    place(ox - 2, base + 1, oz, B.strippedOakLog);
-    place(ox, base + 1, oz + 2, B.strippedOakLog);
-    // TENT (wool, red roof + white walls, A-frame): use stairs to suggest slopes.
-    // Tent footprint: 3×4 starting at ox-3, oz+2..oz+5
-    const tx = ox - 3, tz0 = oz + 2, tz1 = oz + 5;
+    lay(ox, oz, r, base, B.dirt, 7);                            // clear 7 tall → standable tent
+    const F = base + 1;                                          // floor-top level (items sit here)
+    // ---- CAMPFIRE on a 3×3 cobble / mossy hearth ----
+    for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++)
+      place(ox + dx, base, oz + dz, (dx === 0 && dz === 0) ? B.cobblestone : (dx && dz) ? B.mossyCobblestone : B.cobblestone);
+    place(ox, F, oz, B.campfire);
+    // log seats ringing the fire (sit on the -x / +x / -z sides; tent is on +z)
+    place(ox - 2, F, oz, B.strippedOakLog); place(ox + 2, F, oz, B.strippedOakLog); place(ox, F, oz - 2, B.strippedOakLog);
+    // ---- TENT: 7-wide (x: ox-3..ox+3) × 5-deep (z: oz+3..oz+7) ridge A-frame ----
+    const tz0 = oz + 3, tz1 = oz + 7, RIDGE = base + 4;
+    fillRect(ox - 3, tz0, ox + 3, tz1, base, B.oakPlanks);       // plank groundsheet
     for (let dz = tz0; dz <= tz1; dz++) {
-      // base ridge of fabric
-      place(tx, base + 1, dz, B.woolWhite); place(tx + 2, base + 1, dz, B.woolWhite);
-      // roof (slanted using stairs)
-      place(tx, base + 2, dz, OAK_ST[0]);
-      place(tx + 2, base + 2, dz, OAK_ST[1]);
-      place(tx + 1, base + 2, dz, B.woolRed);
-      place(tx + 1, base + 3, dz, B.woolRed);
+      for (let dx = -3; dx <= 3; dx++) {
+        const ry = RIDGE - Math.abs(dx);                        // A-frame: peak at the ridge, eaves low
+        const roof = (Math.abs(dx) === 3) ? B.woolWhite : B.woolRed;   // white eaves, red canvas
+        place(ox + dx, ry, oz + dz, roof);
+        if (dz === tz1) for (let wy = F; wy < ry; wy++)          // closed BACK gable wall
+          place(ox + dx, wy, oz + dz, Math.abs(dx) === 3 ? B.woolWhite : B.woolRed);
+      }
     }
-    // tent tie-poles (fence at corners)
-    place(tx, base + 1, tz0 - 1, B.oakFence);
-    place(tx + 2, base + 1, tz0 - 1, B.oakFence);
-    // LOG PILE (3 stripped logs stacked + a couple cross-laid)
-    place(ox + 2, base + 1, oz - 2, B.strippedOakLog);
-    place(ox + 3, base + 1, oz - 2, B.strippedOakLog);
-    place(ox + 2, base + 2, oz - 2, B.strippedOakLog);
-    place(ox + 4, base + 1, oz - 2, B.strippedOakLog);
-    // CRATE STACK (oak slabs as crate lids)
-    place(ox - 3, base + 1, oz - 2, B.oakPlanks);
-    place(ox - 3, base + 2, oz - 2, B.oakSlab);
-    place(ox - 4, base + 1, oz - 2, B.oakPlanks);
-    // SCATTERED FLOWERS / TALL GRASS
-    place(ox + 3, base + 1, oz + 3, B.flowerPoppy);
-    place(ox - 3, base + 1, oz - 3, B.flowerDandelion);
-    place(ox + 4, base + 1, oz + 1, B.tallGrassLower);
-    if (base + 2 < H) place(ox + 4, base + 2, oz + 1, B.tallGrassUpper);
-    // SHORT TRAIL leaving the camp (twisting + thinning)
+    // guy-rope fence pegs at the open front corners
+    place(ox - 3, F, tz0 - 1, B.oakFence); place(ox + 3, F, tz0 - 1, B.oakFence);
+    // ---- TENT INTERIOR (player can stand in the centre strip) ----
+    place(ox - 1, F, oz + 6, B.bedFoot); place(ox - 1, F, oz + 7, B.bedHead);   // a real bed
+    place(ox + 2, F, oz + 7, B.chest);                          // supplies chest
+    place(ox + 2, F, oz + 6, B.barrel);                         // water/food barrel
+    place(ox, base + 3, oz + 5, B.lantern);                     // lantern hung from the ridge
+    // ---- CAMP KIT around the fire ----
+    place(ox - 3, F, oz - 1, B.craftingTable);
+    place(ox - 3, F, oz, B.barrel); place(ox - 3, F + 1, oz, B.flowerPot);   // pot on the barrel
+    // log pile (stacked + cross-laid stripped logs)
+    place(ox + 3, F, oz - 2, B.strippedOakLog); place(ox + 4, F, oz - 2, B.strippedOakLog);
+    place(ox + 3, F + 1, oz - 2, B.strippedOakLog); place(ox + 3, F, oz - 3, B.strippedOakLog);
+    // scattered flowers / tall grass
+    place(ox + 3, F, oz + 1, B.flowerPoppy); place(ox - 4, F, oz - 3, B.flowerDandelion);
+    place(ox + 4, F, oz + 2, B.tallGrassLower); if (base + 2 < H) place(ox + 4, F + 1, oz + 2, B.tallGrassUpper);
+    // short trail leaving camp
     if (rng.random() < 0.7) {
       const ang = rng.random() * Math.PI * 2;
-      drawTrailPath(ox, oz - 4, 12 + Math.floor(rng.random() * 8), ang);
+      drawTrailPath(ox, oz - 5, 12 + Math.floor(rng.random() * 8), ang);
     }
   };
 

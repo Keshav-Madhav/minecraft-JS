@@ -83,6 +83,9 @@ export class Player {
   flySpeedScale = 1;   // scroll wheel adjusts this while flying (creative / survival-flight)
   // Space held (regardless of flying) — read by Physics for swim-up while in water.
   wantsUp = false;
+  // Set by Physics each substep: true while the body is submerged in open water.
+  // Lets the auto-step lift the player OUT of the water onto a 1-block shore ledge.
+  inWater = false;
 
   cameraHelper = new Three.CameraHelper(this.camera);
 
@@ -248,8 +251,9 @@ export class Player {
     const wl = Math.hypot(wx, wf);
     if (wl > 0) { wx /= wl; wf /= wl; }
 
-    // sprint only counts while actually pushing forward
-    this.sprinting = (this.sprintKey || this.#doubleTapSprint) && wf > 0.1;
+    // sprint only counts while actually pushing forward — and NOT in water, where
+    // Shift means "dive" (else a dive would also sprint-boost speed + the FOV kick).
+    this.sprinting = (this.sprintKey || this.#doubleTapSprint) && wf > 0.1 && !this.inWater;
     const speed = this.sprinting ? this.maxSpeed * SPRINT_MULT : this.maxSpeed;
 
     if (wl > 0) {
