@@ -1,6 +1,7 @@
 import { resources } from "./blocks";
 import { Player } from "./player";
 import { World } from "./world";
+import { findNearestBiome, findNearestStructure, compass, BIOME_TARGETS, STRUCTURE_TARGETS, type FindResult } from "./finder";
 
 export type GameMode = 'survival' | 'creative' | 'spectator';
 
@@ -34,6 +35,7 @@ export type QualityControls = {
   getShadowRange: () => number, setShadowRange: (v: number) => void,
   getBlockLights: () => boolean, setBlockLights: (v: boolean) => void,
   getClouds: () => boolean, setClouds: (v: boolean) => void,
+  getFrustumStreaming: () => boolean, setFrustumStreaming: (v: boolean) => void,
   getStatsOverlay: () => boolean, setStatsOverlay: (v: boolean) => void,
   getUltraGraphics: () => boolean, setUltraGraphics: (v: boolean) => void,
 };
@@ -185,7 +187,7 @@ export function createMenu(opts: MenuOptions): MenuController {
   const tabbar = el('div', 'menu__tabs');
   const bodies: Record<string, HTMLElement> = {};
   const tabBtns: Record<string, HTMLElement> = {};
-  const TABS = ['Stats', 'Settings', 'Mode', 'Controls'] as const;
+  const TABS = ['Stats', 'Settings', 'Finder', 'Mode', 'Controls'] as const;
   const bodyWrap = el('div', 'menu__bodywrap');
   let active = 'Settings';
   const selectTab = (name: string) => {
@@ -233,6 +235,35 @@ export function createMenu(opts: MenuOptions): MenuController {
     statRows['GPU geometries'].textContent = String(s.geometries);
     statRows['GPU textures'].textContent = String(s.textures);
   };
+
+  // ===== FINDER tab =========================================================
+  // Locate the nearest biome / structure (direction + distance + coords). Pure
+  // function of the world seed, so it works without loading the target's chunks.
+  const finderBody = bodies['Finder'];
+  finderBody.append(el('div', 'menu__hint', 'Find the nearest biome or structure. Click a target — its direction, distance and coordinates appear below (computed straight from the world seed; open the map to navigate there).'));
+  const finderResult = el('div', 'finder-result', 'Pick a target to locate.');
+  finderBody.append(finderResult);
+  const showFind = (label: string, res: FindResult) => {
+    if (!res) { finderResult.textContent = `${label}: none found within range.`; return; }
+    const dx = res.x - player.position.x, dz = res.z - player.position.z;
+    finderResult.textContent = `${label}  —  ${Math.round(res.dist).toLocaleString()} blocks ${compass(dx, dz)}  →  (${Math.round(res.x)}, ${Math.round(res.z)})`;
+  };
+  const biomeGrid = el('div', 'finder-grid');
+  addSection(finderBody, 'Biomes', false).append(biomeGrid);
+  for (const t of BIOME_TARGETS) {
+    addButton(biomeGrid, t.label, () => {
+      finderResult.textContent = `Searching for ${t.label}…`;
+      // defer one frame so the "Searching…" text paints before the (brief) scan
+      setTimeout(() => showFind(t.label, findNearestBiome(world.sampler, player.position.x, player.position.z, t.id)), 0);
+    });
+  }
+  const structGrid = el('div', 'finder-grid');
+  addSection(finderBody, 'Structures', false).append(structGrid);
+  for (const t of STRUCTURE_TARGETS) {
+    addButton(structGrid, t.label, () => {
+      showFind(t.label, findNearestStructure(world.sampler, world.params.seed, player.position.x, player.position.z, t.kind));
+    });
+  }
 
   // ===== MODE tab ===========================================================
   const modeBody = bodies['Mode'];
@@ -321,6 +352,7 @@ export function createMenu(opts: MenuOptions): MenuController {
   }));
   remember(addToggle(adv, 'Block Lights', quality.getBlockLights, quality.setBlockLights));
   remember(addToggle(adv, 'Clouds', quality.getClouds, quality.setClouds));
+  remember(addToggle(adv, 'Frustum Culling (saves RAM)', quality.getFrustumStreaming, quality.setFrustumStreaming));
   remember(addSlider(adv, 'Resolution Scale', {
     min: 0.5, max: 1, step: 0.05, decimals: 2,
     get: () => settings.resolutionScale, set: (v) => { settings.resolutionScale = v; },

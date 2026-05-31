@@ -712,11 +712,21 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   //    only the |n|≈0 ridgelines rise → genuine connected ranges;
   //  • drop the ×1.25 and the fine octaves (the jagged spines).
   const mountainous = sm(c.erosion, -0.20, -0.55);
+  // RANGE gate: ONLY the strongest (very-low-erosion) COOL terrain becomes an
+  // extreme, snow-capped mountain RANGE. Everywhere else, low-erosion terrain gets
+  // just the modest BASE amplitude (mountainAmp) → normal mounds / small peaks, so a
+  // random mountain between desert & forest no longer spikes to world height. The
+  // EXTRA height is added only where rangeGate is high (and that same gate tags the
+  // `mountains` biome below, so the tall ranges and the snowy biome coincide).
+  const rangeGate = sm(c.erosion, -0.32, -0.62) * (1 - sm(c.temp, 0.0, 0.20));
   const rA = fbm(simplex, wx + 1300, wz + 1300, fs * 2.2, 3);    // big primary ridgelines (~570b)
   const rB = fbm(simplex, wx + 4300, wz + 2300, fs * 1.3, 2);    // coarse secondary ridges
   let ridge = Math.pow(1 - Math.abs(rA), 3) * 0.85 + Math.pow(1 - Math.abs(rB), 3) * 0.15;
   ridge = Math.max(0, ridge - 0.12);                            // flat between ridgelines
-  const relief = ridge * mountainAmp * land * (mountainous * mountainous);
+  // Range bonus capped at 90 (not higher) so the worst case — spline ceiling
+  // (baseLand+32 ≈ 170) + ridge(0.88)·(60+90) + ripple ≈ 304 — stays safely under
+  // maxY (319), i.e. no FLAT-TOPPED peaks clipped against the world ceiling.
+  const relief = ridge * land * (mountainous * mountainous) * (mountainAmp + 90 * rangeGate);
   baseH += relief;
   // Fine ground ripple, gated to land (×land) so plains/coast stay smooth (it used
   // to ripple every column incl. beaches → ragged shorelines).
@@ -857,11 +867,12 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   const iceSpikesMem = sm(tempEff, -0.30, -0.52)
     * sm(fbm(simplex, wx + 44000, wz + 44000, fs * 4, 2), 0.40, 0.58);
 
-  // MOUNTAIN-RANGE biome: genuinely mountain-forming (very low erosion) high terrain
-  // that ISN'T hot → a snow-capped rocky range. All-continuous gates (erosion /
-  // altitude / temp) → smooth borders. Hot regions keep their desert/savanna identity
-  // (bare-rock tops, no snow) so the range only appears where snow makes sense.
-  const mountainsMem = sm(c.erosion, -0.28, -0.60) * sm(aboveSea, 34, 64) * (1 - sm(c.temp, 0.12, 0.34));
+  // MOUNTAIN-RANGE biome: tagged by the SAME rangeGate that gives the extreme height
+  // (so the tall ranges and the snowy biome coincide), once the column is actually
+  // high. Smooth borders (all-continuous gates). Hot regions keep their desert/savanna
+  // identity (rangeGate≈0 there → bare-rock tops, no snow) so the range only appears
+  // where snow makes sense.
+  const mountainsMem = rangeGate * sm(aboveSea, 40, 72);
 
   // --- biome selection: specials (by gate, priority order) → water bands → grid ---
   // The badlands shells (core → red-desert → desert) are checked before the grid

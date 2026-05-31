@@ -551,3 +551,11 @@ body {
 .ui-seg__btn { background: #5a5a5a; color: #d0d0d0; text-shadow: 1px 1px 0 #000; border: 2px solid; border-color: #7d7d7d #2a2a2a #2a2a2a #7d7d7d; }
 .ui-seg__btn:hover { background: #6a6a6a; color: #fff; }
 .ui-seg__btn--on { background: #6d8a4f; color: #fff; border-color: #9bbf78 #2c3a1f #2c3a1f #9bbf78; }
+/* finder tab */
+.finder-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 6px; padding: 6px 0; }
+.finder-grid .ui-btn { width: 100%; }
+.finder-result {
+  margin: 8px 0; padding: 10px 12px; background: #1e1e1e; color: #7bdc6a;
+  border: 2px solid; border-color: #0a0a0a #4a4a4a #4a4a4a #0a0a0a;
+  text-shadow: 1px 1px 0 #000; font-size: 13px; min-height: 18px;
+}

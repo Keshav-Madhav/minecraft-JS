@@ -658,10 +658,10 @@ function applyQualityPreset(p: QualityPreset) {
     applyShadowQuality('high'); lightInterval = 1; lightManager.setEnabled(true);
     settings.resolutionScale = 1; clouds.visible = true;
   } else if (p === 'ultra') {
-    // Max it out: 64-chunk view, foliage far out, 8192 soft shadows. VERY heavy on
-    // RAM (~16k resident chunks) — for strong machines; dial the Render Distance
-    // slider back if it stutters/OOMs. (Ultra Graphics post-FX is a separate toggle.)
-    world.drawDistance = 64; world.setFoliage(true, 48);
+    // Max it out: 32-chunk view, foliage far out, 8192 soft shadows. The Render
+    // Distance slider goes to 64 for those who want to push it (very heavy on RAM),
+    // but the preset stays at a sane 32. (Ultra Graphics post-FX is a separate toggle.)
+    world.drawDistance = 32; world.setFoliage(true, 32);
     applyShadowQuality('ultra'); lightInterval = 1; lightManager.setEnabled(true);
     settings.resolutionScale = 1; clouds.visible = true;
   }
@@ -737,6 +737,8 @@ const menu = createMenu({
     setBlockLights: (v) => { lightManager.setEnabled(v); qualityPreset = 'custom'; },
     getClouds: () => clouds.visible,
     setClouds: (v) => { clouds.visible = v; qualityPreset = 'custom'; },
+    getFrustumStreaming: () => world.frustumStreaming,
+    setFrustumStreaming: (v) => { world.frustumStreaming = v; world.forceRescan(); qualityPreset = 'custom'; },
     getStatsOverlay: () => settings.statsOverlay,
     setStatsOverlay: (v) => { settings.statsOverlay = v; updateHudVisibility(); },
     getUltraGraphics: () => ultraGraphics,
@@ -779,6 +781,7 @@ function animate() {
   worldMap.update();
 
   if (!worldMap.isOpen()) {
+    world.activeCamera = mode === 'spectator' ? spectator.camera : player.camera;   // frustum-streaming view
     world.update(player);
     world.processQueues();
     if (lightManager.enabled && (lightTick++ % lightInterval) === 0) {

@@ -8,6 +8,16 @@ import { ResourceGenInfo, BLOCK_IDS, TOGGLE, DOOR_PART } from './blockTypes';
 import { GeometryArrays } from './chunkMesh';
 import type { WorkerRequest, MeshMessage, GeometryPayload } from './chunkWorker';
 
+// Frustum-streaming tuning (see World.frustumStreaming):
+const FRUSTUM_MARGIN = 40;      // world units to fatten the frustum (hysteresis vs rotation churn)
+// Chunks within this Chebyshev radius are ALWAYS resident regardless of view — covers
+// the minimap (~±6 chunks) + immediate surroundings, so the minimap never goes blank
+// and turning never pops in NEARBY terrain. Frustum culling then trims only the FAR
+// ring (rings 7..drawDistance), which is where the chunk count (and RAM) explodes at
+// high draw distance — so the win scales with draw distance while play stays smooth.
+const FRUSTUM_NEAR_KEEP = 6;
+const VIEW_YAW_RESCAN = 0.15;   // camera-yaw delta (rad, ~8.5°) that triggers a frustum re-evaluation
+
 type chunkCoords = { x: number, z: number };
 
 const FACE_NEIGHBOURS: ReadonlyArray<readonly [number, number, number]> = [
@@ -36,10 +46,12 @@ export class World extends Three.Group {
   params: ChunkParams = {
     // scale = feature breadth (continents ~3.5x this); magnitude = mountain
     // height; offset = land-height bias above sea (higher => more/larger land).
-    // Large scale keeps the world traversible (broad, gentle terrain) instead
-    // of a pretty-but-miniature diorama. magnitude raised 85→150 for tall ranges.
+    // Large scale keeps the world traversible (broad, gentle terrain) instead of a
+    // pretty-but-miniature diorama. magnitude = the BASE mountain amplitude (modest,
+    // normal mounds/peaks); a +110 RANGE bonus in columnSurface lifts ONLY the cold
+    // very-low-erosion mountain RANGES to their extreme, snow-capped height.
     seed: 0,
-    terrain: { scale: 260, magnitude: 150, offset: 10, waterOffset: 128 },
+    terrain: { scale: 260, magnitude: 60, offset: 10, waterOffset: 128 },
     trees: {
       trunk: { minHeight: 4, maxHeight: 7 },
       canopy: { minRadius: 2, maxRadius: 3, density: 0.7 },
@@ -99,6 +111,21 @@ export class World extends Three.Group {
   private lastDrawDistance = NaN;
   private visibleKeys = new Set<string>();
   private removalPending = false;
+
+  // VIEW-FRUSTUM STREAMING: keep only chunks in/near the camera frustum RESIDENT to
+  // bound RAM (chunks behind/beside the view UNLOAD; they re-stream on turn). A "fat"
+  // frustum (planes pushed out by FRUSTUM_MARGIN) + a NEAR_KEEP always-resident radius
+  // give hysteresis so small turns don't thrash; rescans also fire on camera ROTATION
+  // (not just chunk-cross). Player edits survive unload (dataStore re-applies on
+  // reload). Toggleable; default ON. NOTE: behind-camera chunks won't cast shadows and
+  // the minimap shows only the loaded cone — both acceptable for the RAM win.
+  frustumStreaming = true;
+  activeCamera: Three.Camera | null = null;   // the rendering camera, set by main.ts each frame
+  private lastViewYaw = 999;
+  private readonly _frustum = new Three.Frustum();
+  private readonly _projScreen = new Three.Matrix4();
+  private readonly _chunkBox = new Three.Box3();
+  private readonly _viewDir = new Three.Vector3();
 
   dataStore = new DataStore();
 
@@ -221,13 +248,23 @@ export class World extends Three.Group {
     // Rescan when the player crossed a chunk boundary OR draw distance changed
     // (e.g. Apply lowered it — otherwise the now-unused chunks would never be
     // removed). While chunks merely stream in, processQueues drains `pending`.
+    // With frustum streaming, the visible set ALSO changes as the camera rotates —
+    // rescan when the view yaw turns past VIEW_YAW_RESCAN (not every frame).
+    let viewYaw = this.lastViewYaw;
+    if (this.frustumStreaming && this.activeCamera) {
+      this.activeCamera.getWorldDirection(this._viewDir);
+      viewYaw = Math.atan2(this._viewDir.x, this._viewDir.z);
+    }
+    const yawTurned = this.frustumStreaming && this.activeCamera &&
+      Math.abs(((viewYaw - this.lastViewYaw + Math.PI * 3) % (Math.PI * 2)) - Math.PI) > VIEW_YAW_RESCAN;
     const rescan = c.x !== this.lastPlayerChunkX || c.z !== this.lastPlayerChunkZ ||
-      this.drawDistance !== this.lastDrawDistance;
+      this.drawDistance !== this.lastDrawDistance || yawTurned;
 
     if (rescan) {
       this.lastPlayerChunkX = c.x;
       this.lastPlayerChunkZ = c.z;
       this.lastDrawDistance = this.drawDistance;
+      this.lastViewYaw = viewYaw;
 
       const visibleChunks = this.getVisibleChunks(player);
       this.visibleKeys = new Set(visibleChunks.map(({ x, z }) => this.chunkKey(x, z)));
@@ -352,13 +389,37 @@ export class World extends Three.Group {
     return chunk && chunk.loaded ? chunk.getMapTileCanvas() : null;
   }
 
+  // Force the next update() to re-evaluate the visible set (e.g. after toggling
+  // frustum streaming, so loaded chunks immediately cull/restore without waiting
+  // for the player to cross a chunk or turn).
+  forceRescan() { this.lastPlayerChunkX = NaN; this.lastViewYaw = 999; }
+
   getVisibleChunks(player: Player) {
     const visibleChunks: chunkCoords[] = [];
     const coords = this.worldToChunkCoords(player.position.x, player.position.y, player.position.z);
     const { x, z } = coords.chunk;
+    const dd = this.drawDistance;
 
-    for (let i = x - this.drawDistance; i <= x + this.drawDistance; i++) {
-      for (let j = z - this.drawDistance; j <= z + this.drawDistance; j++) {
+    // Build the fat view frustum once (when frustum streaming is on + a camera is set).
+    const useFrustum = this.frustumStreaming && !!this.activeCamera;
+    if (useFrustum) {
+      const cam = this.activeCamera!;
+      cam.updateMatrixWorld();
+      this._projScreen.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+      this._frustum.setFromProjectionMatrix(this._projScreen);
+      for (const p of this._frustum.planes) p.constant += FRUSTUM_MARGIN;   // fatten → hysteresis
+    }
+    const W = this.chunkSize.width, H = this.chunkSize.height;
+
+    for (let i = x - dd; i <= x + dd; i++) {
+      for (let j = z - dd; j <= z + dd; j++) {
+        if (useFrustum && Math.max(Math.abs(i - x), Math.abs(j - z)) > FRUSTUM_NEAR_KEEP) {
+          // keep ONLY chunks whose full-height column intersects the fat frustum
+          // (near chunks above are always kept for physics / instant turn-around).
+          this._chunkBox.min.set(i * W, 0, j * W);
+          this._chunkBox.max.set(i * W + W, H, j * W + W);
+          if (!this._frustum.intersectsBox(this._chunkBox)) continue;
+        }
         visibleChunks.push({ x: i, z: j });
       }
     }
