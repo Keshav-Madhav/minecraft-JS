@@ -629,13 +629,27 @@ export class World extends Three.Group {
     return this.chunkMap.get(this.chunkKey(x, z));
   }
 
+  // MULTIPLAYER hook: fired with the FINAL world-space result of every LOCAL
+  // edit (place / remove / door-toggle) — exactly what a peer must replay to
+  // converge. Fired only when the block actually CHANGED (a refused add — e.g.
+  // target not air — must not broadcast), and muted while applying edits that
+  // arrived FROM the network so they can't echo back.
+  onEdit?: (x: number, y: number, z: number, id: number) => void;
+  private muteEditEvents = false;
+  private emitEdit(x: number, y: number, z: number, id: number) {
+    if (!this.muteEditEvents) this.onEdit?.(x, y, z, id);
+  }
+
   setBlock(x: number, y: number, z: number, id: number) {
     const coords = this.worldToChunkCoords(x, y, z);
     const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
 
     if (chunk) {
+      const before = chunk.getBlockId(coords.block.x, coords.block.y, coords.block.z);
       chunk.addBlock(coords.block.x, coords.block.y, coords.block.z, id, this.getWorldBlock, this.getGrassTint);
       this.remeshAround(x, y, z, chunk);
+      const after = chunk.getBlockId(coords.block.x, coords.block.y, coords.block.z);
+      if (after !== before) this.emitEdit(x, y, z, after);
     }
   }
 
@@ -644,8 +658,35 @@ export class World extends Three.Group {
     const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
 
     if (chunk) {
+      const before = chunk.getBlockId(coords.block.x, coords.block.y, coords.block.z);
       chunk.removeBlock(coords.block.x, coords.block.y, coords.block.z, this.getWorldBlock, this.getGrassTint);
       this.remeshAround(x, y, z, chunk);
+      if (before !== BLOCK_IDS.air) this.emitEdit(x, y, z, BLOCK_IDS.air);
+    }
+  }
+
+  // Apply a block edit that arrived FROM a peer. Overwrite semantics
+  // (last-write-wins — the remote already validated its own action). If the
+  // chunk isn't resident here (different draw distance / frustum streaming),
+  // persist straight to the dataStore: loadPlayerChanges() re-applies it when
+  // the chunk streams in — same mechanism that makes local edits survive unload.
+  applyRemoteEdit(x: number, y: number, z: number, id: number) {
+    this.muteEditEvents = true;   // a replayed edit must not re-broadcast
+    try {
+      const coords = this.worldToChunkCoords(x, y, z);
+      const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
+      if (chunk && chunk.loaded) {
+        chunk.setBlockEdit(coords.block.x, coords.block.y, coords.block.z, id, this.getWorldBlock, this.getGrassTint);
+        this.remeshAround(x, y, z, chunk);
+      } else {
+        this.dataStore.set({
+          chunkX: coords.chunk.x, chunkZ: coords.chunk.z,
+          blockX: coords.block.x, blockY: coords.block.y, blockZ: coords.block.z,
+          blockID: id,
+        });
+      }
+    } finally {
+      this.muteEditEvents = false;
     }
   }
 
@@ -658,7 +699,11 @@ export class World extends Three.Group {
     const setOne = (wx: number, wy: number, wz: number, nid: number) => {
       const c = this.worldToChunkCoords(wx, wy, wz);
       const chunk = this.getChunk(c.chunk.x, c.chunk.z);
-      if (chunk) { chunk.setBlockEdit(c.block.x, c.block.y, c.block.z, nid, this.getWorldBlock, this.getGrassTint); this.remeshAround(wx, wy, wz, chunk); }
+      if (chunk) {
+        chunk.setBlockEdit(c.block.x, c.block.y, c.block.z, nid, this.getWorldBlock, this.getGrassTint);
+        this.remeshAround(wx, wy, wz, chunk);
+        this.emitEdit(wx, wy, wz, nid);   // peers replay the RESULTING id (no double-toggle)
+      }
     };
     setOne(x, y, z, toggled);
     if (DOOR_PART[id] === 1) {                       // doors are 2-tall — toggle the other half too

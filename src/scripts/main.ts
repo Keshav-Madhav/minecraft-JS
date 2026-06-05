@@ -13,6 +13,8 @@ import { biomeTint, biomeWaterHex } from './chunkGen';
 import { updatePlantWind, toggleReferenceTextures, updateCubeUniforms, setFoliageShadows, registerFogShader, updateFogCamera, CYL_FOG_FRAGMENT } from './blockArrayMaterial';
 import { LightManager } from './lightManager';
 import { PostFX } from './ultraGraphics';
+import { Net } from './net';
+import { RemotePlayer } from './remotePlayer';
 
 // Get window size
 let winWidth = window.innerWidth;
@@ -364,7 +366,8 @@ function configureMap() {
   worldMap.configure(world.params, world.chunkSize, world.params.terrain.waterOffset);
 }
 configureMap();
-world.onAfterGenerate = configureMap;
+// (world.onAfterGenerate is assigned in the MULTIPLAYER block below — it runs
+// configureMap first, then re-snapshots the world to a connected guest.)
 
 const modelLoader = new ModelLoader();
 modelLoader.loadModels((models) => {
@@ -751,11 +754,83 @@ function setUltraGraphics(on: boolean) {
 setUpLights();
 applyQualityPreset(qualityPreset);   // sets draw distance + shadows + lights + resolution (calls updateViewDistance itself)
 
+// ===========================================================================
+//  MULTIPLAYER (P2P co-op via net.ts)
+//  The world never crosses the wire — terrain is deterministic from
+//  params.seed, so the host sends { params, edits, timeOfDay } once and the
+//  guest regenerates locally. After that: tiny edit events + ~20 Hz positions.
+// ===========================================================================
+const net = new Net();
+const remote = new RemotePlayer();
+scene.add(remote.group);
+
+const POS_SEND_MS = 50;        // ~20 Hz — the avatar interpolates between these
+const TIME_SYNC_MS = 10_000;   // host re-syncs the day/night clock occasionally
+let lastPosSendAt = 0, lastTimeSyncAt = 0;
+const _netEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+
+net.getInitPayload = () => ({ params: world.params, edits: world.dataStore.data, timeOfDay });
+
+// GUEST: adopt the host's world wholesale — same machinery as world.load().
+net.onInit = ({ params, edits, timeOfDay: tod }) => {
+  world.params = params;
+  world.dataStore.data = edits;
+  world.dataStore.rebuildIndex();   // data was assigned directly (bypassing set())
+  timeOfDay = tod;
+  world.generate(false);            // regenerate = the host's exact terrain (deterministic)
+  // Snap to the new terrain's surface at our current XZ (same as the boot spawn
+  // snap) — the old world's ground height is meaningless in the host's world.
+  const sx = Math.floor(player.position.x), sz = Math.floor(player.position.z);
+  const surf = Math.max(world.sampler(sx, sz).height, world.params.terrain.waterOffset);
+  player.spawnPoint.set(player.position.x, surf + 3, player.position.z);
+  player.position.copy(player.spawnPoint);
+  player.velocity.set(0, 0, 0);
+};
+
+net.onEdit = (x, y, z, id) => world.applyRemoteEdit(x, y, z, id);
+net.onPos = (p, yaw, pitch) => remote.push(performance.now(), p, yaw, pitch);
+net.onTime = (tod) => { timeOfDay = tod; };
+net.onPeerChange = (connected) => {
+  remote.group.visible = connected;
+  if (!connected) remote.reset();
+  const status = document.getElementById('status');
+  if (status) {
+    status.innerHTML = connected ? '🤝 Friend connected' : 'Friend disconnected';
+    setTimeout(() => { status.innerHTML = ''; }, 3000);
+  }
+};
+
+// Local edits broadcast to the peer (world fires this only for REAL changes,
+// and mutes it while applying edits that came FROM the peer — no echo loops).
+world.onEdit = (x, y, z, id) => net.sendEdit(x, y, z, id);
+
+// Regenerate/load while hosting → push a fresh world snapshot to the guest
+// (configureMap was the previous onAfterGenerate — keep it first).
+world.onAfterGenerate = () => { configureMap(); net.sendInit(); };
+
+// Debug/test handle — mp-smoke.mjs drives real game paths through this
+// (host edits → guest world, avatar tracking). Read-only convenience in prod.
+(window as unknown as Record<string, unknown>).__mcDebug = { world, player, net, remote, BLOCK_IDS };
+
+// While connected as GUEST, the host owns the world: regenerating or loading a
+// local save here would silently desync every future edit (same coords,
+// different terrain). The host doing either re-syncs the guest automatically
+// (onAfterGenerate → sendInit), so only the guest needs the guard.
+function guestWorldGuard(): boolean {
+  if (!net.connected || net.isHost) return false;
+  const status = document.getElementById('status');
+  if (status) {
+    status.innerHTML = 'The HOST owns the world while connected';
+    setTimeout(() => { status.innerHTML = ''; }, 3000);
+  }
+  return true;
+}
+
 const menu = createMenu({
   world,
   player,
   settings,
-  regenerate: () => { world.generate(false); },
+  regenerate: () => { if (!guestWorldGuard()) world.generate(false); },
   onViewDistanceChange: updateViewDistance,
   getStats: () => {
     const r = renderer.info.render, m = renderer.info.memory;
@@ -771,7 +846,13 @@ const menu = createMenu({
   setMode,
   onResume: resume,
   onSave: () => world.save(),
-  onLoad: () => world.load(),
+  onLoad: () => { if (!guestWorldGuard()) world.load(); },
+  multiplayer: {
+    host: () => net.host(),
+    join: (code) => net.join(code),
+    leave: () => net.leave(),
+    getStatus: () => net.status,
+  },
   lighting: {
     getSun: () => sunPeak, setSun: (v) => { sunPeak = v; },
     getFill: () => baseFill, setFill: (v) => { baseFill = v; },
@@ -872,6 +953,22 @@ function animate() {
   updatePlantWind(currentTime / 1000);
 
   worldMap.update();
+
+  // --- multiplayer pump (runs even while paused / in the map, so the friend
+  // keeps moving on screen and our own position keeps flowing out) ----------
+  if (net.status.state !== 'off') {
+    remote.update(currentTime);
+    if (net.connected && currentTime - lastPosSendAt >= POS_SEND_MS) {
+      lastPosSendAt = currentTime;
+      const cam = mode === 'spectator' ? spectator.camera : player.camera;
+      _netEuler.setFromQuaternion(cam.quaternion, 'YXZ');
+      net.sendPos(cam.position, _netEuler.y, _netEuler.x);
+      if (net.isHost && currentTime - lastTimeSyncAt >= TIME_SYNC_MS) {
+        lastTimeSyncAt = currentTime;
+        net.sendTime(timeOfDay);
+      }
+    }
+  }
 
   if (!worldMap.isOpen()) {
     world.activeCamera = mode === 'spectator' ? spectator.camera : player.camera;   // frustum-streaming view

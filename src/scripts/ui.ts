@@ -44,6 +44,16 @@ export type QualityControls = {
   getResolutionScale: () => number, setResolutionScale: (v: number) => void,
 };
 
+// Multiplayer (P2P co-op) controls — backed by Net in net.ts, wired in main.ts.
+// The menu only triggers actions + renders the live status; it owns no state.
+export type MultiplayerStatus = { state: string, code: string, detail: string };
+export type MultiplayerControls = {
+  host: () => void,
+  join: (code: string) => void,
+  leave: () => void,
+  getStatus: () => MultiplayerStatus,
+};
+
 // First-person / spectator view controls (applied live, no rebuild).
 export type PlayerViewControls = {
   getFov: () => number, setFov: (v: number) => void,
@@ -63,6 +73,7 @@ type MenuOptions = {
   lighting: LightingControls,
   quality: QualityControls,
   playerView: PlayerViewControls,
+  multiplayer: MultiplayerControls,
   regenerate: () => void,
   onViewDistanceChange: () => void,
   getStats: () => StatsSnapshot,
@@ -197,7 +208,7 @@ export function createMenu(opts: MenuOptions): MenuController {
   const tabbar = el('div', 'menu__tabs');
   const bodies: Record<string, HTMLElement> = {};
   const tabBtns: Record<string, HTMLElement> = {};
-  const TABS = ['Stats', 'Settings', 'Finder', 'Mode', 'Controls'] as const;
+  const TABS = ['Stats', 'Settings', 'Finder', 'Mode', 'Multiplayer', 'Controls'] as const;
   const bodyWrap = el('div', 'menu__bodywrap');
   let active = 'Settings';
   const selectTab = (name: string) => {
@@ -232,7 +243,11 @@ export function createMenu(opts: MenuOptions): MenuController {
     statRows[name] = v;
     statGrid.append(v);
   }
+  // refreshStats is called every frame while the menu is open — it also drives
+  // the Multiplayer tab's live status line (assigned in that tab's section).
+  let refreshMpStatus = () => {};
   const refreshStats = () => {
+    if (active === 'Multiplayer') refreshMpStatus();
     if (active !== 'Stats') return;
     const s = opts.getStats();
     statRows['Mode'].textContent = s.mode;
@@ -298,6 +313,81 @@ export function createMenu(opts: MenuOptions): MenuController {
     for (const m of MODES) modeBtns[m.id].classList.toggle('menu__mode--on', m.id === cur);
   };
   syncMode();
+
+  // ===== MULTIPLAYER tab ====================================================
+  // P2P co-op: the host shares a room code; the friend types it in and joins
+  // the host's exact world (terrain regenerates locally from the host's seed —
+  // only edits + positions cross the network). All state lives in net.ts.
+  {
+    const mp = opts.multiplayer;
+    const mpBody = bodies['Multiplayer'];
+    mpBody.append(el('div', 'menu__hint',
+      'Play together! One player hosts and shares the room code; the other joins with it. '
+      + 'The joiner loads the host\'s world (terrain, edits, time of day) and you build side by side. '
+      + 'Keep this tab open while connecting.'));
+
+    const hostRow = el('div', 'menu__btnrow');
+    const hostBtn = addButton(hostRow, '🌐  Host This World', () => { mp.host(); refreshMpStatus(); }, 'ui-btn--primary');
+
+    const joinRow = el('div', 'menu__btnrow');
+    const codeInput = el('input', 'ui-input') as HTMLInputElement;
+    codeInput.placeholder = 'ROOM CODE';
+    codeInput.maxLength = 8;
+    codeInput.autocapitalize = 'characters';
+    codeInput.spellcheck = false;
+    // Keep typed letters out of the game's document-level key handlers
+    // ('o' toggles the dev texture-compare, Esc would close the menu, …).
+    codeInput.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') joinBtn.click();
+    });
+    joinRow.append(codeInput);
+    const joinBtn = addButton(joinRow, '🔗  Join', () => { mp.join(codeInput.value); refreshMpStatus(); });
+
+    const leaveRow = el('div', 'menu__btnrow');
+    const leaveBtn = addButton(leaveRow, '✕  Disconnect', () => { mp.leave(); refreshMpStatus(); });
+
+    // Live status: room code shown big (click to copy) + a detail line.
+    const codeBox = el('div', 'mp-code');
+    codeBox.title = 'Click to copy';
+    codeBox.addEventListener('click', () => {
+      const code = codeBox.dataset.code;
+      if (code) {
+        navigator.clipboard?.writeText(code).catch(() => {});
+        codeBox.textContent = 'copied!';
+        setTimeout(refreshMpStatusForce, 800);
+      }
+    });
+    const mpStatus = el('div', 'finder-result mp-status', 'Not connected.');
+    mpBody.append(hostRow, joinRow, codeBox, mpStatus, leaveRow);
+
+    let mpLastSig = '';
+    const render = () => {
+      const s = mp.getStatus();
+      const sig = `${s.state}|${s.code}|${s.detail}`;
+      if (sig === mpLastSig) return;
+      mpLastSig = sig;
+      const busy = s.state !== 'off' && s.state !== 'error';
+      hostBtn.disabled = busy;
+      joinBtn.disabled = busy;
+      codeInput.disabled = busy;
+      leaveRow.style.display = s.state === 'off' ? 'none' : '';
+      leaveBtn.textContent = s.state === 'connected' ? '✕  Disconnect' : '✕  Cancel / Close Room';
+      const showCode = s.code && (s.state === 'hosting' || s.state === 'connected');
+      codeBox.style.display = showCode ? '' : 'none';
+      codeBox.dataset.code = showCode ? s.code : '';
+      if (showCode) codeBox.textContent = s.code;
+      mpStatus.textContent =
+        s.state === 'off' ? 'Not connected.' :
+        s.state === 'error' ? `⚠ ${s.detail}` :
+        s.state === 'hosting' ? `Hosting — share the code above. ${s.detail}` :
+        s.detail;
+      mpStatus.classList.toggle('finder-result--err', s.state === 'error');
+    };
+    const refreshMpStatusForce = () => { mpLastSig = ''; render(); };
+    refreshMpStatus = render;
+    refreshMpStatusForce();
+  }
 
   // ===== CONTROLS tab =======================================================
   const ctrlBody = bodies['Controls'];

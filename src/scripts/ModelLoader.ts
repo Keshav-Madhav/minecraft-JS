@@ -1,4 +1,5 @@
 import { GLTFLoader } from "three/examples/jsm/Addons.js"
+import { assetUrl } from "./assetBase"
 
 export class ModelLoader {
   loader = new GLTFLoader();
@@ -8,10 +9,12 @@ export class ModelLoader {
   }
 
   loadModels(onLoad: (models: { [key: string]: any }) => void){
-    // RELATIVE path (no leading '/') so the model resolves under whatever path the
-    // app is deployed at — domain root on Vercel/Netlify, a sub-path on Pages —
-    // exactly like the textures (which also load via bare-relative URLs).
-    this.loader.load('pickaxe.glb', (gltf) => {
+    // assetUrl resolves against vite's BASE_URL ('/' in dev, './' in the build)
+    // so the model loads under whatever path the app is DEPLOYED at (domain root
+    // on Vercel, a sub-path on Pages) while staying immune to the PAGE path — a
+    // bare-relative path here got the SPA index.html fallback ("<!doctype" JSON
+    // error) whenever the dev tab sat at a non-root URL.
+    this.loader.load(assetUrl('pickaxe.glb'), (gltf) => {
       const mesh = gltf.scene;
       this.models.pickaxe = mesh;
 

@@ -562,3 +562,21 @@ body {
   border: 2px solid; border-color: #0a0a0a #4a4a4a #4a4a4a #0a0a0a;
   text-shadow: 1px 1px 0 #000; font-size: 13px; min-height: 18px;
 }
+/* multiplayer tab */
+.ui-input {
+  flex: 1; min-width: 0; padding: 9px 12px; font: inherit; font-weight: 600;
+  letter-spacing: 2px; text-transform: uppercase;
+  background: #1e1e1e; color: #fff; text-shadow: 1px 1px 0 #000;
+  border: 2px solid; border-color: #0a0a0a #4a4a4a #4a4a4a #0a0a0a; outline: none;
+}
+.ui-input::placeholder { color: #777; letter-spacing: 1px; }
+.ui-input:disabled { opacity: 0.5; }
+.ui-btn:disabled { opacity: 0.5; cursor: default; }
+.mp-code {
+  margin: 8px 0; padding: 12px; text-align: center; cursor: pointer; user-select: all;
+  font-size: 26px; font-weight: 700; letter-spacing: 8px; color: #ffd95e;
+  background: #1e1e1e; text-shadow: 2px 2px 0 #000;
+  border: 2px solid; border-color: #0a0a0a #4a4a4a #4a4a4a #0a0a0a;
+}
+.mp-code:hover { color: #ffe89a; }
+.finder-result--err { color: #ff7a6a; }

@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { TEXTURE_LAYER, LAYER_COUNT } from './blockTypes';
+import { assetUrl } from './assetBase';
 
 // One texture layer per distinct block-face texture, packed into a single
 // DataArrayTexture so every block type can be drawn by ONE material -> one draw
@@ -253,6 +254,7 @@ function createArrayTexture(): THREE.DataArrayTexture {
     if (!url) return;
     pending++;
     const img = new Image();
+    let retries = 0;
     img.onload = () => {
       ctx.clearRect(0, 0, TILE, TILE);
       ctx.drawImage(img, 0, 0, TILE, TILE);
@@ -261,14 +263,23 @@ function createArrayTexture(): THREE.DataArrayTexture {
       done();
     };
     img.onerror = () => {
-      // A missing/broken texture would otherwise render as silent black; fill the
-      // layer magenta so the failure is obvious, and log which URL failed.
+      // Texture fetches can fail TRANSIENTLY (dev-server restart mid-load, a
+      // network blip) — and a failure here used to bake magenta into the array
+      // texture for the whole session ("everything is purple"). Retry a couple
+      // of times with backoff; only a genuinely missing file goes magenta (so
+      // the failure stays obvious), with the URL logged.
+      if (retries++ < 2) {
+        setTimeout(() => { img.src = `${assetUrl(url)}?retry=${retries}`; }, 1500 * retries);
+        return;
+      }
       console.warn(`block texture failed to load: ${url}`);
       const off = layer * TILE * TILE * 4;
       for (let i = 0; i < TILE * TILE; i++) { data[off + i * 4] = 255; data[off + i * 4 + 1] = 0; data[off + i * 4 + 2] = 255; data[off + i * 4 + 3] = 255; }
       done();
     };
-    img.src = url;
+    // assetUrl: resolve against BASE_URL, not the page path — a tab open at a
+    // non-root path (stale /minecraft-JS/ bookmark) must not 404 every texture.
+    img.src = assetUrl(url);
   });
 
   return texture;
@@ -549,7 +560,7 @@ function buildRefArrayTexture(refmap: Record<string, string>): THREE.DataArrayTe
     if (!url) return;
     const base = url.split('/').pop()!;            // our texture filename, e.g. 'andesite.png'
     const ref = refmap[base];
-    const src = ref ? ('_ref/' + ref) : url;       // MC reference where mapped, else keep ours
+    const src = assetUrl(ref ? ('_ref/' + ref) : url);   // MC reference where mapped, else keep ours
     pending++;
     const img = new Image();
     img.onload = () => {
@@ -575,7 +586,7 @@ export function toggleReferenceTextures(): void {
     console.info(`[texture toggle] now showing ${usingRef ? 'MINECRAFT reference' : 'our'} textures`);
   };
   if (refArrayTexture) { apply(); return; }
-  fetch('_ref/refmap.json')
+  fetch(assetUrl('_ref/refmap.json'))
     .then(r => r.ok ? r.json() : Promise.reject(new Error('no ref pack')))
     .then((refmap: Record<string, string>) => { refArrayTexture = buildRefArrayTexture(refmap); apply(); })
     .catch(() => console.warn('[texture toggle] dev ref pack missing — run `python3 .texref/make_compare.py` to enable'));
