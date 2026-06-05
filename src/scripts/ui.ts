@@ -393,8 +393,9 @@ export function createMenu(opts: MenuOptions): MenuController {
     min: 0.5, max: 2, step: 0.05, decimals: 2,   // >1 = supersample (SSAA): crisp but heavy
     get: quality.getResolutionScale, set: quality.setResolutionScale,
   }));
-  // VSync ON caps to the display refresh; OFF (default) renders uncapped, then the
-  // Frame Rate Limit below applies a soft cap (Max = unlimited).
+  // VSync ON (default) locks to the display refresh via rAF. OFF spins the loop
+  // uncapped (benchmark mode — the MessageChannel flood can starve input/compositing,
+  // see main.ts), then the Frame Rate Limit below applies a soft cap (Max = unlimited).
   remember(addToggle(adv, 'VSync', () => !settings.uncapFPS, (v) => { settings.uncapFPS = !v; }, applyDeps));
   remember(dep(addSegmented<string>(adv, 'Frame Rate Limit',
     [{ value: '0', label: 'Max' }, { value: '60', label: '60' }, { value: '120', label: '120' }, { value: '144', label: '144' }, { value: '240', label: '240' }],

@@ -33,10 +33,14 @@ window.addEventListener('resize', () => {
 
 let previousTime = performance.now();
 
-// Settings surfaced in the menu. Defaults: FPS UNLOCKED (uncapFPS on → VSync is
-// an opt-in toggle), fog on, biome tint + day/night on, and an always-on stats
-// overlay (top-right, under the minimap) while playing.
-const settings = { uncapFPS: true, fpsCap: 0, fog: true, fogNear: 0.7, resolutionScale: 1, biomeLighting: true, dayNight: true, statsOverlay: true };
+// Settings surfaced in the menu. Defaults: VSYNC ON (uncapFPS off) — the uncapped
+// MessageChannel spin floods the main thread with macrotasks, starving compositor
+// commits and pointer-lock mousemove delivery: the loop counter reads 500+ "fps"
+// while the screen visibly updates at ~10. Worst in production builds (minified →
+// faster spin → harder starvation), which is why Vercel felt broken while local
+// dev looked fine. Uncapped stays as an opt-in benchmark toggle. Fog on, biome
+// tint + day/night on, and an always-on stats overlay while playing.
+const settings = { uncapFPS: false, fpsCap: 0, fog: true, fogNear: 0.7, resolutionScale: 1, biomeLighting: true, dayNight: true, statsOverlay: true };
 const SKY_COLOR = 0x80a0e0;
 
 // Frame scheduler. requestAnimationFrame is hard-locked to the display refresh
@@ -65,6 +69,19 @@ function scheduleFrame() {
 
 // --- live perf stats (shown in the debug menu, not a permanent HUD) ----------
 let fps = 0, fpsFrames = 0, fpsLast = performance.now();
+
+// DISPLAY fps: a dedicated rAF chain that just counts ticks. rAF fires once per
+// display frame the main thread actually services, so when the uncapped loop
+// floods the thread this drops in step with the visible jank while the loop
+// counter (`fps` above) stays sky-high. Shown next to the loop fps when they
+// diverge so the meter can't claim 500 while the screen crawls.
+let dispFps = 0, dispFrames = 0, dispLast = performance.now();
+(function dispTick() {
+  dispFrames++;
+  const t = performance.now();
+  if (t - dispLast >= 250) { dispFps = dispFrames * 1000 / (t - dispLast); dispFrames = 0; dispLast = t; }
+  requestAnimationFrame(dispTick);
+})();
 
 // --- Boot safety net ---------------------------------------------------------
 // Surface a readable overlay if startup fails, instead of a silent blank canvas.
@@ -911,8 +928,13 @@ function animate() {
     if (statsOverlayEl.style.display !== 'none') {
       const r = renderer.info.render;
       const p = mode === 'spectator' ? spectator.camera.position : player.position;
+      // Loop fps vs display fps: show the display rate when the loop runs well
+      // ahead of it (uncapped), since what the player perceives is the latter.
+      const fpsLabel = fps > dispFps * 1.25
+        ? `FPS ${Math.round(dispFps)} (loop ${Math.round(fps)})`
+        : `FPS ${Math.round(fps)}`;
       statsOverlayEl.textContent =
-        `FPS ${Math.round(fps)}  ·  ${mode}\n` +
+        `${fpsLabel}  ·  ${mode}\n` +
         `XYZ ${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)}\n` +
         `draws ${r.calls}  ·  tris ${r.triangles.toLocaleString()}\n` +
         `chunks ${world.chunkCount}`;
