@@ -989,6 +989,53 @@ export function createWorldSampler(params: ChunkParams, size: ChunkSize): WorldS
 }
 
 // ===========================================================================
+//  LOD helpers — the far-terrain mesher (lodMesh.ts) renders columns straight
+//  from the sampler, so it needs the SAME top-block rule generateTerrain uses.
+// ===========================================================================
+// The block actually placed at y = height. ColumnSurface.surfaceId is correct
+// everywhere EXCEPT band-driven biomes (badlands): the per-Y terracotta band
+// overrides the nominal surface there (mirrors generateTerrain's outSurface).
+export function lodSurfaceBlock(cs: ColumnSurface, sea: number): number {
+  const band = BIOMES[cs.biome].band;
+  return band ? band(cs.height, cs.height, sea) : cs.surfaceId;
+}
+
+// Statistical distant-forest canopy per biome, derived from the SAME feature
+// recipes generateFeatures dispatches on (one tree pick per 4×4 world cell), so
+// LOD forest density/species track the real worldgen automatically. `prob` is
+// the per-4×4-cell tree probability, applied AS-IS by the LOD mesher on its
+// world-fixed 4-block tree grid at every stride (no scaling — the grid is
+// stride-invariant, so density already matches the real worldgen 1:1).
+// base/height: canopy box bottom offset above the surface and its thickness —
+// rough silhouettes of each species' real shape (redwood/jungle tall, acacia flat).
+export type LodCanopy = { leafId: number, trunkId: number, prob: number, base: number, height: number, tinted: boolean };
+export const LOD_CANOPY: ReadonlyArray<LodCanopy | null> = BIOMES.map((b) => {
+  const f = b.features;
+  if (!f) return null;
+  // species → (leaf block, trunk log, canopy shape); ordered by the dispatch
+  // priority in generateFeatures so the DOMINANT species defines the look.
+  const species: ReadonlyArray<readonly [number | undefined, number, number, number, number, boolean]> = [
+    [f.cherry, BLOCK_IDS.cherryLeaves, BLOCK_IDS.cherryLog, 4, 3, false],
+    [f.redwood, BLOCK_IDS.spruceLeaves, BLOCK_IDS.spruceLog, 7, 9, false],
+    [f.spruce, BLOCK_IDS.spruceLeaves, BLOCK_IDS.spruceLog, 2, 6, false],
+    [f.jungleTree, BLOCK_IDS.jungleLeaves, BLOCK_IDS.jungleLog, 5, 6, true],
+    [f.darkOak, BLOCK_IDS.darkOakLeaves, BLOCK_IDS.darkOakLog, 3, 3, true],
+    [f.acacia, BLOCK_IDS.acaciaLeaves, BLOCK_IDS.acaciaLog, 4, 2, true],
+    [f.birch, BLOCK_IDS.birchLeaves, BLOCK_IDS.birchLog, 4, 3, false],
+    [f.mangrove, BLOCK_IDS.mangroveLeaves, BLOCK_IDS.mangroveLog, 4, 3, true],
+    [f.swampOak, BLOCK_IDS.leaves, BLOCK_IDS.tree, 3, 3, true],
+    [f.oak, BLOCK_IDS.leaves, BLOCK_IDS.tree, 3, 3, true],
+  ];
+  let prob = 0, best: LodCanopy | null = null;
+  for (const [p, leafId, trunkId, base, height, tinted] of species) {
+    if (!p) continue;
+    prob += p;
+    if (!best || p > best.prob) best = { leafId, trunkId, prob: p, base, height, tinted };
+  }
+  return best ? { ...best, prob } : null;   // prob = TOTAL tree chance, look = dominant species
+});
+
+// ===========================================================================
 //  RESOURCES (ore + stone variants) — coarse-grid noise that replaces host rock
 //  (stone OR deepslate) with the resource block. Each resource may declare a
 //  [minY,maxY] depth window so the sweep is both cheaper (fewer cells) and lets

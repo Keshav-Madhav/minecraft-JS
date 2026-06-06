@@ -1,6 +1,7 @@
 import { generateChunkData, createWorldSampler, createCaveSampler, LAVA_Y, ICE_SURFACE_TEMP, wellShaftRange, biomeWaterHex, WorldSampler, ChunkParams, ChunkSize } from './chunkGen';
 import { ResourceGenInfo, BLOCK_IDS } from './blockTypes';
 import { buildChunkGeometry, buildChunkMapTile, scanEmitters, GeometryArrays } from './chunkMesh';
+import { buildLodTile } from './lodMesh';
 
 // The worker generates a chunk's block data AND greedily meshes it, off the
 // main thread. Cross-chunk border faces are culled by sampling the deterministic
@@ -19,7 +20,11 @@ type ConfigMessage = {
   resources: ResourceGenInfo[],
 };
 type GenMessage = { type: 'gen', version: number, key: string, worldX: number, worldZ: number };
-export type WorkerRequest = ConfigMessage | GenMessage;
+// LOD far-terrain tile: meshed purely from the deterministic sampler (no voxel
+// data) at a coarse stride. tileBlocks = tile edge in blocks (a multiple of the
+// chunk width, chosen by World); stride = blocks per LOD cell.
+type LodMessage = { type: 'lod', version: number, key: string, worldX: number, worldZ: number, tileBlocks: number, stride: number };
+export type WorkerRequest = ConfigMessage | GenMessage | LodMessage;
 
 export type GeometryPayload = {
   positions: ArrayBuffer, normals: ArrayBuffer, uvs: ArrayBuffer, layers: ArrayBuffer, indices: ArrayBuffer,
@@ -38,6 +43,19 @@ export type MeshMessage = {
   emitters: ArrayBuffer,     // light-emitter world positions [wx,wy,wz,id,…] (Float32) for the point-light pool
   mapTile: ArrayBuffer,      // W×W RGBA top-down tile for the in-sync minimap (Uint8)
 };
+
+// LOD tile reply. `stride` is echoed so World can reject a stale reply when the
+// tile's desired stride changed while this one was in flight (key alone is not
+// enough — same tile, different detail level).
+export type LodMeshMessage = {
+  type: 'lodMesh',
+  version: number,
+  key: string,
+  stride: number,
+  terrain: GeometryPayload,   // opaque blocky heightmap (blockArrayMaterial)
+  canopy: GeometryPayload,    // statistical leaf boxes (leafArrayMaterial — alpha-cutout)
+};
+export type WorkerReply = MeshMessage | LodMeshMessage;
 
 let config: ConfigMessage | null = null;
 let sampler: WorldSampler | null = null;
@@ -64,8 +82,24 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
     return;
   }
 
-  // gen
   if (!config || !sampler || !caveSampler || msg.version !== config.version) return; // stale request
+
+  if (msg.type === 'lod') {
+    // LOD far-terrain tile: pure sampler → mesh, no voxel data. Same stateless
+    // determinism as chunk gens (a neighbour tile computes identical borders).
+    const geo = buildLodTile(sampler, config.params.terrain.waterOffset, config.size.height - 1,
+      msg.worldX, msg.worldZ, msg.tileBlocks, msg.stride);
+    const terrain = geometryToPayload(geo.terrain);
+    const canopy = geometryToPayload(geo.canopy);
+    const reply: LodMeshMessage = {
+      type: 'lodMesh', version: config.version, key: msg.key, stride: msg.stride,
+      terrain: terrain.payload, canopy: canopy.payload,
+    };
+    (self as unknown as Worker).postMessage(reply, [...terrain.transfer, ...canopy.transfer]);
+    return;
+  }
+
+  // gen
   const cfg = config;
   const sample = sampler;
   const caveAt = caveSampler;

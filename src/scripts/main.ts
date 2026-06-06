@@ -132,6 +132,10 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap; // soft shadow edges (set befo
 // so the stats overlay shows the true scene draw count even in ultra mode where
 // the EffectComposer issues several post-process passes after the scene render.
 renderer.info.autoReset = false;
+// No per-frame z-sort of the render list: with thousands of opaque voxel draws
+// the projectObject+sort cost is real CPU while early-Z already handles overdraw.
+// The only transparent object is the single water plane, so ordering is moot.
+renderer.sortObjects = false;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.2;
 document.body.appendChild(renderer.domElement);
@@ -181,10 +185,11 @@ const lightManager = new LightManager(scene);
 let lightInterval = 2;   // frames between point-light gathers (quality preset)
 let lightTick = 0;
 
-// Fog and the camera far plane scale with draw distance so the loaded edge fades
+// Fog and the camera far plane scale with the VIEW distance — the farther of
+// the full-detail ring and the LOD far-terrain ring — so the loaded edge fades
 // into the sky. Applied to BOTH cameras so fog matches whichever is active.
 function updateViewDistance() {
-  const span = Math.max(world.drawDistance, 1) * world.chunkSize.width;
+  const span = Math.max(world.drawDistance, world.lodDistance, 1) * world.chunkSize.width;
   player.camera.far = span + 48;
   player.camera.updateProjectionMatrix();
   spectator.camera.far = span + 48;
@@ -520,12 +525,19 @@ function applySunDirection(azimuthDeg: number, elevationDeg: number) {
 }
 
 let shadowRange = 320;
+// --- shadow re-render throttle state (see the animate() shadow block) -------
+let shadowDirty = true;                  // force a render on the next daylight frame
+const _lastShadowCenter = new THREE.Vector3(NaN, NaN, NaN);
+let lastShadowAz = NaN, lastShadowEl = NaN;
+let lastShadowMeshEpoch = -1;
+
 function applyShadowRange(r: number) {
   shadowRange = r;
   const cam = sun.shadow.camera;
   cam.left = -r; cam.right = r; cam.top = r; cam.bottom = -r;
   cam.far = SUN_DISTANCE + r * 2 + 80;
   cam.updateProjectionMatrix();
+  shadowDirty = true;
 }
 
 // Shadow QUALITY: map resolution + range, or off. Map size must agree with the
@@ -536,7 +548,7 @@ function applyShadowQuality(q: ShadowQuality) {
   shadowQuality = q;
   if (q === 'off') { sun.castShadow = false; return; }
   sun.castShadow = true;
-  // ultra = an 8192 map over a wide range → ~0.1-block texels (razor-crisp), with
+  // ultra = an 8192 map over a wide range → ~0.16-block texels (razor-crisp), with
   // the foliage/leaf cutout shadows + soft PCF reading as real dappled light.
   const size = q === 'low' ? 1024 : q === 'medium' ? 2048 : q === 'high' ? 4096 : 8192;
   if (sun.shadow.mapSize.x !== size) {
@@ -544,7 +556,13 @@ function applyShadowQuality(q: ShadowQuality) {
     // Drop the old render target so three reallocates it at the new resolution.
     if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
   }
-  applyShadowRange(q === 'low' ? 110 : q === 'medium' ? 200 : q === 'high' ? 320 : 440);
+  // Ranges pushed out (was 110/200/320/440): three returns FULLY LIT for any
+  // fragment outside the shadow frustum — no fade — so a small range painted a
+  // hard bright ring on the ground mid-terrain ("weird lighting"). Larger
+  // ranges move the seam toward the fog band; texels stay sharp (2r/size).
+  // The caster-count cost is absorbed by the shadow re-render throttle below.
+  applyShadowRange(q === 'low' ? 140 : q === 'medium' ? 280 : q === 'high' ? 480 : 640);
+  shadowDirty = true;
 }
 
 function setUpLights() {
@@ -632,10 +650,14 @@ function updateSky(delta: number) {
     const t = biomeTint(s.biome);
     _targetSky.setHex(t.sky); _targetGround.setHex(t.ground); _targetClear.setHex(t.clear); _targetBright = t.bright;
   }
-  _tintSky.lerp(_targetSky, 0.04);
-  _tintGround.lerp(_targetGround, 0.04);
-  _tintClear.lerp(_targetClear, 0.04);
-  _bright += (_targetBright - _bright) * 0.04;
+  // Frame-rate-INDEPENDENT chase (was a fixed 0.04/frame, so biome/ambient
+  // colour transitions ran ~5× faster at 200fps than at 40 — visible "weird
+  // lighting" drift speed changes). k ≈ 0.04 at 60fps; k=0 while paused (delta 0).
+  const tintK = 1 - Math.exp(-2.5 * delta);
+  _tintSky.lerp(_targetSky, tintK);
+  _tintGround.lerp(_targetGround, tintK);
+  _tintClear.lerp(_targetClear, tintK);
+  _bright += (_targetBright - _bright) * tintK;
 
   _sky.copy(NIGHT_SKY).lerp(_tintClear, daylight).lerp(DUSK_SKY, glow * 0.6);
   renderer.setClearColor(_sky);
@@ -658,7 +680,9 @@ function updateSky(delta: number) {
   sunSprite.material.opacity = THREE.MathUtils.clamp(daylight * 1.6, 0, 1);
   moonSprite.material.opacity = THREE.MathUtils.clamp((1 - daylight) * 1.3, 0, 1) * 0.95;
 
-  moon.intensity = MOON_PEAK * (1 - daylight);
+  // Moon only rises once the sun is nearly gone — previously sun + moon + hemi
+  // all contributed through dusk, additively over-brightening those frames.
+  moon.intensity = MOON_PEAK * (1 - daylight) * (1 - sstep(daylight, 0.05, 0.2));
   moon.position.copy(player.position).addScaledVector(_sunDir, -SUN_DISTANCE);
   moon.target.position.copy(player.position);
 }
@@ -699,34 +723,52 @@ document.addEventListener('mousedown', onMouseDown);
 // ===========================================================================
 //  QUALITY PRESETS  — bundle render distance, foliage, shadows, lights, etc.
 // ===========================================================================
-let qualityPreset: QualityPreset = 'fast';   // default to lowest graphics
+// UNIFIED view distance: one knob (chunks) drives both rings. The value is the
+// LOD far-terrain horizon; the full-detail (physics/edit) chunk ring is always
+// a QUARTER of it — 256 → 64 real chunks + 4km of LOD, 48 → 12 real chunks.
+// Smooth (step 1): odd values just round the chunk ring.
+function applyUnifiedViewDistance(v: number) {
+  world.lodDistance = Math.max(4, Math.round(v));
+  world.drawDistance = Math.min(64, Math.max(2, Math.round(v / 4)));
+  updateViewDistance();
+}
+
+let qualityPreset: QualityPreset = 'balanced';   // sensible default out of the box
 function applyQualityPreset(p: QualityPreset) {
   qualityPreset = p;
-  // NOTE: presets NO LONGER touch ultra graphics — it's an independent ADD-ON
-  // toggle (off by default) that layers onto ANY preset (see setUltraGraphics).
-  if (p === 'fast') {
+  // Ultra Graphics (post-FX) stays an independent ADD-ON for the normal ladder —
+  // only MAX forces it on ("everything maxed"); other presets leave it as-is.
+  // Every preset sets ONE unified View Distance (chunks): the slider value IS
+  // the LOD horizon, and the full-detail chunk ring is always a quarter of it
+  // (32→8, 64→16, 128→32, 192→48, 256→64) — see applyUnifiedViewDistance.
+  if (p === 'low') {
     // Lowest: short view, tight foliage, NO shadow pass, NO dynamic point lights,
     // NO cloud overdraw, lightly downscaled render — the cheapest the engine goes.
     // (0.85 not 0.7 so the out-of-box image isn't noticeably blurry on weak GPUs.)
-    world.drawDistance = 6; world.setFoliage(true, 4);
+    applyUnifiedViewDistance(32); world.setFoliage(true, 5);
     applyShadowQuality('off'); lightInterval = 4; lightManager.setEnabled(false);
     settings.resolutionScale = 0.85; clouds.visible = false;
   } else if (p === 'balanced') {
-    world.drawDistance = 12; world.setFoliage(true, 8);
+    applyUnifiedViewDistance(64); world.setFoliage(true, 10);
     applyShadowQuality('medium'); lightInterval = 2; lightManager.setEnabled(true);
     settings.resolutionScale = 1; clouds.visible = true;
   } else if (p === 'fancy') {
-    world.drawDistance = 20; world.setFoliage(true, 16);
+    applyUnifiedViewDistance(128); world.setFoliage(true, 20);
     applyShadowQuality('high'); lightInterval = 1; lightManager.setEnabled(true);
     settings.resolutionScale = 1; clouds.visible = true;
   } else if (p === 'ultra') {
-    // Max it out: 28-chunk view, foliage far out, 8192 soft shadows. The Render
-    // Distance slider goes to 64 for those who want to push it (very heavy on RAM),
-    // but the preset stays at a sane 28. (Ultra Graphics post-FX is a separate toggle.)
-    // Ladder re-spaced 6/12/20/28 so fancy→ultra isn't a 4× chunk-ring cliff.
-    world.drawDistance = 28; world.setFoliage(true, 28);
+    // 48-chunk full-detail ring under a ~3km LOD horizon, 8192 soft shadows.
+    applyUnifiedViewDistance(192); world.setFoliage(true, 32);
     applyShadowQuality('ultra'); lightInterval = 1; lightManager.setEnabled(true);
     settings.resolutionScale = 1; clouds.visible = true;
+  } else if (p === 'max') {
+    // MAX: every slider at its limit — 64 real chunks + 4km LOD horizon, 8K soft
+    // shadows, far foliage, post-FX pipeline, 2× supersampling. The UI shows a
+    // warning; this is the "I have a monster machine" button.
+    applyUnifiedViewDistance(256); world.setFoliage(true, 64);
+    applyShadowQuality('ultra'); lightInterval = 1; lightManager.setEnabled(true);
+    settings.resolutionScale = 2; clouds.visible = true;
+    setUltraGraphics(true);
   }
   applyResolution();
   updateViewDistance();
@@ -745,6 +787,7 @@ function setUltraGraphics(on: boolean) {
   ultraGraphics = on;
   setFoliageShadows(on);            // new chunk meshes pick this up...
   world.refreshFoliageShadows(on);  // ...and existing ones are updated in place
+  shadowDirty = true;               // caster set changed (foliage shadows) → re-render the map
   // (water uReflect is driven every frame in the render loop from `ultraGraphics`)
   if (on && !postfx) postfx = new PostFX(renderer, scene, mode === 'spectator' ? spectator.camera : player.camera);
   else if (!on && postfx) { postfx.dispose(); postfx = null; }   // free the HDR buffers when ultra is off
@@ -808,9 +851,10 @@ world.onEdit = (x, y, z, id) => net.sendEdit(x, y, z, id);
 // (configureMap was the previous onAfterGenerate — keep it first).
 world.onAfterGenerate = () => { configureMap(); net.sendInit(); };
 
-// Debug/test handle — mp-smoke.mjs drives real game paths through this
-// (host edits → guest world, avatar tracking). Read-only convenience in prod.
-(window as unknown as Record<string, unknown>).__mcDebug = { world, player, net, remote, BLOCK_IDS };
+// Debug/test handle — mp-smoke.mjs / lod-bench.mjs drive real game paths
+// through this (host edits → guest world, avatar tracking, perf metrics).
+// Read-only convenience in prod.
+(window as unknown as Record<string, unknown>).__mcDebug = { world, player, net, remote, BLOCK_IDS, renderer };
 
 // While connected as GUEST, the host owns the world: regenerating or loading a
 // local save here would silently desync every future edit (same coords,
@@ -838,6 +882,7 @@ const menu = createMenu({
     return {
       fps, x: p.x, y: p.y, z: p.z,
       drawCalls: r.calls, triangles: r.triangles, chunks: world.chunkCount,
+      lodTiles: world.lodTileCount,
       geometries: m.geometries, textures: m.textures,
       mode, flying: player.flying, onGround: player.onGround,
     };
@@ -876,8 +921,14 @@ const menu = createMenu({
   quality: {
     applyPreset: applyQualityPreset,
     getPreset: () => qualityPreset,
-    getRenderDistance: () => world.drawDistance,
-    setRenderDistance: (v) => { world.drawDistance = v; qualityPreset = 'custom'; updateViewDistance(); },
+    getViewDistance: () => world.lodDistance,
+    setViewDistance: (v) => { applyUnifiedViewDistance(v); qualityPreset = 'custom'; },
+    // Advanced override: decouple the full-detail ring from the ¼ rule (e.g. a
+    // tiny 4-chunk detail ring under a 4km LOD horizon — the stride ladder is
+    // relative to this edge, so the falloff stays gradual at any combination).
+    // Moving the View Distance slider re-applies the ¼ rule.
+    getDetailDistance: () => world.drawDistance,
+    setDetailDistance: (v) => { world.drawDistance = Math.min(64, Math.max(2, Math.round(v))); qualityPreset = 'custom'; updateViewDistance(); },
     getFoliage: () => world.foliageEnabled,
     setFoliage: (v) => { world.setFoliage(v, world.foliageDistance); qualityPreset = 'custom'; },
     getFoliageDistance: () => world.foliageDistance,
@@ -947,9 +998,38 @@ function animate() {
   // flag only — flipping it costs nothing and triggers no recompile, and three
   // re-renders the map fresh at the player's current position the first daylight
   // frame after it flips back on (the frozen map was invisible at intensity ~0).
+  // SHADOW RE-RENDER THROTTLE: with autoUpdate, three re-renders EVERY caster
+  // into the shadow map EVERY daylight frame — a silent ~2× draw multiplier
+  // (the depth pass submits the same thousands of chunk meshes as the colour
+  // pass). The map only actually changes when (a) the texel-snapped frustum
+  // centre moves (player crossed a shadow texel), (b) the caster set changed
+  // (world.meshEpoch — chunk streamed/removed/edited), or (c) the sun moved
+  // (day/night cycle, >0.15°). Standing still or mouse-looking now costs ZERO
+  // shadow re-renders; needsUpdate is a one-shot flag three auto-clears.
   const shadowsActive = sun.castShadow && currentDaylight > 0.02;
-  renderer.shadowMap.autoUpdate = shadowsActive;
-  if (shadowsActive) updateSunShadow();   // skip the frustum maths too when frozen/off
+  renderer.shadowMap.autoUpdate = false;
+  if (shadowsActive) {
+    updateSunShadow();
+    let render = shadowDirty;
+    if (!render && !sun.target.position.equals(_lastShadowCenter)) render = true;
+    if (!render && world.meshEpoch !== lastShadowMeshEpoch) render = true;
+    // 0.5° (was 0.15°): at the default day length the sun crawls 0.75°/s, so
+    // 0.15° re-rendered the whole caster set ~5×/s while STANDING STILL —
+    // measured ~6 loop fps lost to invisible shadow nudges. At 0.5° the step
+    // is ~1.5×/s and a half-degree shadow jump is still imperceptible in play.
+    if (!render && settings.dayNight &&
+      (Math.abs(sunAzimuth - lastShadowAz) > 0.5 || Math.abs(sunElevation - lastShadowEl) > 0.5)) render = true;
+    renderer.shadowMap.needsUpdate = render;
+    if (render) {
+      _lastShadowCenter.copy(sun.target.position);
+      lastShadowAz = sunAzimuth; lastShadowEl = sunElevation;
+      lastShadowMeshEpoch = world.meshEpoch;
+      shadowDirty = false;
+    }
+  } else {
+    renderer.shadowMap.needsUpdate = false;
+    shadowDirty = true;   // dawn: render a fresh map the first daylight frame
+  }
   updatePlantWind(currentTime / 1000);
 
   worldMap.update();
@@ -1034,7 +1114,7 @@ function animate() {
         `${fpsLabel}  ·  ${mode}\n` +
         `XYZ ${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)}\n` +
         `draws ${r.calls}  ·  tris ${r.triangles.toLocaleString()}\n` +
-        `chunks ${world.chunkCount}`;
+        `chunks ${world.chunkCount}  ·  lod ${world.lodTileCount}`;
     }
   }
   if (menu.isOpen()) menu.refreshStats();

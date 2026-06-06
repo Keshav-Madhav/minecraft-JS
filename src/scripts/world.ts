@@ -6,10 +6,15 @@ import { resources } from './blocks';
 import { ChunkParams, generateChunkData, createWorldSampler, WorldSampler, climateGrassTint } from './chunkGen';
 import { ResourceGenInfo, BLOCK_IDS, TOGGLE, DOOR_PART } from './blockTypes';
 import { GeometryArrays } from './chunkMesh';
-import type { WorkerRequest, MeshMessage, GeometryPayload } from './chunkWorker';
+import { blockArrayMaterial, leafArrayMaterial } from './blockArrayMaterial';
+import type { WorkerRequest, MeshMessage, LodMeshMessage, WorkerReply, GeometryPayload } from './chunkWorker';
 
 // Frustum-streaming tuning (see World.frustumStreaming):
-const FRUSTUM_MARGIN = 40;      // world units to fatten the frustum (hysteresis vs rotation churn)
+// 96 (was 40): rescans only fire after ~8.5° of yaw, so anything inside the
+// margin must already be resident when it rotates on-screen — 40 units was
+// ~1-3° at chunk distances, thin enough that edge-of-screen terrain noticeably
+// popped in late ("ghost" gaps at the screen edge, worst for far LOD tiles).
+const FRUSTUM_MARGIN = 96;      // world units to fatten the frustum (hysteresis vs rotation churn)
 // Chunks within this Chebyshev radius are ALWAYS resident regardless of view — covers
 // the minimap (~±6 chunks) + immediate surroundings, so the minimap never goes blank
 // and turning never pops in NEARBY terrain. Frustum culling then trims only the FAR
@@ -17,6 +22,41 @@ const FRUSTUM_MARGIN = 40;      // world units to fatten the frustum (hysteresis
 // high draw distance — so the win scales with draw distance while play stays smooth.
 const FRUSTUM_NEAR_KEEP = 6;
 const VIEW_YAW_RESCAN = 0.15;   // camera-yaw delta (rad, ~8.5°) that triggers a frustum re-evaluation
+
+// ---- LOD far-terrain ring (see lodMesh.ts for the mesher) -------------------
+// Beyond the full-detail ring, big downsampled heightmap tiles extend the view
+// out to `lodDistance` chunks for a fraction of a chunk's cost (no voxel data,
+// no physics, 1-2 draw calls per 8×8-chunk tile).
+const LOD_TILE_CHUNKS = 8;        // base tile edge in chunks (128 blocks)
+// Far ring: 16-chunk (256-block) MEGATILES at stride 16. The render-side cost
+// that actually bounds fps is per-OBJECT CPU (matrix uniforms + state checks
+// per draw — profiled at ~70% of frame time), so the far ring quarters its
+// node/draw count by using one tile where the near ring would use four.
+const LOD_MEGA_CHUNKS = 16;
+const LOD_MEGA_START = 96;        // chunks: megatiles (stride 16) beyond here
+const LOD_NEAR_KEEP = 24;         // chunks: tiles inside stay resident regardless of view (instant turn-around)
+const LOD_REMOVAL_GRACE = 3;      // rescans a tile survives outside the desired set (mouse-look hysteresis)
+const MAX_LOD_OUTSTANDING = 4;    // in-flight LOD gens (chunk gens always have queue priority)
+const LOD_APPLY_VERT_BUDGET = 28000;   // verts uploaded per frame across LOD applies (≥1 tile always)
+const MAX_LOD_REMOVALS_PER_FRAME = 16;
+
+// One LOD tile's live state. `stride` = detail of the APPLIED meshes (0 = none
+// yet); `wantStride` = what the current rescan wants; `inflightStride` = what
+// the worker is currently building (-1 = nothing). A reply only applies when
+// its echoed stride matches wantStride — that's what arbitrates the in-flight
+// race when the player moves across a stride band while a build is queued.
+type LodTile = {
+  tx: number, tz: number,
+  tileChunks: number,     // 8 (near ring) or 16 (far megatile) — tx/tz are in THIS grid's units
+  terrain: Three.Mesh | null,
+  canopy: Three.Mesh | null,
+  stride: number,
+  wantStride: number,
+  inflightStride: number,
+  queued: boolean,
+  near: number,           // Chebyshev chunk-distance (for nearest-first ordering)
+  miss: number,           // consecutive rescans outside the desired set (see LOD_REMOVAL_GRACE)
+};
 
 type chunkCoords = { x: number, z: number };
 
@@ -72,6 +112,10 @@ export class World extends Three.Group {
   // Bumped whenever any chunk's minimap tile is (re)built (stream-in or edit). The
   // minimap reads it to skip its stationary heartbeat repaint when nothing changed.
   mapTileEpoch = 0;
+  // Bumped whenever the SHADOW-CASTING mesh set changes (chunk applied/removed/
+  // re-meshed after an edit). main.ts uses it to re-render the sun shadow map
+  // only when something actually changed instead of every daylight frame.
+  meshEpoch = 0;
   // three.js already frustum-culls every chunk mesh automatically AND per-pass
   // (main camera for colour, the sun's shadow camera for shadows), using each
   // mesh's bounding sphere. This toggle just lets you force-disable that culling
@@ -86,7 +130,29 @@ export class World extends Three.Group {
       chunk.visible = true;
       for (const child of chunk.children) child.frustumCulled = v;
     }
+    // LOD tiles too (visible stays coverage-managed — only the cull flag here)
+    for (const mesh of this.lodGroup.children) mesh.frustumCulled = v;
   }
+
+  // ---- LOD far-terrain state ------------------------------------------------
+  // 0 = off. Tiles live OUT of chunkMap (so physics/picking/minimap/lights stay
+  // structurally blind to them) in their own group, which carries a small
+  // downward offset so the overlap ring sits strictly UNDER real terrain.
+  lodDistance = 0;
+  readonly lodGroup = new Three.Group();
+  private lodMap = new Map<string, LodTile>();
+  private lodPending: string[] = [];
+  private lodApplyQueue: LodMeshMessage[] = [];
+  private lodOutstanding = 0;
+  private lodInflightWorker = new Map<string, Worker>();
+  private lodDesired = new Set<string>();
+  private lodRemovalPending = false;
+  private lastLodDistance = NaN;
+  // Tiles whose visibility must be re-evaluated (a real chunk over them loaded
+  // or unloaded since the last frame). Drained in processQueues.
+  private lodDirty = new Set<string>();
+
+  get lodTileCount() { return this.lodMap.size; }
 
   // Per-frame work budgets keep streaming smooth.
   maxChunkRequestsPerFrame = 6; // sync (no-worker) fallback
@@ -134,11 +200,24 @@ export class World extends Three.Group {
 
   // O(1) chunk lookup keyed by "chunkX,chunkZ".
   private chunkMap = new Map<string, WorldChunk>();
+  // Numeric-keyed mirror of chunkMap for the PER-FRAME hot paths (physics block
+  // queries run ~50×/frame): `${x},${z}` template keys allocate a string per
+  // lookup — ~50 strings + ~100 coord objects/frame of pure GC churn through a
+  // path whose comment promised "allocation-free". Key packs ±32k chunk coords.
+  private chunkNumMap = new Map<number, WorldChunk>();
+  private static numKey(cx: number, cz: number): number {
+    return (cx + 32768) * 65536 + (cz + 32768);
+  }
   // Pool of stateless gen+mesh workers (each chunk is independent thanks to the
   // deterministic apron), round-robined. Parallelism lets a high apply budget be
   // fed without the worker becoming the bottleneck.
   private workers: Worker[] = [];
   private nextWorker = 0;
+  // Dedicated far-terrain gen thread (see initWorkers); null → LOD falls back
+  // to the shared pool behind a backlog gate (and is lazily re-spawned,
+  // throttled by lodWorkerRetryTick — see the 2b dispatch block).
+  private lodWorker: Worker | null = null;
+  private lodWorkerRetryTick = 0;
   // chunkKey -> the worker currently generating it, so a worker that dies can have
   // its in-flight gen slots reclaimed (otherwise `outstanding` saturates and
   // streaming silently stalls). Cleared per key when its result is applied.
@@ -169,6 +248,17 @@ export class World extends Three.Group {
     super();
     this.params.seed = seed;
     this.sampler = createWorldSampler(this.params, this.chunkSize);
+    this.lodGroup.matrixAutoUpdate = false;
+    this.add(this.lodGroup);
+    // FREEZE the world subtree's per-frame matrix traversal: three's
+    // scene.updateMatrixWorld() recurses into EVERY descendant each render —
+    // matrixAutoUpdate=false only skips the math, not the walk. With 10-20k
+    // static chunk/LOD nodes that walk is pure per-frame waste (profiled).
+    // Anything added under World must compose its own matrixWorld ONCE via
+    // updateMatrixWorld(true) at add time (generateChunk, buildLodMesh,
+    // WorldChunk.applyGeometry); the world itself never moves.
+    this.matrixWorldAutoUpdate = false;
+    this.updateMatrixWorld(true);
 
     this.initWorkers();
     // Save/Load are exposed as menu buttons now (the old 'm'/'n' keybinds were
@@ -179,15 +269,27 @@ export class World extends Three.Group {
     // Leave a couple of cores for the main/render thread.
     const count = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 2));
     for (let i = 0; i < count; i++) {
-      try {
-        const w = new Worker(new URL('./chunkWorker.ts', import.meta.url), { type: 'module' });
-        w.onmessage = (event: MessageEvent<MeshMessage>) => this.onWorkerMessage(event.data);
-        w.onerror = (e) => this.handleWorkerDeath(w, e);
-        this.workers.push(w);
-      } catch { /* fall back to fewer / no workers */ }
+      const w = this.spawnWorker();
+      if (w) this.workers.push(w);
     }
     // More in-flight with more workers so each stays fed; still bounded.
     this.maxOutstanding = Math.max(16, this.workers.length * 8);
+    // DEDICATED LOD worker: far-terrain gen gets its own thread so the chunk
+    // backlog can never starve it. Without this, sustained movement kept the
+    // chunk pipeline saturated and LOD ahead of the player simply never built
+    // (postMessage FIFOs can't be reprioritised, so sharing the pool forced an
+    // all-or-nothing gate). One extra thread on top of `count` is fine — the
+    // cores-2 budget was conservative, and LOD jobs are bursty, not constant.
+    this.lodWorker = this.spawnWorker();
+  }
+
+  private spawnWorker(): Worker | null {
+    try {
+      const w = new Worker(new URL('./chunkWorker.ts', import.meta.url), { type: 'module' });
+      w.onmessage = (event: MessageEvent<WorkerReply>) => this.onWorkerMessage(event.data);
+      w.onerror = (e) => this.handleWorkerDeath(w, e);
+      return w;
+    } catch { return null; /* fall back to fewer / no workers */ }
   }
 
   // A worker died (e.g. crashed mid-gen). Drop it AND reclaim its in-flight gen
@@ -203,21 +305,48 @@ export class World extends Three.Group {
       this.inflightWorker.delete(key);
       this.outstanding = Math.max(0, this.outstanding - 1);
       const chunk = this.chunkMap.get(key);
-      if (chunk && !chunk.hasData) { chunk.disposeInstance(); this.remove(chunk); this.chunkMap.delete(key); reclaimed = true; }
+      if (chunk && !chunk.hasData) {
+        chunk.disposeInstance(); this.remove(chunk); this.chunkMap.delete(key);
+        const c = chunk.userData as chunkCoords;
+        this.chunkNumMap.delete(World.numKey(c.x, c.z));
+        reclaimed = true;
+      }
+    }
+    // LOD gens in flight on the dead worker: free their slots (or lodOutstanding
+    // saturates and LOD streaming silently stalls forever) and re-queue the tiles.
+    for (const [key, worker] of this.lodInflightWorker) {
+      if (worker !== w) continue;
+      this.lodInflightWorker.delete(key);
+      this.lodOutstanding = Math.max(0, this.lodOutstanding - 1);
+      const t = this.lodMap.get(key);
+      if (t) {
+        t.inflightStride = -1;
+        if (!t.queued && t.wantStride !== t.stride) { t.queued = true; this.lodPending.push(key); }
+      }
+    }
+    // The dedicated LOD thread died → respawn it once (with the current config,
+    // which it missed) so far-terrain streaming recovers without a regenerate.
+    if (w === this.lodWorker) {
+      this.lodWorker = this.spawnWorker();
+      this.lodWorker?.postMessage(this.buildWorkerConfig());
     }
     if (reclaimed) this.lastPlayerChunkX = NaN; // force a rescan → re-request the orphaned chunks
   }
 
   // Push the current generation config to every worker. Sent on each regenerate.
-  private sendWorkerConfig() {
-    const message: WorkerRequest = {
+  private buildWorkerConfig(): WorkerRequest {
+    return {
       type: 'config',
       version: this.worldVersion,
       size: this.chunkSize,
       params: this.params,
       resources: this.resourcePayload(),
     };
+  }
+  private sendWorkerConfig() {
+    const message = this.buildWorkerConfig();
     for (const w of this.workers) w.postMessage(message);
+    this.lodWorker?.postMessage(message);
   }
 
   private chunkKey(x: number, z: number) {
@@ -261,12 +390,14 @@ export class World extends Three.Group {
     const yawTurned = this.frustumStreaming && this.activeCamera &&
       Math.abs(((viewYaw - this.lastViewYaw + Math.PI * 3) % (Math.PI * 2)) - Math.PI) > VIEW_YAW_RESCAN;
     const rescan = c.x !== this.lastPlayerChunkX || c.z !== this.lastPlayerChunkZ ||
-      this.drawDistance !== this.lastDrawDistance || yawTurned;
+      this.drawDistance !== this.lastDrawDistance || yawTurned ||
+      this.lodDistance !== this.lastLodDistance;
 
     if (rescan) {
       this.lastPlayerChunkX = c.x;
       this.lastPlayerChunkZ = c.z;
       this.lastDrawDistance = this.drawDistance;
+      this.lastLodDistance = this.lodDistance;
       this.lastViewYaw = viewYaw;
 
       const visibleChunks = this.getVisibleChunks(player);
@@ -277,11 +408,247 @@ export class World extends Three.Group {
         .sort((a, b) => ((a.x - c.x) ** 2 + (a.z - c.z) ** 2) - ((b.x - c.x) ** 2 + (b.z - c.z) ** 2));
       // Player crossed a chunk boundary → re-evaluate which chunks show foliage.
       this.refreshFoliageVisibility();
-    } else if (this.removalPending) {
-      // Keep removing (capped per frame) using the cached visible set — no need
-      // to rebuild the visible list / pending every frame during removal.
-      this.removalPending = this.removeUnusedChunks();
+      // LOD ring: re-evaluate tile membership + detail bands. The down-offset
+      // (which keeps overlapped LOD strictly under real terrain, no z-fight)
+      // scales with drawDistance because depth-buffer precision worsens with
+      // distance — at dd64 the overlap reaches ~1.4km where 0.25 isn't enough.
+      const lodDrop = -Math.max(0.3, this.drawDistance * 0.016);
+      if (this.lodGroup.position.y !== lodDrop) {
+        this.lodGroup.position.y = lodDrop;
+        this.lodGroup.updateMatrix();
+        // frozen subtree: recompose the LOD meshes' world matrices (dd changes only)
+        this.lodGroup.updateMatrixWorld(true);
+      }
+      this.updateLodTiles(c.x, c.z);
+      this.lodRemovalPending = this.removeUnusedLodTiles();
+    } else {
+      if (this.removalPending) {
+        // Keep removing (capped per frame) using the cached visible set — no need
+        // to rebuild the visible list / pending every frame during removal.
+        this.removalPending = this.removeUnusedChunks();
+      }
+      if (this.lodRemovalPending) this.lodRemovalPending = this.removeUnusedLodTiles();
     }
+  }
+
+  // ---- LOD ring management ---------------------------------------------------
+  // Recompute which LOD tiles should exist (annulus from the always-loaded core
+  // out to lodDistance, frustum-trimmed beyond LOD_NEAR_KEEP) and what stride
+  // each wants. Runs only on rescan — tile membership changes every 8 chunks of
+  // movement, so this is far rarer than the chunk rescan it piggybacks on.
+  // DETAIL LADDER, modelled on Distant Horizons' geometric drop-off (detail =
+  // floor(log2(dist/unit)) — each band is TWICE as wide as the previous, so the
+  // detail falloff reads smooth instead of stepping from blocks straight to
+  // coarse cells) + Voxy's screen-space rule (don't pay for sub-pixel detail:
+  // absolute caps keep cell size ~proportional to distance). Bands start at the
+  // VISIBLE edge (drawDistance): the first 6 chunks of LOD are FULL 1-block
+  // resolution — that's what makes the chunk→LOD seam nearly invisible (DH's
+  // default keeps block-res LOD out to 384 blocks for the same reason). Tiles
+  // deep inside the chunk ring are pure turn-around fill (hidden whenever the
+  // camera looks at them) and stay cheap.
+  private lodStrideFor(near: number): number {
+    const dd = this.drawDistance;
+    if (near < dd - 2) return 8;            // interior turn-fill — only ever glimpsed while chunks restream
+    const d = near - (dd - 2);              // chunks past the visible edge
+    let s = d < 6 ? 1 : d < 18 ? 2 : d < 42 ? 4 : d < 90 ? 8 : 16;   // geometric bands: 6, 12, 24, 48 wide
+    // Voxy-style absolute caps: at long range a fine cell is sub-pixel — waste.
+    // Thresholds sit ABOVE the deepest seam each stride can serve (the seam is
+    // at near ≈ dd-2, dd ≤ 64): a cap that ignored dd silently deleted the
+    // whole stride-1 band at dd ≥ 35, putting stride-2+ right against full-
+    // detail chunks — the exact "abrupt high→low def" pop this ladder exists
+    // to prevent. 1-block cells stay until ~800m, where they're sub-pixel.
+    if (s === 1 && near > 48) s = 2;
+    if (s === 2 && near > 80) s = 4;
+    if (s === 4 && near > 144) s = 8;
+    return s;
+  }
+
+  private updateLodTiles(pcx: number, pcz: number) {
+    this.lodDesired.clear();
+    // lodPending is rebuilt from scratch — clear every tile's queued flag too,
+    // or a tile queued before this rescan (and dropped here) could never
+    // re-queue (the !queued check would block it forever).
+    this.lodPending.length = 0;
+    for (const t of this.lodMap.values()) t.queued = false;
+    if (this.lodDistance <= 0) return;   // off → removeUnusedLodTiles drains everything
+
+    const T = LOD_TILE_CHUNKS, M = LOD_MEGA_CHUNKS;
+    // Inner edge: hug the always-resident chunk core so behind-camera ground
+    // (which frustum streaming unloads) is LOD-covered the instant you turn.
+    const lodStart = Math.min(FRUSTUM_NEAR_KEEP, Math.max(1, this.drawDistance - 1));
+    const useFrustum = this.frustumStreaming && !!this.activeCamera;
+    if (useFrustum) {
+      const cam = this.activeCamera!;
+      cam.updateMatrixWorld();
+      this._projScreen.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+      this._frustum.setFromProjectionMatrix(this._projScreen);
+      for (const p of this._frustum.planes) p.constant += FRUSTUM_MARGIN;
+    }
+    const W = this.chunkSize.width, H = this.chunkSize.height;
+
+    // Rect helpers in chunk units (rectangle [cx0..cx1]×[cz0..cz1] vs player).
+    const rectNear = (cx0: number, cx1: number, cz0: number, cz1: number) =>
+      Math.max(Math.max(cx0 - pcx, pcx - cx1, 0), Math.max(cz0 - pcz, pcz - cz1, 0));
+    const rectFar = (cx0: number, cx1: number, cz0: number, cz1: number) => Math.max(
+      Math.max(Math.abs(cx0 - pcx), Math.abs(cx1 - pcx)),
+      Math.max(Math.abs(cz0 - pcz), Math.abs(cz1 - pcz)));
+    // Residency test with a DISTANCE-SCALED inflation: the global margin is a
+    // fixed world-unit fattening, which shrinks to a fraction of a degree at
+    // far-tile distances — a megatile 2km out could leave the frustum on a
+    // small turn and only return a rescan later (ghost gap at the screen
+    // edge). Inflating the test box ~10% of its distance keeps a constant
+    // ANGULAR margin instead, so far tiles stay resident through small turns.
+    const frustumHit = (cx0: number, cx1: number, cz0: number, cz1: number, near: number) => {
+      const inflate = near * W * 0.10;
+      this._chunkBox.min.set(cx0 * W - inflate, 0, cz0 * W - inflate);
+      this._chunkBox.max.set((cx1 + 1) * W + inflate, H, (cz1 + 1) * W + inflate);
+      return this._frustum.intersectsBox(this._chunkBox);
+    };
+    const desire = (key: string, tx: number, tz: number, tileChunks: number, near: number, stride: number) => {
+      this.lodDesired.add(key);
+      let t = this.lodMap.get(key);
+      if (!t) {
+        t = { tx, tz, tileChunks, terrain: null, canopy: null, stride: 0, wantStride: stride, inflightStride: -1, queued: false, near, miss: 0 };
+        this.lodMap.set(key, t);
+      }
+      // Stride hysteresis: if the tile's APPLIED stride would still be chosen
+      // 2 chunks to either side, it's sitting near a band edge — keep it.
+      // Without this, walking back and forth across a band boundary re-meshes
+      // the whole tile every chunk-cross (worker + GPU-upload churn for zero
+      // visible change). Held only within ONE band step (≤2× apart): a tile
+      // crossing from interior fill (8) into the stride-1 seam band must
+      // re-mesh immediately — holding it would park a 8× coarser patch right
+      // against full-detail chunks. Megatiles are exempt (fixed stride 16).
+      if (t.stride > 0 && t.stride !== stride && tileChunks === LOD_TILE_CHUNKS &&
+        t.stride <= stride * 2 && stride <= t.stride * 2 &&
+        (t.stride === this.lodStrideFor(near - 2) || t.stride === this.lodStrideFor(near + 2))) {
+        stride = t.stride;
+      }
+      t.near = near;
+      t.miss = 0;
+      t.wantStride = stride;
+      if (t.stride !== stride && t.inflightStride !== stride && !t.queued) {
+        t.queued = true;
+        this.lodPending.push(key);
+      }
+      // visibleKeys just changed with this rescan → re-evaluate hiding for
+      // every tile that can overlap loaded chunks (the rest are plain visible).
+      if (t.terrain || t.canopy) this.refreshLodVisibility(t);
+    };
+
+    // Iterate the 16-chunk PARENT grid: a parent fully beyond LOD_MEGA_START
+    // becomes one stride-16 megatile; otherwise its four 8-chunk children are
+    // evaluated individually — a perfect partition, so the two grids can never
+    // gap or double-cover at the band boundary.
+    const m0x = Math.floor((pcx - this.lodDistance) / M), m1x = Math.floor((pcx + this.lodDistance) / M);
+    const m0z = Math.floor((pcz - this.lodDistance) / M), m1z = Math.floor((pcz + this.lodDistance) / M);
+    for (let mx = m0x; mx <= m1x; mx++) {
+      for (let mz = m0z; mz <= m1z; mz++) {
+        const mx0 = mx * M, mx1 = mx0 + M - 1, mz0 = mz * M, mz1 = mz0 + M - 1;
+        const mNear = rectNear(mx0, mx1, mz0, mz1);
+        if (mNear > this.lodDistance) continue;
+        if (mNear > LOD_MEGA_START) {
+          if (useFrustum && !frustumHit(mx0, mx1, mz0, mz1, mNear)) continue;
+          desire(`M${mx},${mz}`, mx, mz, M, mNear, 16);
+          continue;
+        }
+        for (let cx = 0; cx < 2; cx++) {
+          for (let cz = 0; cz < 2; cz++) {
+            const tx = mx * 2 + cx, tz = mz * 2 + cz;
+            const cx0 = tx * T, cx1 = cx0 + T - 1, cz0 = tz * T, cz1 = cz0 + T - 1;
+            const near = rectNear(cx0, cx1, cz0, cz1);
+            if (near > this.lodDistance) continue;
+            if (rectFar(cx0, cx1, cz0, cz1) < lodStart) continue;   // fully inside the always-loaded core
+            if (useFrustum && near > LOD_NEAR_KEEP && !frustumHit(cx0, cx1, cz0, cz1, near)) continue;
+            desire(`${tx},${tz}`, tx, tz, T, near, this.lodStrideFor(near));
+          }
+        }
+      }
+    }
+    this.lodPending.sort((a, b) => (this.lodMap.get(a)?.near ?? 0) - (this.lodMap.get(b)?.near ?? 0));
+    // Hysteresis bookkeeping: runs exactly once per RESCAN (this function),
+    // never per frame — removeUnusedLodTiles is re-called every frame during a
+    // capped removal burst and must not age tiles at frame rate.
+    for (const [key, t] of this.lodMap) {
+      if (!this.lodDesired.has(key)) t.miss++;
+    }
+  }
+
+  // Capped LOD-tile removal (mirrors removeUnusedChunks). Returns true if more remain.
+  // Tiles get LOD_REMOVAL_GRACE rescans of hysteresis before disposal: a quick
+  // look-away-and-back must NOT dispose + re-generate a whole frustum's worth
+  // of tiles (that churn was a real worker-time sink while mouse-looking).
+  private removeUnusedLodTiles(): boolean {
+    let removed = 0;
+    for (const [key, t] of this.lodMap) {
+      if (removed >= MAX_LOD_REMOVALS_PER_FRAME) return true;
+      if (!this.lodDesired.has(key)) {
+        // Grace counts RESCANS — a stationary player produces none, so with
+        // LOD turned off entirely the tiles would otherwise linger forever.
+        if (this.lodDistance > 0 && t.miss < LOD_REMOVAL_GRACE) continue;
+        // Reclaim the tile's in-flight slot too: a tile recreated at this key
+        // later must start from a clean single-in-flight state, or the orphan
+        // request's slot becomes unreclaimable when its worker dies. The orphan
+        // reply is harmless (apply path: key no longer in lodInflightWorker →
+        // no double-decrement; tile gone → discarded).
+        if (this.lodInflightWorker.delete(key)) this.lodOutstanding = Math.max(0, this.lodOutstanding - 1);
+        this.disposeLodTile(t);
+        this.lodMap.delete(key);
+        removed++;
+      }
+    }
+    return false;
+  }
+
+  private disposeLodTile(t: LodTile) {
+    for (const mesh of [t.terrain, t.canopy]) {
+      if (!mesh) continue;
+      mesh.geometry.dispose();
+      this.lodGroup.remove(mesh);
+    }
+    t.terrain = t.canopy = null;
+  }
+
+  // ---- LOD visibility -------------------------------------------------------
+  // A tile hides as soon as every chunk of it the CAMERA CAN SEE is loaded:
+  //   • loaded chunk            → covered (real terrain draws on top)
+  //   • within dd, ∉visibleKeys → the chunk system deliberately skipped it for
+  //                               VIEW reasons (frustum-trimmed) → off-screen,
+  //                               doesn't block hiding
+  //   • beyond dd / wanted-but-unloaded → genuinely visible → tile must show.
+  // This is what kills "LOD right next to the player": in view, the tile
+  // disappears the moment real chunks cover its on-screen part — while a tile
+  // BEHIND the camera (all chunks frustum-skipped) stays resident+visible, so
+  // turning around shows ground instantly. The old all-64-loaded rule almost
+  // never fired under frustum streaming (behind-camera chunks never load).
+  private noteChunkOverTile(chunk: WorldChunk) {
+    this.meshEpoch++;   // caster set changed → the shadow map needs one re-render
+    const { x, z } = chunk.userData as chunkCoords;
+    this.lodDirty.add(`${Math.floor(x / LOD_TILE_CHUNKS)},${Math.floor(z / LOD_TILE_CHUNKS)}`);
+    // The megatile owner too: inert today (megatiles start beyond the deepest
+    // possible chunk at dd 64), but if LOD_MEGA_START or the dd cap ever move,
+    // a covered megatile must still get its visibility re-evaluated.
+    this.lodDirty.add(`M${Math.floor(x / LOD_MEGA_CHUNKS)},${Math.floor(z / LOD_MEGA_CHUNKS)}`);
+  }
+  private refreshLodVisibility(t: LodTile) {
+    const T = t.tileChunks, dd = this.drawDistance;
+    const pcx = this.lastPlayerChunkX, pcz = this.lastPlayerChunkZ;
+    let anyLoaded = false, hide = true;
+    if (t.near > dd + 1) {
+      hide = false;   // no chunk of it can be loaded — skip the 64-cell scan
+    } else {
+      scan: for (let cx = t.tx * T; cx < t.tx * T + T; cx++) {
+        for (let cz = t.tz * T; cz < t.tz * T + T; cz++) {
+          const key = this.chunkKey(cx, cz);
+          if (this.chunkMap.get(key)?.loaded) { anyLoaded = true; continue; }
+          const offscreen = Math.max(Math.abs(cx - pcx), Math.abs(cz - pcz)) <= dd && !this.visibleKeys.has(key);
+          if (!offscreen) { hide = false; break scan; }   // someone can see this uncovered spot
+        }
+      }
+    }
+    const visible = !(hide && anyLoaded);
+    if (t.terrain) t.terrain.visible = visible;
+    if (t.canopy) t.canopy.visible = visible;
   }
 
   // Drain a bounded slice of the work each frame so the world streams in
@@ -319,11 +686,63 @@ export class World extends Three.Group {
           chunk.setMapTile(new Uint8Array(msg.mapTile));
         }
         this.applyFoliageVisibility(chunk);
+        this.noteChunkOverTile(chunk);   // re-evaluate the covering LOD tile's visibility
       } catch (e) {
         console.error('chunk apply failed, skipping', msg.key, e);
       }
     }
     if (batch.length) this.mapTileEpoch++;   // new tiles → let the minimap repaint once
+
+    // 1b) LOD tile applies, budgeted by VERTEX COUNT (not tile count): a far
+    // stride-8 tile is a few thousand verts but a stride-2 mountain tile can be
+    // ~50k — counting tiles would let two of those burst a frame with multi-MB
+    // GPU uploads. Always at least one tile per frame so the queue can't stall.
+    let lodApplied = 0, lodVertsApplied = 0;
+    while ((lodApplied === 0 || lodVertsApplied < LOD_APPLY_VERT_BUDGET) && this.lodApplyQueue.length > 0) {
+      const msg = this.lodApplyQueue.shift()!;
+      // Slot ownership = lodInflightWorker membership (exactly one request per
+      // tile). If the key is already gone the slot was reclaimed elsewhere
+      // (tile removal / worker death) — decrementing again would let the
+      // in-flight count drift below reality and overshoot the cap.
+      if (this.lodInflightWorker.delete(msg.key)) this.lodOutstanding = Math.max(0, this.lodOutstanding - 1);
+      const t = this.lodMap.get(msg.key);
+      if (!t) continue;                                  // tile removed before its build landed
+      if (msg.stride === t.inflightStride) t.inflightStride = -1;
+      // Tile in its removal-grace window (no longer desired, kept only as
+      // look-back hysteresis): don't build OR re-queue — its wantStride is
+      // stale, and rebuilding a tile that dies within ≤2 rescans is exactly
+      // the mouse-look churn the grace window exists to kill.
+      if (!this.lodDesired.has(msg.key)) continue;
+      if (msg.stride !== t.wantStride) {
+        // Stale detail level (band changed mid-flight). The tile was popped
+        // from lodPending when this request was dispatched, so re-queue it for
+        // the stride it wants now — nothing else would until the next rescan.
+        if (t.wantStride !== t.stride && !t.queued) { t.queued = true; this.lodPending.push(msg.key); }
+        continue;
+      }
+      if (msg.stride === t.stride && t.terrain) continue; // duplicate reply
+      try {
+        this.disposeLodTile(t);
+        t.terrain = this.buildLodMesh(payloadToArrays(msg.terrain), blockArrayMaterial, t);
+        t.canopy = this.buildLodMesh(payloadToArrays(msg.canopy), leafArrayMaterial, t);
+        t.stride = msg.stride;
+        this.refreshLodVisibility(t);
+        lodApplied++;
+        lodVertsApplied += ((msg.terrain?.positions.byteLength ?? 0) + (msg.canopy?.positions.byteLength ?? 0)) / 12;
+      } catch (e) {
+        console.error('lod tile apply failed, skipping', msg.key, e);
+      }
+    }
+
+    // 1c) Re-evaluate LOD tile visibility where real chunks (un)loaded this
+    // frame — a handful of 64-cell scans at most, far cheaper than it reads.
+    if (this.lodDirty.size) {
+      for (const key of this.lodDirty) {
+        const t = this.lodMap.get(key);
+        if (t) this.refreshLodVisibility(t);
+      }
+      this.lodDirty.clear();
+    }
 
     // 2) Request more generation (gated by in-flight = sent-but-not-applied).
     if (this.asyncLoading && this.workers.length > 0) {
@@ -342,6 +761,48 @@ export class World extends Three.Group {
       }
     }
 
+    // 2b) LOD tile gens — on the DEDICATED LOD thread, fully decoupled from
+    // chunk streaming (sustained movement keeps the chunk pipeline saturated
+    // forever; anything gated on it starves — the player would outrun the far
+    // terrain and see only chunks ahead). Deliberately OUTSIDE the chunk-pool
+    // branch above: a healthy lodWorker must keep dispatching even if every
+    // chunk worker has died (the pools are independent). Fallback without the
+    // dedicated worker: share the pool, but only while the chunk backlog is
+    // light. A lodWorker lost to a spawn failure is lazily retried here
+    // (throttled) — worker death can only respawn a worker that still exists.
+    if (this.asyncLoading && this.lodPending.length > 0) {
+      if (!this.lodWorker && (this.lodWorkerRetryTick++ & 127) === 0) {
+        this.lodWorker = this.spawnWorker();
+        this.lodWorker?.postMessage(this.buildWorkerConfig());
+      }
+      if (this.lodWorker || (this.workers.length > 0 && this.outstanding < this.maxOutstanding / 2)) {
+        while (this.lodOutstanding < MAX_LOD_OUTSTANDING && this.lodPending.length > 0) {
+          const key = this.lodPending.shift()!;
+          const t = this.lodMap.get(key);
+          if (!t) continue;
+          t.queued = false;
+          if (t.wantStride === t.stride) continue;       // resolved meanwhile
+          // At most ONE in-flight request per tile — a second concurrent one
+          // would break the key→worker slot accounting (the map can only track
+          // one, so a worker death could leak the untracked slot forever). If
+          // the in-flight build is for a stale stride, the apply path re-queues
+          // this tile the moment that reply lands.
+          if (t.inflightStride !== -1) continue;
+          const tileBlocks = t.tileChunks * this.chunkSize.width;
+          const request: WorkerRequest = {
+            type: 'lod', version: this.worldVersion, key,
+            worldX: t.tx * tileBlocks, worldZ: t.tz * tileBlocks,
+            tileBlocks, stride: t.wantStride,
+          };
+          const w = this.lodWorker ?? this.workers[this.nextWorker++ % this.workers.length];
+          w.postMessage(request);
+          t.inflightStride = t.wantStride;
+          this.lodOutstanding++;
+          this.lodInflightWorker.set(key, w);
+        }
+      }
+    }
+
     let builds = 0;
     for (const chunk of this.meshQueue) {
       if (builds >= this.maxMeshBuildsPerFrame) break;
@@ -349,10 +810,45 @@ export class World extends Three.Group {
       if (chunk.hasData && chunk.parent === this) {
         chunk.buildMeshes(this.getWorldBlock, this.getGrassTint);
         this.applyFoliageVisibility(chunk);
+        this.noteChunkOverTile(chunk);   // first build via the sync/no-worker path affects LOD visibility too
         this.mapTileEpoch++;   // rebuilt tile (edit/neighbour remesh) → minimap repaint
         builds++;
       }
     }
+  }
+
+  // Turn a transferred LOD geometry payload into a mesh under lodGroup. LOD
+  // tiles are pure scenery: castShadow=false (don't double the shadow-pass
+  // node count), inert to raycasts (the pick ray is 4 units / nearby-chunks
+  // only, but a no-op raycast makes them structurally unhittable), and static.
+  // receiveShadow MUST be true: it shares the chunk materials, and three keys
+  // the compiled program on (material, object.receiveShadow) — mixing values
+  // on one material made the renderer re-resolve the program (getParameters +
+  // cache-key build) on EVERY chunk↔LOD alternation in the draw order, a
+  // profiled multi-ms/frame CPU sink. Matching the chunks keeps one stable
+  // program; far tiles are outside the shadow camera anyway.
+  private buildLodMesh(arrays: GeometryArrays | null, material: Three.Material, t: LodTile): Three.Mesh | null {
+    if (!arrays || arrays.indices.length === 0) return null;
+    const geometry = new Three.BufferGeometry();
+    geometry.setAttribute('position', new Three.BufferAttribute(arrays.positions, 3));
+    geometry.setAttribute('normal', new Three.BufferAttribute(arrays.normals, 3));
+    geometry.setAttribute('tileUv', new Three.BufferAttribute(arrays.uvs, 2));
+    geometry.setAttribute('layerIndex', new Three.BufferAttribute(arrays.layers, 1));
+    if (arrays.colors) geometry.setAttribute('tintColor', new Three.BufferAttribute(arrays.colors, 4, true));
+    geometry.setIndex(new Three.BufferAttribute(arrays.indices, 1));
+    geometry.computeBoundingSphere();
+    const mesh = new Three.Mesh(geometry, material);
+    mesh.castShadow = false;
+    mesh.receiveShadow = true;
+    mesh.raycast = () => {};
+    const tileBlocks = t.tileChunks * this.chunkSize.width;
+    mesh.position.set(t.tx * tileBlocks, 0, t.tz * tileBlocks);
+    mesh.matrixAutoUpdate = false;
+    mesh.updateMatrix();
+    mesh.frustumCulled = this._frustumCulling;
+    this.lodGroup.add(mesh);
+    mesh.updateMatrixWorld(true);   // world subtree is frozen — compose once, AFTER parenting (needs lodGroup's y)
+    return mesh;
   }
 
   // Called once when a chunk first receives data: already-built neighbours drew
@@ -449,9 +945,12 @@ export class World extends Three.Group {
       if (removed >= this.maxRemovalsPerFrame) break;
       if (!this.visibleKeys.has(key)) {
         this.meshQueue.delete(chunk);
+        this.noteChunkOverTile(chunk);   // LOD tile over it may need to show again
         chunk.disposeInstance();
         this.remove(chunk);
         this.chunkMap.delete(key);
+        const c = chunk.userData as chunkCoords;
+        this.chunkNumMap.delete(World.numKey(c.x, c.z));
         removed++;
       }
     }
@@ -469,7 +968,9 @@ export class World extends Three.Group {
     chunk.updateMatrix();
 
     this.add(chunk);
+    chunk.updateMatrixWorld(true);   // world subtree is frozen — compose once at add
     this.chunkMap.set(this.chunkKey(x, z), chunk);
+    this.chunkNumMap.set(World.numKey(x, z), chunk);
 
     if (this.asyncLoading && this.workers.length > 0) {
       // The worker generates AND meshes off-thread, then posts back geometry.
@@ -517,13 +1018,15 @@ export class World extends Three.Group {
     }));
   }
 
-  private onWorkerMessage(msg: MeshMessage) {
+  private onWorkerMessage(msg: WorkerReply) {
     // Shape-guard the reply: a malformed message would otherwise throw deep inside
     // processQueues (per-frame) and escape animate() → permanent freeze.
-    if (!msg || msg.type !== 'mesh' || typeof msg.version !== 'number' || !(msg.data instanceof ArrayBuffer)) return;
+    if (!msg || typeof msg.version !== 'number') return;
     if (msg.version !== this.worldVersion) return; // stale (outstanding already reset on regenerate)
     // Defer the (costly) mesh creation to processQueues so a fast worker can't
     // flood a single frame. The in-flight slot is freed when it's applied.
+    if (msg.type === 'lodMesh' && typeof msg.key === 'string') { this.lodApplyQueue.push(msg); return; }
+    if (msg.type !== 'mesh' || !(msg.data instanceof ArrayBuffer)) return;
     this.applyQueue.push(msg);
   }
 
@@ -564,8 +1067,21 @@ export class World extends Three.Group {
     // Invalidate any in-flight worker results from the previous world.
     this.worldVersion++;
     this.disposeChunks();
+    // LOD teardown BEFORE this.clear(): dispose every tile's geometry explicitly
+    // (Group.clear() only detaches — the GPU buffers would leak on every
+    // regenerate/load/host-init) and reset all LOD queues/accounting.
+    for (const t of this.lodMap.values()) this.disposeLodTile(t);
+    this.lodMap.clear();
+    this.lodPending.length = 0;
+    this.lodApplyQueue.length = 0;
+    this.lodOutstanding = 0;
+    this.lodInflightWorker.clear();
+    this.lodDesired.clear();
+    this.lodDirty.clear();
     this.clear();
+    this.add(this.lodGroup);   // this.clear() detached the (now empty) LOD group — re-adopt it
     this.chunkMap.clear();
+    this.chunkNumMap.clear();
     this.pending = [];
     this.meshQueue.clear();
     this.applyQueue.length = 0;
@@ -593,19 +1109,23 @@ export class World extends Three.Group {
 
   // Is the chunk containing this world column loaded? Physics uses this to avoid
   // falling through terrain that hasn't streamed in yet (e.g. after a teleport).
+  // Allocation-free (numeric chunk key) — runs every physics step.
   isLoadedAt(worldX: number, worldZ: number): boolean {
-    const coords = this.worldToChunkCoords(worldX, 0, worldZ);
-    const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
+    const W = this.chunkSize.width;
+    const chunk = this.chunkNumMap.get(World.numKey(Math.floor(worldX / W), Math.floor(worldZ / W)));
     return !!chunk && chunk.loaded;
   }
 
-  // Allocation-free block id at a world coordinate (air if not loaded). Used by
-  // the physics broad phase, which queries dozens of cells every fixed step.
+  // TRULY allocation-free block id at a world coordinate (air if not loaded).
+  // Used by the physics broad phase (~50 queries/frame at 200 Hz substeps) —
+  // the old path allocated two coord objects + a template-string key per call
+  // through worldToChunkCoords/chunkKey, ~150 short-lived allocations a frame.
   getBlockId(x: number, y: number, z: number): number {
-    const coords = this.worldToChunkCoords(x, y, z);
-    const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
+    const W = this.chunkSize.width;
+    const cx = Math.floor(x / W), cz = Math.floor(z / W);
+    const chunk = this.chunkNumMap.get(World.numKey(cx, cz));
     if (chunk && chunk.loaded) {
-      return chunk.getBlockId(coords.block.x, coords.block.y, coords.block.z);
+      return chunk.getBlockId(x - cx * W, y, z - cz * W);
     }
     return BLOCK_IDS.air;
   }
@@ -721,6 +1241,7 @@ export class World extends Three.Group {
   // seam-digging can't hitch the click thread with several rebuilds at once (the
   // momentarily-stale border self-heals within a frame or two).
   private remeshAround(x: number, y: number, z: number, edited: WorldChunk) {
+    this.meshEpoch++;   // the edited chunk re-meshed synchronously → shadow map re-render
     for (const [dx, dy, dz] of FACE_NEIGHBOURS) {
       const coords = this.worldToChunkCoords(x + dx, y + dy, z + dz);
       const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);

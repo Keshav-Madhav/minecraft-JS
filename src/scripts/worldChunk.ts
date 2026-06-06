@@ -121,6 +121,10 @@ export class WorldChunk extends THREE.Group {
     // material, biome-tinted (plantColor). They cast cutout shadows only in ultra
     // (getFoliageShadows) — off by default to avoid shadow-acne + cost on thin geo.
     this.addGeometryMesh(plants, getFoliageShadows(), plantMaterial);
+    // The World subtree's automatic matrix traversal is frozen (see World
+    // constructor) — compose the freshly created child meshes' world matrices
+    // once here. Safe pre-add too (parent matrix falls back to local).
+    this.updateMatrixWorld(true);
     this.loaded = true;
   }
 

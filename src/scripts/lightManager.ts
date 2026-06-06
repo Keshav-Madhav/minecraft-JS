@@ -88,7 +88,12 @@ export class LightManager {
       const flick = s.flicker > 0
         ? 1 - s.flicker * (0.5 + 0.5 * Math.sin(time * 9 + bx[i] * 1.3 + bz[i] * 0.7))
         : 1;
-      L.intensity = s.intensity * flick;
+      // Distance rolloff near the gather edge: an emitter leaving MAX_DIST (or
+      // the nearest-24 set) used to snap to zero — walking through a lamp-lit
+      // village made torches visibly pop on/off. Fade over the last ~25% of
+      // range so they dim out instead.
+      const edge = Math.min(1, Math.max(0, (maxD2 - bd2[i]) / (maxD2 * 0.45)));
+      L.intensity = s.intensity * flick * edge;
     }
   }
 }

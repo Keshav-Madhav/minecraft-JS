@@ -74,6 +74,9 @@ class CloudLayer extends THREE.Mesh {
   private cloudMap: THREE.Texture;
   private height: number;
   private baseOpacity: number;   // style opacity; the master multiplier scales this
+  private basePlaneSize: number;
+  private baseRepeat: number;
+  private fadeEnd = 480;         // remembered so a shader compiled AFTER setFade picks it up
   private shader: { uniforms: { [k: string]: THREE.IUniform } } | null = null;
 
   constructor(style: LayerStyle) {
@@ -93,8 +96,11 @@ class CloudLayer extends THREE.Mesh {
     // Distance-from-camera alpha fade (horizontal distance, since clouds sit
     // overhead). uFadeEnd is kept just inside the camera far plane.
     mat.onBeforeCompile = (shader) => {
-      shader.uniforms.uFadeStart = { value: 120 };
-      shader.uniforms.uFadeEnd = { value: 480 };
+      // Initialised from the REMEMBERED fade: setViewDistance usually runs at
+      // boot, before the first render compiles this shader — the old fixed
+      // 120/480 init silently ignored that early call.
+      shader.uniforms.uFadeStart = { value: this.fadeEnd * 0.45 };
+      shader.uniforms.uFadeEnd = { value: this.fadeEnd };
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', '#include <common>\nvarying vec3 vWorldPos;')
         .replace('#include <begin_vertex>', '#include <begin_vertex>\nvWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
@@ -109,6 +115,8 @@ class CloudLayer extends THREE.Mesh {
     this.speed = style.speed;
     this.height = style.height;
     this.baseOpacity = style.opacity;
+    this.basePlaneSize = style.planeSize;
+    this.baseRepeat = style.repeat;
     // Face DOWN: underside seen looking up; culled looking down so clouds don't
     // obscure the top-down / orbit view.
     this.rotation.x = Math.PI / 2;
@@ -116,10 +124,18 @@ class CloudLayer extends THREE.Mesh {
   }
 
   setFade(end: number) {
+    this.fadeEnd = end;
     if (this.shader) {
       this.shader.uniforms.uFadeEnd.value = end;
       this.shader.uniforms.uFadeStart.value = end * 0.45;
     }
+    // Grow the plane so its hard geometric edge stays beyond the fade — at a
+    // 4km view (unified slider max) the fade reaches past the fixed plane's
+    // half-extent and a square cloud edge would show. Texture repeat scales
+    // with the plane so puff size stays constant.
+    const s = Math.max(1, (end * 2.3) / this.basePlaneSize);
+    this.scale.set(s, s, 1);
+    this.cloudMap.repeat.set(this.baseRepeat * s, this.baseRepeat * s);
   }
 
   setOpacity(mult: number) {

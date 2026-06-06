@@ -21,14 +21,18 @@ export type LightingControls = {
 };
 
 export type ShadowQuality = 'off' | 'low' | 'medium' | 'high' | 'ultra';
-export type QualityPreset = 'fast' | 'balanced' | 'fancy' | 'ultra' | 'custom';
+export type QualityPreset = 'low' | 'balanced' | 'fancy' | 'ultra' | 'max' | 'custom';
 
 // Quality / optimization handles. Presets set everything at once; the advanced
 // rows tune individual knobs (which flips the preset to 'custom').
 export type QualityControls = {
   applyPreset: (p: QualityPreset) => void,
   getPreset: () => QualityPreset,
-  getRenderDistance: () => number, setRenderDistance: (v: number) => void,
+  // Unified view distance (chunks): the value is the LOD horizon; the
+  // full-detail chunk ring defaults to a quarter of it (mapped in main.ts).
+  getViewDistance: () => number, setViewDistance: (v: number) => void,
+  // Advanced override for the full-detail ring (decoupled from the ¼ rule).
+  getDetailDistance: () => number, setDetailDistance: (v: number) => void,
   getFoliage: () => boolean, setFoliage: (v: boolean) => void,
   getFoliageDistance: () => number, setFoliageDistance: (v: number) => void,
   getShadowQuality: () => ShadowQuality, setShadowQuality: (v: ShadowQuality) => void,
@@ -62,7 +66,7 @@ export type PlayerViewControls = {
 
 export type StatsSnapshot = {
   fps: number, x: number, y: number, z: number,
-  drawCalls: number, triangles: number, chunks: number,
+  drawCalls: number, triangles: number, chunks: number, lodTiles: number,
   geometries: number, textures: number, mode: GameMode, flying: boolean, onGround: boolean,
 };
 
@@ -236,7 +240,7 @@ export function createMenu(opts: MenuOptions): MenuController {
   statsBody.append(statGrid);
   // name → value element
   const statRows: Record<string, HTMLElement> = {};
-  const STAT_ORDER = ['Mode', 'FPS', 'Position', 'State', 'Draw calls', 'Triangles', 'Chunks loaded', 'GPU geometries', 'GPU textures'];
+  const STAT_ORDER = ['Mode', 'FPS', 'Position', 'State', 'Draw calls', 'Triangles', 'Chunks loaded', 'LOD tiles', 'GPU geometries', 'GPU textures'];
   for (const name of STAT_ORDER) {
     statGrid.append(el('div', 'menu__stat-k', name));
     const v = el('div', 'menu__stat-v', '—');
@@ -257,6 +261,7 @@ export function createMenu(opts: MenuOptions): MenuController {
     statRows['Draw calls'].textContent = String(s.drawCalls);
     statRows['Triangles'].textContent = s.triangles.toLocaleString();
     statRows['Chunks loaded'].textContent = String(s.chunks);
+    statRows['LOD tiles'].textContent = String(s.lodTiles);
     statRows['GPU geometries'].textContent = String(s.geometries);
     statRows['GPU textures'].textContent = String(s.textures);
   };
@@ -431,9 +436,16 @@ export function createMenu(opts: MenuOptions): MenuController {
   // --- Quality: preset + an Advanced drawer split into Graphics / Performance / Debug ---
   const q = addSection(setBody, '⚡  Quality');
   const presetRow = remember(addSegmented<QualityPreset>(q, 'Preset',
-    [{ value: 'fast', label: 'Fast' }, { value: 'balanced', label: 'Balanced' }, { value: 'fancy', label: 'Fancy' }, { value: 'ultra', label: 'Ultra' }],
+    [{ value: 'low', label: 'Low' }, { value: 'balanced', label: 'Balanced' }, { value: 'fancy', label: 'Fancy' }, { value: 'ultra', label: 'Ultra' }, { value: 'max', label: 'MAX' }],
     quality.getPreset,   // returns 'custom' when knobs were tuned → no preset highlighted
     (v) => { quality.applyPreset(v); syncSettings(); opts.onViewDistanceChange(); }));
+  // MAX warning: shown whenever the MAX preset is active (it pins EVERY slider).
+  const maxWarn = el('div', 'menu__hint', '⚠ MAX pins everything to its limit — 4 km view, 64 full-detail chunks, 8K soft shadows, post-FX, 2× supersampling. Expect heavy GPU/RAM load and a long initial load. For monster machines.');
+  maxWarn.style.color = '#ffb054';
+  (maxWarn as any)._sync = () => { maxWarn.style.display = quality.getPreset() === 'max' ? '' : 'none'; };
+  (maxWarn as any)._sync();
+  syncables.push(maxWarn);
+  q.append(maxWarn);
   const adv = addSection(q, 'Advanced', true);
   // Tuning ANY advanced knob flips the preset to 'custom' (in the main.ts setters);
   // reflect that instantly by re-syncing the Preset chip (it de-highlights). Delegated
@@ -475,9 +487,19 @@ export function createMenu(opts: MenuOptions): MenuController {
 
   // PERFORMANCE — how hard the machine works.
   adv.append(el('div', 'ui-subhead', 'Performance'));
-  remember(addSlider(adv, 'Render Distance (chunks)', {
-    min: 2, max: 64, step: 1,   // up to 64 chunks (VERY heavy on RAM — for strong machines)
-    get: quality.getRenderDistance, set: quality.setRenderDistance,   // setter already re-applies the view distance
+  // ONE view-distance knob: the slider is the total visible horizon (LOD far
+  // terrain); the full-detail chunk ring (physics, edits, mobs-of-the-future)
+  // is always a quarter of it — 256 ⇒ 64 real chunks + ~4km of LOD scenery.
+  remember(addSlider(adv, 'View Distance (chunks, ¼ full detail)', {
+    min: 4, max: 256, step: 1,
+    get: quality.getViewDistance, set: quality.setViewDistance,   // setter re-applies camera/fog/water spans
+  }));
+  // Decoupled full-detail override: how far REAL (physics/edit) chunks reach.
+  // The View Distance slider above resets this to its ¼ default when moved —
+  // this knob is for "tiny detail ring, huge LOD horizon" (or the reverse).
+  remember(addSlider(adv, 'Full-Detail Distance (chunks)', {
+    min: 2, max: 64, step: 1,
+    get: quality.getDetailDistance, set: quality.setDetailDistance,
   }));
   remember(addSlider(adv, 'Resolution Scale', {
     min: 0.5, max: 2, step: 0.05, decimals: 2,   // >1 = supersample (SSAA): crisp but heavy

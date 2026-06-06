@@ -344,9 +344,17 @@ export class WorldMap {
   }
 
   // Called every frame.
+  private lastMarkerYaw = NaN;
   update() {
     const p = this.opts.getPlayer();
-    this.miniMarker.style.transform = `translate(-50%, -50%) rotate(${p.yaw}rad)`;
+    // Write the marker transform only when the yaw actually changed — an
+    // unconditional per-frame style write forces a style invalidation even
+    // while standing perfectly still (yaw quantized so micro-jitter is free).
+    const yawQ = Math.round(p.yaw * 200);
+    if (yawQ !== this.lastMarkerYaw) {
+      this.lastMarkerYaw = yawQ;
+      this.miniMarker.style.transform = `translate(-50%, -50%) rotate(${p.yaw}rad)`;
+    }
     // Only recomposite when the result would actually differ: the integer screen
     // origin (same maths as compositeMini) MOVED, or the heartbeat fired AND a tile
     // actually changed since the last paint (epoch). So a stationary player over

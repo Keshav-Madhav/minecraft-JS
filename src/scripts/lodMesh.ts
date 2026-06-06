@@ -1,0 +1,331 @@
+import { WorldSampler, lodSurfaceBlock, climateGrassTint, ICE_SURFACE_TEMP, LOD_CANOPY, BIOME } from './chunkGen';
+import { BLOCK_IDS, BLOCK_FACE_LAYERS } from './blockTypes';
+import type { GeometryArrays } from './chunkMesh';
+
+// LOD FAR-TERRAIN MESHER — builds one big blocky-heightmap tile (default 8×8
+// chunks = 128×128 blocks) straight from the deterministic world sampler at a
+// coarse stride, with NO voxel data: flat top quads at each sampled column's
+// height, vertical walls where neighbouring cells differ, and a statistical
+// leaf-box canopy so distant forests read as forests. DOM/THREE-free so it runs
+// in the chunk worker (same constraint as chunkMesh). Costs ~(N+2)² sampler
+// calls per tile (the sampler is ~40-55 simplex evals — sampling at stride is
+// the whole point; never call it per block here).
+//
+// Conventions shared with chunkMesh so LOD lines up EXACTLY with real chunks:
+// block i's faces sit at i±0.5 in tile-local coords (mesh.position = tile world
+// origin, a multiple of 16); a column of height h has its top face at h+0.5;
+// UVs are local coords +0.5 so the shader's fract() tiles one texture per block.
+// Winding matches chunkMesh's DIR_META (CCW front faces, outward normals).
+
+// Terrain walls: the first few blocks under the surface are the column's subId
+// (dirt under grass, sandstone under sand); anything deeper reads as stone —
+// matching generateTerrain's 4-block subsurface + deep rock.
+const SUB_DEPTH = 3;
+
+// hash in [0,1) — pure fn of world coords (canopy is statistical: tree spots
+// need to be stable per cell, not to match generateFeatures' RNG ordering).
+function hash01(x: number, z: number): number {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(z | 0, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+// Growable typed-array accumulator. A stride-4 mountain/forest tile emits tens
+// of thousands of vertices — number[].push() accumulators (fine for 16×16
+// chunks) would churn the worker GC at this scale, so we write into pre-sized
+// typed arrays and double on demand.
+class Acc {
+  pos: Float32Array; norm: Float32Array; uv: Float32Array; layer: Float32Array;
+  col: Uint8Array; idx: Uint32Array;
+  v = 0; i = 0;   // vertex / index counts
+  constructor(vcap: number) {
+    this.pos = new Float32Array(vcap * 3); this.norm = new Float32Array(vcap * 3);
+    this.uv = new Float32Array(vcap * 2); this.layer = new Float32Array(vcap);
+    this.col = new Uint8Array(vcap * 4); this.idx = new Uint32Array(vcap + (vcap >> 1));
+  }
+  private grow(minV: number, minI: number) {
+    const vcap = Math.max(minV, (this.layer.length * 2) | 0);
+    const icap = Math.max(minI, (this.idx.length * 2) | 0);
+    const g = <T extends Float32Array | Uint8Array | Uint32Array>(a: T, n: number): T => {
+      const b = new (a.constructor as new (n: number) => T)(n); b.set(a as never); return b;
+    };
+    if (minV > this.layer.length) {
+      this.pos = g(this.pos, vcap * 3); this.norm = g(this.norm, vcap * 3);
+      this.uv = g(this.uv, vcap * 2); this.layer = g(this.layer, vcap); this.col = g(this.col, vcap * 4);
+    }
+    if (minI > this.idx.length) this.idx = g(this.idx, icap);
+  }
+  // One axis-aligned quad: 4 corners (xyz each), shared normal, per-corner uv,
+  // one texture layer, one rgba tint (a = emissive, always 0 for LOD).
+  quad(c: Float32Array, nx: number, ny: number, nz: number, uvs: Float32Array,
+    layer: number, r: number, g: number, b: number) {
+    if (this.v + 4 > this.layer.length || this.i + 6 > this.idx.length) this.grow(this.v + 4, this.i + 6);
+    const v0 = this.v;
+    for (let k = 0; k < 4; k++) {
+      const p = (v0 + k) * 3, t = (v0 + k) * 2, c4 = (v0 + k) * 4;
+      this.pos[p] = c[k * 3]; this.pos[p + 1] = c[k * 3 + 1]; this.pos[p + 2] = c[k * 3 + 2];
+      this.norm[p] = nx; this.norm[p + 1] = ny; this.norm[p + 2] = nz;
+      this.uv[t] = uvs[k * 2]; this.uv[t + 1] = uvs[k * 2 + 1];
+      this.layer[v0 + k] = layer;
+      this.col[c4] = r; this.col[c4 + 1] = g; this.col[c4 + 2] = b; this.col[c4 + 3] = 0;
+    }
+    this.v += 4;
+    const ix = this.i;
+    this.idx[ix] = v0; this.idx[ix + 1] = v0 + 1; this.idx[ix + 2] = v0 + 2;
+    this.idx[ix + 3] = v0; this.idx[ix + 4] = v0 + 2; this.idx[ix + 5] = v0 + 3;
+    this.i += 6;
+  }
+  finalize(): GeometryArrays | null {
+    if (this.i === 0) return null;
+    return {
+      positions: this.pos.slice(0, this.v * 3),
+      normals: this.norm.slice(0, this.v * 3),
+      uvs: this.uv.slice(0, this.v * 2),
+      layers: this.layer.slice(0, this.v),
+      indices: this.v > 65535 ? this.idx.slice(0, this.i) : Uint16Array.from(this.idx.subarray(0, this.i)),
+      colors: this.col.slice(0, this.v * 4),
+    };
+  }
+}
+
+// scratch buffers reused across quads (no per-quad allocation)
+const _c = new Float32Array(12);
+const _uv = new Float32Array(8);
+
+// Corner/uv layouts mirror chunkMesh DIR_META windings (verified CCW per face).
+function topQuad(acc: Acc, x0: number, x1: number, z0: number, z1: number, y: number,
+  layer: number, r: number, g: number, b: number) {
+  _c.set([x0, y, z0, x0, y, z1, x1, y, z1, x1, y, z0]);
+  _uv.set([x0 + .5, z0 + .5, x0 + .5, z1 + .5, x1 + .5, z1 + .5, x1 + .5, z0 + .5]);
+  acc.quad(_c, 0, 1, 0, _uv, layer, r, g, b);
+}
+function bottomQuad(acc: Acc, x0: number, x1: number, z0: number, z1: number, y: number,
+  layer: number, r: number, g: number, b: number) {
+  _c.set([x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1]);
+  _uv.set([x0 + .5, z0 + .5, x1 + .5, z0 + .5, x1 + .5, z1 + .5, x0 + .5, z1 + .5]);
+  acc.quad(_c, 0, -1, 0, _uv, layer, r, g, b);
+}
+function xWall(acc: Acc, x: number, y0: number, y1: number, z0: number, z1: number, sign: number,
+  layer: number, r: number, g: number, b: number) {
+  if (sign > 0) _c.set([x, y0, z0, x, y1, z0, x, y1, z1, x, y0, z1]);
+  else _c.set([x, y0, z0, x, y0, z1, x, y1, z1, x, y1, z0]);
+  if (sign > 0) _uv.set([z0 + .5, y0 + .5, z0 + .5, y1 + .5, z1 + .5, y1 + .5, z1 + .5, y0 + .5]);
+  else _uv.set([z0 + .5, y0 + .5, z1 + .5, y0 + .5, z1 + .5, y1 + .5, z0 + .5, y1 + .5]);
+  acc.quad(_c, sign, 0, 0, _uv, layer, r, g, b);
+}
+function zWall(acc: Acc, z: number, y0: number, y1: number, x0: number, x1: number, sign: number,
+  layer: number, r: number, g: number, b: number) {
+  if (sign > 0) _c.set([x0, y0, z, x1, y0, z, x1, y1, z, x0, y1, z]);
+  else _c.set([x0, y0, z, x0, y1, z, x1, y1, z, x1, y0, z]);
+  if (sign > 0) _uv.set([x0 + .5, y0 + .5, x1 + .5, y0 + .5, x1 + .5, y1 + .5, x0 + .5, y1 + .5]);
+  else _uv.set([x0 + .5, y0 + .5, x0 + .5, y1 + .5, x1 + .5, y1 + .5, x1 + .5, y0 + .5]);
+  acc.quad(_c, 0, 0, sign, _uv, layer, r, g, b);
+}
+
+export type LodTileGeometry = { terrain: GeometryArrays | null, canopy: GeometryArrays | null };
+
+export function buildLodTile(
+  sample: WorldSampler, sea: number, maxY: number,
+  worldX: number, worldZ: number, tileBlocks: number, stride: number,
+): LodTileGeometry {
+  const N = (tileBlocks / stride) | 0;   // cells per side
+  const G = N + 2;                       // sampled grid incl. a 1-cell ring from neighbour tiles
+  // per-grid-cell column data (ring included so tile-border walls + canopy
+  // culling are seamless — the sampler is global, so neighbours agree exactly)
+  const hgt = new Int16Array(G * G);
+  const top = new Uint8Array(G * G);     // block id at the surface (ids ≤ 255)
+  const sub = new Uint8Array(G * G);
+  const biom = new Uint8Array(G * G);
+  const wet = new Uint8Array(G * G);     // 1 = submerged (incl. frozen-over) → no canopy
+  const tint = new Uint8Array(G * G * 3);
+
+  for (let gz = 0; gz < G; gz++) {
+    for (let gx = 0; gx < G; gx++) {
+      const cs = sample(worldX + (gx - 1) * stride, worldZ + (gz - 1) * stride);
+      const o = gz * G + gx;
+      let h = cs.height, t = lodSurfaceBlock(cs, sea), s = cs.subId;
+      if (h < sea) {
+        wet[o] = 1;
+        // frozen ocean/river: the walkable ice sheet caps the column at sea level
+        if (cs.temp < ICE_SURFACE_TEMP) { h = sea; t = BLOCK_IDS.ice; s = BLOCK_IDS.ice; }
+      }
+      hgt[o] = h; top[o] = t; sub[o] = s; biom[o] = cs.biome;
+      if (wet[o]) {
+        // Submerged: bake a depth-darkening into the seabed tint (mirrors the
+        // minimap's shade curve). Without it, bright sand glows through the
+        // semi-transparent water plane across the whole far ocean — before LOD
+        // the plane blended over sky back there, so deep water read dark; a
+        // uniformly bright floor made all far water look washed-out/shallow.
+        const f = 1 - 0.5 * Math.min((sea - h) / 40, 1);   // h=sea (ice) → 1, deep → 0.5
+        const v = (f * 255) | 0;
+        tint[o * 3] = v; tint[o * 3 + 1] = v; tint[o * 3 + 2] = v;
+      } else {
+        const gt = climateGrassTint(cs.temp, cs.humid);
+        tint[o * 3] = (gt[0] * 255) | 0; tint[o * 3 + 1] = (gt[1] * 255) | 0; tint[o * 3 + 2] = (gt[2] * 255) | 0;
+      }
+    }
+  }
+
+  const terrain = new Acc(N * N * 4 + 256);
+  const STONE_SIDE = BLOCK_FACE_LAYERS[BLOCK_IDS.stone][0];
+
+  // ---- TOP QUADS, greedy-merged per (height, layer, tint) ------------------
+  // key packs height(0..319)·layer(0..255)·tint12 into an int32; tint only
+  // differentiates grass tops (everything else merges freely on height+layer).
+  const tintBucket = (o: number) =>
+    ((tint[o * 3] >> 4) << 8) | ((tint[o * 3 + 1] >> 4) << 4) | (tint[o * 3 + 2] >> 4);
+  const mask = new Int32Array(N * N);
+  for (let cz = 0; cz < N; cz++) {
+    for (let cx = 0; cx < N; cx++) {
+      const o = (cz + 1) * G + (cx + 1);
+      const layer = (BLOCK_FACE_LAYERS[top[o]] ?? BLOCK_FACE_LAYERS[BLOCK_IDS.stone])[2];
+      // tint participates in the merge key for grass (climate tint) AND
+      // submerged cells (depth shade) so merged quads stay colour-uniform
+      const tb = top[o] === BLOCK_IDS.grass || wet[o] ? tintBucket(o) : 0;
+      mask[cz * N + cx] = ((hgt[o] * 256 + layer) * 4096 + tb) | 0;
+    }
+  }
+  for (let cz = 0; cz < N; cz++) {
+    let cx = 0;
+    while (cx < N) {
+      const m = mask[cz * N + cx];
+      if (m === 0) { cx++; continue; }
+      let w = 1;
+      while (cx + w < N && mask[cz * N + cx + w] === m) w++;
+      let d = 1, grow = true;
+      while (cz + d < N && grow) {
+        for (let k = 0; k < w; k++) if (mask[(cz + d) * N + cx + k] !== m) { grow = false; break; }
+        if (grow) d++;
+      }
+      const o = (cz + 1) * G + (cx + 1);
+      const h = hgt[o], layer = (m / 4096 | 0) % 256;
+      let r = 255, g = 255, b = 255;
+      if (top[o] === BLOCK_IDS.grass || wet[o]) { r = tint[o * 3]; g = tint[o * 3 + 1]; b = tint[o * 3 + 2]; }
+      topQuad(terrain,
+        cx * stride - 0.5, (cx + w) * stride - 0.5,
+        cz * stride - 0.5, (cz + d) * stride - 0.5,
+        h + 0.5, layer, r, g, b);
+      for (let dz = 0; dz < d; dz++) for (let k = 0; k < w; k++) mask[(cz + dz) * N + cx + k] = 0;
+      cx += w;
+    }
+  }
+
+  // ---- WALLS between cells of different height ------------------------------
+  // Emitted when EITHER side is an interior cell, so tile-boundary slopes are
+  // gap-free without needing the neighbour tile (when both tiles are resident
+  // the boundary wall is emitted twice with identical world geometry — benign).
+  // Wall = the exposed side of the HIGHER column, faced toward the lower one;
+  // top SUB_DEPTH blocks use the higher column's subId, the rest reads stone.
+  const wall = (
+    emit: (y0: number, y1: number, layer: number) => void,
+    oHi: number, lo: number, hi: number, sideDir: number,   // sideDir: BLOCK_FACE_LAYERS index (0/1 = ±x, 4/5 = ±z)
+  ) => {
+    const subTop = Math.max(lo, hi - SUB_DEPTH);
+    const sideLayers = BLOCK_FACE_LAYERS[sub[oHi]] ?? BLOCK_FACE_LAYERS[BLOCK_IDS.dirt];
+    if (subTop > lo) emit(lo + 0.5, subTop + 0.5, STONE_SIDE);
+    emit(subTop + 0.5, hi + 0.5, sideLayers[sideDir]);
+  };
+  for (let gz = 1; gz <= N; gz++) {        // interior cell rows (grid index)
+    for (let gx = 0; gx <= N; gx++) {      // x-borders: between grid cols gx and gx+1 (every border touches ≥1 interior cell)
+      const a = gz * G + gx, b2 = a + 1;
+      const ha = hgt[a], hb = hgt[b2];
+      if (ha === hb) continue;
+      const x = gx * stride - 0.5;                   // border plane (cell 0's west face sits at -0.5)
+      const z0 = (gz - 1) * stride - 0.5, z1 = gz * stride - 0.5;
+      if (ha > hb) wall((y0, y1, l) => xWall(terrain, x, y0, y1, z0, z1, 1, l, 255, 255, 255), a, hb, ha, 0);
+      else wall((y0, y1, l) => xWall(terrain, x, y0, y1, z0, z1, -1, l, 255, 255, 255), b2, ha, hb, 1);
+    }
+  }
+  for (let gx = 1; gx <= N; gx++) {
+    for (let gz = 0; gz <= N; gz++) {      // z-borders
+      const a = gz * G + gx, b2 = a + G;
+      const ha = hgt[a], hb = hgt[b2];
+      if (ha === hb) continue;
+      const z = gz * stride - 0.5;
+      const x0 = (gx - 1) * stride - 0.5, x1 = gx * stride - 0.5;
+      if (ha > hb) wall((y0, y1, l) => zWall(terrain, z, y0, y1, x0, x1, 1, l, 255, 255, 255), a, hb, ha, 4);
+      else wall((y0, y1, l) => zWall(terrain, z, y0, y1, x0, x1, -1, l, 255, 255, 255), b2, ha, hb, 5);
+    }
+  }
+
+  // ---- STATISTICAL TREES ----------------------------------------------------
+  // Exact tree positions are unreachable (generateFeatures' RNG consumption
+  // order), so distant forests are reproduced statistically — but on a WORLD-
+  // FIXED 4-block grid, the same cell size generateFeatures uses (CELL=4, one
+  // tree pick per cell): tree positions are a pure function of world coords,
+  // so they are IDENTICAL at every stride. When a tile re-meshes at a new
+  // detail level the forest stays put (no reshuffle pop), density matches the
+  // real worldgen 1:1 (prob is per-cell, no scaling), and a tree near a tile
+  // border is owned by exactly one tile (its blob may poke past the boundary —
+  // harmless, the bounding sphere covers it).
+  // Blobs are 3-5 blocks with a log trunk; canopy goes in a SEPARATE geometry
+  // (leaf textures are alpha-cutout with BLACK hole texels → they need the
+  // alpha-tested leaf material). Trunks are opaque → the terrain mesh.
+  const canopy = new Acc(1024);
+  const CGRID = 4;
+  const cgN = (tileBlocks / CGRID) | 0;
+  for (let cgz = 0; cgz < cgN; cgz++) {
+    for (let cgx = 0; cgx < cgN; cgx++) {
+      const wx = worldX + cgx * CGRID, wz = worldZ + cgz * CGRID;
+      const h2 = hash01(wx + 31337, wz - 7331);     // size/height jitter
+      const h3 = hash01(wx - 911, wz + 577);        // X placement
+      const h4 = hash01(wx + 247, wz + 131);        // Z placement
+      // nearest sampled column AT THE JITTERED TREE SPOT (not the cell centre —
+      // on a stride-1 slope a 2-block offset is several blocks of height, and
+      // a trunk anchored to the wrong column floats above / buries into the
+      // terrain top drawn at its real column)
+      const jx = cgx * CGRID + ((h3 * CGRID) | 0), jz = cgz * CGRID + ((h4 * CGRID) | 0);
+      const gx = Math.min(N, Math.max(1, Math.round(jx / stride) + 1));
+      const gz = Math.min(N, Math.max(1, Math.round(jz / stride) + 1));
+      const o = gz * G + gx;
+      if (wet[o]) continue;
+      const c = LOD_CANOPY[biom[o]];
+      if (!c) continue;
+      if (hash01(wx, wz) >= c.prob) continue;       // per-4×4-cell chance, same as generateFeatures
+      const blobW = 3 + ((h2 * 3) | 0);             // 3..5 blocks
+      const ground = hgt[o];
+      const y0 = ground + c.base;
+      const y1 = Math.min(maxY, y0 + c.height + ((h2 * 3) | 0));
+      if (y1 <= y0) continue;
+      const L = BLOCK_FACE_LAYERS[c.leafId] ?? BLOCK_FACE_LAYERS[BLOCK_IDS.leaves];
+      let r = 255, g = 255, b = 255;
+      if (c.tinted) { r = tint[o * 3]; g = tint[o * 3 + 1]; b = tint[o * 3 + 2]; }
+      // blob centred on the jittered spot (same column the ground was sampled at)
+      const x0 = jx - blobW / 2, x1 = x0 + blobW;
+      const z0 = jz - blobW / 2, z1 = z0 + blobW;
+      // Snow-capped trees: generateFeatures snow-caps conifers in the COLD
+      // biomes (taiga / snowy / mountain range — even over grass/podzol
+      // ground) and anywhere the surface itself is snow. Mirror both with a
+      // snow TOP face (untinted white) so distant cold forests match the
+      // near ones — bald green LOD conifers next to real snow-capped ones
+      // was a visibly wrong tree style.
+      const coldBiome = biom[o] === BIOME.taiga || biom[o] === BIOME.snowy || biom[o] === BIOME.mountains;
+      if (coldBiome || top[o] === BLOCK_IDS.snow) {
+        topQuad(canopy, x0, x1, z0, z1, y1, BLOCK_FACE_LAYERS[BLOCK_IDS.snow][2], 255, 255, 255);
+      } else {
+        topQuad(canopy, x0, x1, z0, z1, y1, L[2], r, g, b);
+      }
+      bottomQuad(canopy, x0, x1, z0, z1, y0, L[3], r, g, b);
+      xWall(canopy, x1, y0, y1, z0, z1, 1, L[0], r, g, b);
+      xWall(canopy, x0, y0, y1, z0, z1, -1, L[1], r, g, b);
+      zWall(canopy, z1, y0, y1, x0, x1, 1, L[4], r, g, b);
+      zWall(canopy, z0, y0, y1, x0, x1, -1, L[5], r, g, b);
+      // Trunk: a 1-block log column from the surface to the canopy bottom,
+      // centred under the blob — grounds the tree (no more floating slabs).
+      // Skipped at coarse strides: a 1-block post at 700m+ is sub-pixel.
+      if (stride > 4) continue;
+      const TL = BLOCK_FACE_LAYERS[c.trunkId] ?? BLOCK_FACE_LAYERS[BLOCK_IDS.tree];
+      const tcx = (x0 + x1) / 2, tcz = (z0 + z1) / 2;
+      const tx0 = tcx - 0.5, tx1 = tcx + 0.5, tz0 = tcz - 0.5, tz1 = tcz + 0.5;
+      const ty0 = ground + 0.5, ty1 = y0;
+      if (ty1 > ty0) {
+        xWall(terrain, tx1, ty0, ty1, tz0, tz1, 1, TL[0], 255, 255, 255);
+        xWall(terrain, tx0, ty0, ty1, tz0, tz1, -1, TL[1], 255, 255, 255);
+        zWall(terrain, tz1, ty0, ty1, tx0, tx1, 1, TL[4], 255, 255, 255);
+        zWall(terrain, tz0, ty0, ty1, tx0, tx1, -1, TL[5], 255, 255, 255);
+      }
+    }
+  }
+
+  return { terrain: terrain.finalize(), canopy: canopy.finalize() };
+}
