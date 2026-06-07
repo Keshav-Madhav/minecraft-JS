@@ -77,6 +77,12 @@ class CloudLayer extends THREE.Mesh {
   private basePlaneSize: number;
   private baseRepeat: number;
   private fadeEnd = 480;         // remembered so a shader compiled AFTER setFade picks it up
+  // Coverage compensation: at multi-km view distances the visible sky area is
+  // 4-5× what the cloud opacities were tuned for — the same layers read as
+  // permanent OVERCAST (grey backdrop, washed-out scene mood). Thin the layers
+  // as the fade radius grows so big views keep blue sky between the puffs.
+  private distFactor = 1;
+  private lastMult = 1;
   private shader: { uniforms: { [k: string]: THREE.IUniform } } | null = null;
 
   constructor(style: LayerStyle) {
@@ -136,10 +142,14 @@ class CloudLayer extends THREE.Mesh {
     const s = Math.max(1, (end * 2.3) / this.basePlaneSize);
     this.scale.set(s, s, 1);
     this.cloudMap.repeat.set(this.baseRepeat * s, this.baseRepeat * s);
+    // thinner layers when the visible sky is huge (see distFactor comment)
+    this.distFactor = Math.min(1, Math.max(0.5, 450 / end));
+    this.setOpacity(this.lastMult);
   }
 
   setOpacity(mult: number) {
-    (this.material as THREE.MeshBasicMaterial).opacity = this.baseOpacity * mult;
+    this.lastMult = mult;
+    (this.material as THREE.MeshBasicMaterial).opacity = this.baseOpacity * mult * this.distFactor;
   }
 
   update(px: number, pz: number, elapsed: number) {
@@ -166,9 +176,13 @@ export class Clouds extends THREE.Group {
   }
 
   // Keep the fade just inside the camera far plane so clouds dissolve smoothly
-  // instead of being hard-clipped.
+  // instead of being hard-clipped — but CAP the radius: clouds are a local
+  // overhead feature. Letting them stretch to the multi-km LOD horizon piled
+  // perspective-compressed cloud texture into the horizon band (flat planes at
+  // grazing angles), turning every wide view permanently overcast-grey.
   setViewDistance(cameraFar: number) {
-    for (const l of this.cloudLayers) l.setFade(cameraFar * 0.92);
+    const fade = Math.min(cameraFar * 0.92, 520);
+    for (const l of this.cloudLayers) l.setFade(fade);
   }
 
   update(px: number, pz: number, elapsed: number) {

@@ -72,7 +72,7 @@ try {
   // Wait until chunk pending drains AND some lod meshes applied near here.
   await page.waitForFunction(() => {
     const w = window.__mcDebug.world;
-    return w.lodGroup.children.length > 20 && w.chunkCount > 150;
+    return w.lodBuiltCount > 20 && w.chunkCount > 150;
   }, null, { timeout: 300000, polling: 1000 });
   await page.waitForTimeout(8000);   // let applies settle (SwiftShader ~few fps)
 

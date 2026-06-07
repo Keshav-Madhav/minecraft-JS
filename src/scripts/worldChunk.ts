@@ -5,6 +5,7 @@ import { ChunkParams, ChunkSize, blockIndex, generateChunkData } from './chunkGe
 import { ResourceGenInfo, BLOCK_IDS } from './blockTypes';
 import { blockArrayMaterial, leafArrayMaterial, plantMaterial, cutoutDepthMaterial, getFoliageShadows } from './blockArrayMaterial';
 import { buildChunkGeometry, buildChunkMapTile, scanEmitters, GeometryArrays } from './chunkMesh';
+import { setQuantizedBounds } from './batchPool';
 
 // Returns the block id at a world position, or 0 (air) when unknown. Used so a
 // chunk can cull faces against blocks that live in neighbouring chunks.
@@ -131,10 +132,12 @@ export class WorldChunk extends THREE.Group {
   private addGeometryMesh(arrays: GeometryArrays | null, castShadow: boolean, material: THREE.Material) {
     if (!arrays || arrays.indices.length === 0) return;
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(arrays.positions, 3));
-    geometry.setAttribute('normal', new THREE.BufferAttribute(arrays.normals, 3));
-    geometry.setAttribute('tileUv', new THREE.BufferAttribute(arrays.uvs, 2));
-    geometry.setAttribute('layerIndex', new THREE.BufferAttribute(arrays.layers, 1));
+    // Quantized format (chunkMesh.ts): positions/uvs are normalized u16, layers
+    // u16 (layer | faceId<<12 — the face id replaces the normal attribute).
+    // Positions decode through the MESH MATRIX below; uv/layer decode in-shader.
+    geometry.setAttribute('position', new THREE.BufferAttribute(arrays.positions, 3, true));
+    geometry.setAttribute('tileUv', new THREE.BufferAttribute(arrays.uvs, 2, true));
+    geometry.setAttribute('layerIndex', new THREE.BufferAttribute(arrays.layers, 1, true));
     if (arrays.colors) {
       // normalized=true → the Uint8 0..255 tint/sway is read as 0..1 in the shader.
       // Plants read it as `plantColor` (rgb tint + sway a); opaque cubes read it as
@@ -143,12 +146,20 @@ export class WorldChunk extends THREE.Group {
       geometry.setAttribute(material === plantMaterial ? 'plantColor' : 'tintColor', attr);
     }
     geometry.setIndex(new THREE.BufferAttribute(arrays.indices, 1));
-    geometry.computeBoundingSphere(); // tight bounds so frustum culling is accurate
+    // Bounds from a raw u16 scan — computeBoundingSphere() on a NORMALIZED
+    // attribute walks it through per-component denormalize() calls (slow, and
+    // this runs for every streamed/remeshed chunk).
+    setQuantizedBounds(geometry, arrays.positions);
 
     const mesh = new THREE.Mesh(geometry, material);
     mesh.castShadow = castShadow;
     mesh.receiveShadow = true;
     mesh.userData.chunkGeometry = true;
+    // Decode the quantized positions via the matrix: local = norm·(65535/64) − 8.
+    // Every render path (colour, three's built-in shadow depth, our cutout depth,
+    // raycasting) uses the matrix, so they all decode for free.
+    mesh.scale.setScalar(65535 / 64);
+    mesh.position.set(-8, -8, -8);
     mesh.matrixAutoUpdate = false; // static — never moves
     mesh.updateMatrix();
     // Alpha-tested cutout shadows (ultra) need a depth material that honours the

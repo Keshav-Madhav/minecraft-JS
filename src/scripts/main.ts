@@ -42,7 +42,11 @@ let previousTime = performance.now();
 // faster spin → harder starvation), which is why Vercel felt broken while local
 // dev looked fine. Uncapped stays as an opt-in benchmark toggle. Fog on, biome
 // tint + day/night on, and an always-on stats overlay while playing.
-const settings = { uncapFPS: false, fpsCap: 0, fog: true, fogNear: 0.7, resolutionScale: 1, biomeLighting: true, dayNight: true, statsOverlay: true };
+// fogNear 0.85 (was 0.7): with the LOD horizon at 1-4km, a fog ramp starting at
+// 70% put a HUNDREDS-of-metres-wide milky gradient across most of the visible
+// frame ("blurry / non-HD" feel). At 0.85 + a tighter band the world stays
+// vivid out to the far ring and only the horizon itself dissolves.
+const settings = { uncapFPS: false, fpsCap: 0, fog: true, fogNear: 0.85, resolutionScale: 1, biomeLighting: true, dayNight: true, statsOverlay: true };
 const SKY_COLOR = 0x80a0e0;
 
 // Frame scheduler. requestAnimationFrame is hard-locked to the display refresh
@@ -127,7 +131,7 @@ applyResolution();
 renderer.setSize(winWidth, winHeight);
 renderer.setClearColor(0x80a0e0);
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap; // soft shadow edges (set before any material compiles)
+renderer.shadowMap.type = THREE.PCFShadowMap; // soft shadow edges (r182+: PCFSoftShadowMap was deprecated; PCFShadowMap is soft now)
 // Accumulate render-info across ALL passes in a frame (reset manually each frame),
 // so the stats overlay shows the true scene draw count even in ultra mode where
 // the EffectComposer issues several post-process passes after the scene render.
@@ -199,9 +203,10 @@ function updateViewDistance() {
   // render distance look short). The fade ends slightly past the edge so the very
   // last ring isn't a hard wall.
   // Fog Distance (settings.fogNear, 0.4–1.0) sets where the haze starts as a
-  // fraction of the view span; the fade band is a constant ~0.38 span beyond it
-  // so the far edge always dissolves softly (never a hard wall).
-  scene.fog = settings.fog ? new THREE.Fog(SKY_COLOR, span * settings.fogNear, span * (settings.fogNear + 0.38)) : null;
+  // fraction of the view span; the fade band is a constant ~0.25 span beyond it
+  // so the far edge always dissolves softly (never a hard wall). Band tightened
+  // from 0.38 — at multi-km spans a 0.38 band was a huge washed-out gradient.
+  scene.fog = settings.fog ? new THREE.Fog(SKY_COLOR, span * settings.fogNear, span * (settings.fogNear + 0.25)) : null;
   clouds.setViewDistance(player.camera.far);
   // Scale the per-frame streaming budget with distance so a big view actually
   // FILLS quickly instead of slowly creeping out (the other half of why high
@@ -1125,3 +1130,9 @@ function animate() {
 
 animate();
 booted = true;   // first frame rendered without throwing → stop arming the boot-fail overlay
+
+// Warm the shader program variants off the critical path (KHR_parallel_shader_compile
+// under the hood, truly async since r18x): the block/leaf/plant materials each compile
+// several variants (shadow on/off × batched/unbatched × depth), and compiling lazily
+// on first use caused visible hitches on the first frame and on quality toggles.
+renderer.compileAsync(scene, player.camera).catch(() => { /* best-effort warmup */ });

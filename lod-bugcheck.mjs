@@ -63,7 +63,7 @@ try {
   // Let the view settle: chunk pending drained + lod ring built.
   await page.waitForFunction(() => {
     const w = window.__mcDebug.world;
-    return w.lodGroup.children.length > 20 && w.chunkCount > 200;
+    return w.lodBuiltCount > 20 && w.chunkCount > 200;
   }, null, { timeout: 300000, polling: 1000 });
   await page.waitForTimeout(12000);   // streaming settle (SwiftShader is slow)
 
@@ -74,14 +74,9 @@ try {
     const p = window.__mcDebug.player.position;
     const T = 8 * w.chunkSize.width;   // tile span in blocks
     const tx = Math.floor(p.x / T), tz = Math.floor(p.z / T);
-    let result = null;
-    for (const m of w.lodGroup.children) {
-      if (Math.floor(m.position.x / T) === tx && Math.floor(m.position.z / T) === tz) {
-        result = { visible: m.visible };
-        if (m.visible) break;
-      }
-    }
-    return result;   // null = the player's tile has no mesh at all (also fine)
+    const t = w.lodMap.get(`${tx},${tz}`);
+    if (!t || (!t.terrainH && !t.canopyH)) return null;   // no built tile here (also fine)
+    return { visible: t.shown };
   });
   console.log('player-tile LOD:', JSON.stringify(close));
   if (close && close.visible) throw new Error('BUG: LOD tile under the player is still visible (close-LOD bug not fixed)');
@@ -93,10 +88,12 @@ try {
     const w = window.__mcDebug.world;
     const p = window.__mcDebug.player.position;
     let behindVisible = 0, behindTotal = 0;
-    for (const m of w.lodGroup.children) {
-      const dx = m.position.x + 64 - p.x, dz = m.position.z + 64 - p.z;
+    for (const t of w.lodMap.values()) {
+      if (!t.terrainH && !t.canopyH) continue;
+      const tb = t.tileChunks * w.chunkSize.width;
+      const dx = t.tx * tb + tb / 2 - p.x;
       // camera looks roughly +x: "behind" = well in -x
-      if (dx < -200) { behindTotal++; if (m.visible) behindVisible++; }
+      if (dx < -200) { behindTotal++; if (t.shown) behindVisible++; }
     }
     return { behindVisible, behindTotal };
   });

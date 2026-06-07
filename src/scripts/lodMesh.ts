@@ -1,5 +1,6 @@
 import { WorldSampler, lodSurfaceBlock, climateGrassTint, ICE_SURFACE_TEMP, LOD_CANOPY, BIOME } from './chunkGen';
 import { BLOCK_IDS, BLOCK_FACE_LAYERS } from './blockTypes';
+import { quantize } from './chunkMesh';
 import type { GeometryArrays } from './chunkMesh';
 
 // LOD FAR-TERRAIN MESHER — builds one big blocky-heightmap tile (default 8×8
@@ -35,38 +36,39 @@ function hash01(x: number, z: number): number {
 // chunks) would churn the worker GC at this scale, so we write into pre-sized
 // typed arrays and double on demand.
 class Acc {
-  pos: Float32Array; norm: Float32Array; uv: Float32Array; layer: Float32Array;
+  pos: Float32Array; uv: Float32Array; layer: Uint16Array;
   col: Uint8Array; idx: Uint32Array;
   v = 0; i = 0;   // vertex / index counts
   constructor(vcap: number) {
-    this.pos = new Float32Array(vcap * 3); this.norm = new Float32Array(vcap * 3);
-    this.uv = new Float32Array(vcap * 2); this.layer = new Float32Array(vcap);
+    this.pos = new Float32Array(vcap * 3);
+    this.uv = new Float32Array(vcap * 2); this.layer = new Uint16Array(vcap);
     this.col = new Uint8Array(vcap * 4); this.idx = new Uint32Array(vcap + (vcap >> 1));
   }
   private grow(minV: number, minI: number) {
     const vcap = Math.max(minV, (this.layer.length * 2) | 0);
     const icap = Math.max(minI, (this.idx.length * 2) | 0);
-    const g = <T extends Float32Array | Uint8Array | Uint32Array>(a: T, n: number): T => {
+    const g = <T extends Float32Array | Uint8Array | Uint16Array | Uint32Array>(a: T, n: number): T => {
       const b = new (a.constructor as new (n: number) => T)(n); b.set(a as never); return b;
     };
     if (minV > this.layer.length) {
-      this.pos = g(this.pos, vcap * 3); this.norm = g(this.norm, vcap * 3);
+      this.pos = g(this.pos, vcap * 3);
       this.uv = g(this.uv, vcap * 2); this.layer = g(this.layer, vcap); this.col = g(this.col, vcap * 4);
     }
     if (minI > this.idx.length) this.idx = g(this.idx, icap);
   }
-  // One axis-aligned quad: 4 corners (xyz each), shared normal, per-corner uv,
-  // one texture layer, one rgba tint (a = emissive, always 0 for LOD).
-  quad(c: Float32Array, nx: number, ny: number, nz: number, uvs: Float32Array,
+  // One quad: 4 corners (xyz each), a faceId (0..5 → shader normal LUT, packed
+  // into the layer word), per-corner uv, one texture layer, one rgb tint
+  // (a = emissive, always 0 for LOD).
+  quad(c: Float32Array, face: number, uvs: Float32Array,
     layer: number, r: number, g: number, b: number) {
     if (this.v + 4 > this.layer.length || this.i + 6 > this.idx.length) this.grow(this.v + 4, this.i + 6);
     const v0 = this.v;
+    const packed = layer | (face << 12);
     for (let k = 0; k < 4; k++) {
       const p = (v0 + k) * 3, t = (v0 + k) * 2, c4 = (v0 + k) * 4;
       this.pos[p] = c[k * 3]; this.pos[p + 1] = c[k * 3 + 1]; this.pos[p + 2] = c[k * 3 + 2];
-      this.norm[p] = nx; this.norm[p + 1] = ny; this.norm[p + 2] = nz;
       this.uv[t] = uvs[k * 2]; this.uv[t + 1] = uvs[k * 2 + 1];
-      this.layer[v0 + k] = layer;
+      this.layer[v0 + k] = packed;
       this.col[c4] = r; this.col[c4 + 1] = g; this.col[c4 + 2] = b; this.col[c4 + 3] = 0;
     }
     this.v += 4;
@@ -77,10 +79,13 @@ class Acc {
   }
   finalize(): GeometryArrays | null {
     if (this.i === 0) return null;
+    const positions = new Uint16Array(this.v * 3);
+    for (let k = 0; k < positions.length; k++) positions[k] = quantize(this.pos[k]);
+    const uvs = new Uint16Array(this.v * 2);
+    for (let k = 0; k < uvs.length; k++) uvs[k] = quantize(this.uv[k]);
     return {
-      positions: this.pos.slice(0, this.v * 3),
-      normals: this.norm.slice(0, this.v * 3),
-      uvs: this.uv.slice(0, this.v * 2),
+      positions,
+      uvs,
       layers: this.layer.slice(0, this.v),
       indices: this.v > 65535 ? this.idx.slice(0, this.i) : Uint16Array.from(this.idx.subarray(0, this.i)),
       colors: this.col.slice(0, this.v * 4),
@@ -93,17 +98,28 @@ const _c = new Float32Array(12);
 const _uv = new Float32Array(8);
 
 // Corner/uv layouts mirror chunkMesh DIR_META windings (verified CCW per face).
+// Face ids: 0..5 = +x,-x,+y,-y,+z,-z (the shader's normal LUT).
 function topQuad(acc: Acc, x0: number, x1: number, z0: number, z1: number, y: number,
   layer: number, r: number, g: number, b: number) {
   _c.set([x0, y, z0, x0, y, z1, x1, y, z1, x1, y, z0]);
   _uv.set([x0 + .5, z0 + .5, x0 + .5, z1 + .5, x1 + .5, z1 + .5, x1 + .5, z0 + .5]);
-  acc.quad(_c, 0, 1, 0, _uv, layer, r, g, b);
+  acc.quad(_c, 2, _uv, layer, r, g, b);
+}
+// Smooth-terrain variant: per-corner heights (far tiles render as a smooth
+// heightfield — see the smooth branch in buildLodTile). Up-facing normal is an
+// approximation on slopes; at the distances smooth mode runs, it's invisible.
+function topQuadH(acc: Acc, x0: number, x1: number, z0: number, z1: number,
+  y00: number, y01: number, y11: number, y10: number,
+  layer: number, r: number, g: number, b: number) {
+  _c.set([x0, y00, z0, x0, y01, z1, x1, y11, z1, x1, y10, z0]);
+  _uv.set([x0 + .5, z0 + .5, x0 + .5, z1 + .5, x1 + .5, z1 + .5, x1 + .5, z0 + .5]);
+  acc.quad(_c, 2, _uv, layer, r, g, b);
 }
 function bottomQuad(acc: Acc, x0: number, x1: number, z0: number, z1: number, y: number,
   layer: number, r: number, g: number, b: number) {
   _c.set([x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1]);
   _uv.set([x0 + .5, z0 + .5, x1 + .5, z0 + .5, x1 + .5, z1 + .5, x0 + .5, z1 + .5]);
-  acc.quad(_c, 0, -1, 0, _uv, layer, r, g, b);
+  acc.quad(_c, 3, _uv, layer, r, g, b);
 }
 function xWall(acc: Acc, x: number, y0: number, y1: number, z0: number, z1: number, sign: number,
   layer: number, r: number, g: number, b: number) {
@@ -111,7 +127,7 @@ function xWall(acc: Acc, x: number, y0: number, y1: number, z0: number, z1: numb
   else _c.set([x, y0, z0, x, y0, z1, x, y1, z1, x, y1, z0]);
   if (sign > 0) _uv.set([z0 + .5, y0 + .5, z0 + .5, y1 + .5, z1 + .5, y1 + .5, z1 + .5, y0 + .5]);
   else _uv.set([z0 + .5, y0 + .5, z1 + .5, y0 + .5, z1 + .5, y1 + .5, z0 + .5, y1 + .5]);
-  acc.quad(_c, sign, 0, 0, _uv, layer, r, g, b);
+  acc.quad(_c, sign > 0 ? 0 : 1, _uv, layer, r, g, b);
 }
 function zWall(acc: Acc, z: number, y0: number, y1: number, x0: number, x1: number, sign: number,
   layer: number, r: number, g: number, b: number) {
@@ -119,7 +135,7 @@ function zWall(acc: Acc, z: number, y0: number, y1: number, x0: number, x1: numb
   else _c.set([x0, y0, z, x0, y1, z, x1, y1, z, x1, y0, z]);
   if (sign > 0) _uv.set([x0 + .5, y0 + .5, x1 + .5, y0 + .5, x1 + .5, y1 + .5, x0 + .5, y1 + .5]);
   else _uv.set([x0 + .5, y0 + .5, x0 + .5, y1 + .5, x1 + .5, y1 + .5, x1 + .5, y0 + .5]);
-  acc.quad(_c, 0, 0, sign, _uv, layer, r, g, b);
+  acc.quad(_c, sign > 0 ? 4 : 5, _uv, layer, r, g, b);
 }
 
 export type LodTileGeometry = { terrain: GeometryArrays | null, canopy: GeometryArrays | null };
@@ -169,6 +185,34 @@ export function buildLodTile(
   const terrain = new Acc(N * N * 4 + 256);
   const STONE_SIDE = BLOCK_FACE_LAYERS[BLOCK_IDS.stone][0];
 
+  // ---- SMOOTH MODE (stride ≥ 8): far tiles render as a smooth heightfield --
+  // At ≥700m a blocky staircase costs a wall quad per height step that the eye
+  // can't resolve anyway (the same sub-pixel argument that drops trunks out
+  // there). Instead: per-cell quads with CORNER heights averaged from the 4
+  // surrounding cells — no walls at all (~40-60% fewer far-ring triangles) and
+  // distant hills read smooth, which is perceptually MORE correct than 16-block
+  // stair treads. Corner heights only use the deterministic sampled grid (ring
+  // included), so adjacent tiles agree exactly — no cracks between smooth tiles.
+  if (stride >= 8) {
+    const cornerH = (gx: number, gz: number) =>   // corner between cells (gx-1,gz-1)..(gx,gz), grid indices
+      (hgt[(gz - 1) * G + (gx - 1)] + hgt[(gz - 1) * G + gx] + hgt[gz * G + (gx - 1)] + hgt[gz * G + gx]) / 4;
+    for (let cz = 0; cz < N; cz++) {
+      for (let cx = 0; cx < N; cx++) {
+        const o = (cz + 1) * G + (cx + 1);
+        const layer = (BLOCK_FACE_LAYERS[top[o]] ?? BLOCK_FACE_LAYERS[BLOCK_IDS.stone])[2];
+        let r = 255, g = 255, b = 255;
+        if (top[o] === BLOCK_IDS.grass || wet[o]) { r = tint[o * 3]; g = tint[o * 3 + 1]; b = tint[o * 3 + 2]; }
+        const x0 = cx * stride - 0.5, x1 = x0 + stride;
+        const z0 = cz * stride - 0.5, z1 = z0 + stride;
+        topQuadH(terrain, x0, x1, z0, z1,
+          cornerH(cx + 1, cz + 1) + 0.5, cornerH(cx + 1, cz + 2) + 0.5,
+          cornerH(cx + 2, cz + 2) + 0.5, cornerH(cx + 2, cz + 1) + 0.5,
+          layer, r, g, b);
+      }
+    }
+  }
+
+  if (stride < 8) {
   // ---- TOP QUADS, greedy-merged per (height, layer, tint) ------------------
   // key packs height(0..319)·layer(0..255)·tint12 into an int32; tint only
   // differentiates grass tops (everything else merges freely on height+layer).
@@ -247,6 +291,7 @@ export function buildLodTile(
       else wall((y0, y1, l) => zWall(terrain, z, y0, y1, x0, x1, -1, l, 255, 255, 255), b2, ha, hb, 5);
     }
   }
+  }   // end of blocky (stride < 8) path
 
   // ---- STATISTICAL TREES ----------------------------------------------------
   // Exact tree positions are unreachable (generateFeatures' RNG consumption

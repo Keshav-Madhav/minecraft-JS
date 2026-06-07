@@ -1,4 +1,4 @@
-import { generateChunkData, createWorldSampler, createCaveSampler, LAVA_Y, ICE_SURFACE_TEMP, wellShaftRange, biomeWaterHex, WorldSampler, ChunkParams, ChunkSize } from './chunkGen';
+import { generateChunkData, createWorldSampler, createCaveSampler, LAVA_Y, ICE_SURFACE_TEMP, wellShaftRange, biomeWaterHex, climateGrassTint, WorldSampler, ChunkParams, ChunkSize } from './chunkGen';
 import { ResourceGenInfo, BLOCK_IDS } from './blockTypes';
 import { buildChunkGeometry, buildChunkMapTile, scanEmitters, GeometryArrays } from './chunkMesh';
 import { buildLodTile } from './lodMesh';
@@ -24,10 +24,17 @@ type GenMessage = { type: 'gen', version: number, key: string, worldX: number, w
 // data) at a coarse stride. tileBlocks = tile edge in blocks (a multiple of the
 // chunk width, chosen by World); stride = blocks per LOD cell.
 type LodMessage = { type: 'lod', version: number, key: string, worldX: number, worldZ: number, tileBlocks: number, stride: number };
-export type WorkerRequest = ConfigMessage | GenMessage | LodMessage;
+// Re-mesh EXISTING chunk data off-thread (a copy of the chunk's block array is
+// sent along). Used when a batched far chunk is demoted into the near ring and
+// needs individual meshes again — running the full mesher on the main thread
+// for every boundary crossing was a profiled multi-ms/frame sink.
+type RemeshMessage = { type: 'remesh', version: number, key: string, worldX: number, worldZ: number, data: ArrayBuffer };
+export type WorkerRequest = ConfigMessage | GenMessage | LodMessage | RemeshMessage;
 
+// Quantized vertex format (see chunkMesh.ts): positions/uvs are u16, layers is
+// u16 (textureLayer | faceId<<12 — face id replaces the old normals buffer).
 export type GeometryPayload = {
-  positions: ArrayBuffer, normals: ArrayBuffer, uvs: ArrayBuffer, layers: ArrayBuffer, indices: ArrayBuffer,
+  positions: ArrayBuffer, uvs: ArrayBuffer, layers: ArrayBuffer, indices: ArrayBuffer,
   i16: boolean,   // whether `indices` is a Uint16Array (else Uint32Array) — for reconstruction on the main thread
   colors?: ArrayBuffer,   // vec4/vertex tint: plants (rgb + sway a) AND cubes (biome tint rgb, white=untinted)
 } | null;
@@ -36,6 +43,7 @@ export type MeshMessage = {
   type: 'mesh',
   version: number,
   key: string,
+  remesh?: boolean,          // reply to a 'remesh' request (chunk already loaded — apply replaces its meshes)
   data: ArrayBuffer,
   casters: GeometryPayload,
   nonCasters: GeometryPayload,
@@ -64,10 +72,10 @@ let caveSampler: ReturnType<typeof createCaveSampler> | null = null;
 function geometryToPayload(g: GeometryArrays | null): { payload: GeometryPayload, transfer: ArrayBuffer[] } {
   if (!g) return { payload: null, transfer: [] };
   const payload: GeometryPayload = {
-    positions: g.positions.buffer, normals: g.normals.buffer, uvs: g.uvs.buffer,
+    positions: g.positions.buffer, uvs: g.uvs.buffer,
     layers: g.layers.buffer, indices: g.indices.buffer, i16: g.indices instanceof Uint16Array,
   };
-  const transfer = [g.positions.buffer, g.normals.buffer, g.uvs.buffer, g.layers.buffer, g.indices.buffer];
+  const transfer = [g.positions.buffer, g.uvs.buffer, g.layers.buffer, g.indices.buffer];
   if (g.colors) { payload.colors = g.colors.buffer; transfer.push(g.colors.buffer); }
   return { payload, transfer };
 }
@@ -99,7 +107,7 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
     return;
   }
 
-  // gen
+  // gen | remesh
   const cfg = config;
   const sample = sampler;
   const caveAt = caveSampler;
@@ -109,7 +117,22 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   // is a free array read instead of re-sampling columnSurface per grass cell.
   const tw = cfg.size.width;
   const tintMap = new Uint8Array(tw * tw * 3);
-  const data = generateChunkData(cfg.size, cfg.params, worldX, worldZ, cfg.resources, tintMap);
+  let data: Uint8Array;
+  if (msg.type === 'remesh') {
+    // Existing chunk data shipped with the request — no generation pass, so the
+    // tints come straight from the sampler (one call per column, same source).
+    data = new Uint8Array(msg.data);
+    for (let lx = 0; lx < tw; lx++) {
+      for (let lz = 0; lz < tw; lz++) {
+        const s = sample(worldX + lx, worldZ + lz);
+        const t = climateGrassTint(s.temp, s.humid);
+        const i = (lx * tw + lz) * 3;
+        tintMap[i] = (t[0] * 255) | 0; tintMap[i + 1] = (t[1] * 255) | 0; tintMap[i + 2] = (t[2] * 255) | 0;
+      }
+    }
+  } else {
+    data = generateChunkData(cfg.size, cfg.params, worldX, worldZ, cfg.resources, tintMap);
+  }
 
   // Apron: neighbour solidity from the deterministic surface height. Memoised
   // per border column so repeated y queries are O(1). Returns any non-air id for
@@ -165,7 +188,7 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   // touch it after posting — so the previous defensive `.slice()` was a wasted
   // 64KB alloc+memcpy per chunk.
   const message: MeshMessage = {
-    type: 'mesh', version: cfg.version, key: msg.key,
+    type: 'mesh', version: cfg.version, key: msg.key, remesh: msg.type === 'remesh',
     data: data.buffer, casters: casters.payload, nonCasters: nonCasters.payload, plants: plants.payload,
     emitters: emitters.buffer, mapTile: mapTile.buffer,
   };

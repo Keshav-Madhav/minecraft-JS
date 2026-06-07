@@ -6,7 +6,8 @@ import { resources } from './blocks';
 import { ChunkParams, generateChunkData, createWorldSampler, WorldSampler, climateGrassTint } from './chunkGen';
 import { ResourceGenInfo, BLOCK_IDS, TOGGLE, DOOR_PART } from './blockTypes';
 import { GeometryArrays } from './chunkMesh';
-import { blockArrayMaterial, leafArrayMaterial } from './blockArrayMaterial';
+import { blockArrayMaterial, leafArrayMaterial, plantMaterial, cutoutDepthMaterial } from './blockArrayMaterial';
+import { BatchPool, BatchHandle } from './batchPool';
 import type { WorkerRequest, MeshMessage, LodMeshMessage, WorkerReply, GeometryPayload } from './chunkWorker';
 
 // Frustum-streaming tuning (see World.frustumStreaming):
@@ -22,6 +23,14 @@ const FRUSTUM_MARGIN = 96;      // world units to fatten the frustum (hysteresis
 // high draw distance — so the win scales with draw distance while play stays smooth.
 const FRUSTUM_NEAR_KEEP = 6;
 const VIEW_YAW_RESCAN = 0.15;   // camera-yaw delta (rad, ~8.5°) that triggers a frustum re-evaluation
+
+// CHUNK DRAW-CALL COLLAPSE: chunks beyond this Chebyshev radius render through
+// BatchedMesh pools (a handful of multi-draw calls) instead of 1-3 meshes each.
+// Within the radius they stay INDIVIDUAL meshes: the 4-unit pick ray raycasts
+// the 3×3 nearby chunk groups, and local edits re-mesh chunks synchronously —
+// both need real per-chunk meshes. 3 covers the pick ray + the edit-neighbour
+// remesh ripple with margin.
+const NEAR_BATCH_KEEP = 3;
 
 // ---- LOD far-terrain ring (see lodMesh.ts for the mesher) -------------------
 // Beyond the full-detail ring, big downsampled heightmap tiles extend the view
@@ -39,6 +48,7 @@ const LOD_REMOVAL_GRACE = 3;      // rescans a tile survives outside the desired
 const MAX_LOD_OUTSTANDING = 4;    // in-flight LOD gens (chunk gens always have queue priority)
 const LOD_APPLY_VERT_BUDGET = 28000;   // verts uploaded per frame across LOD applies (≥1 tile always)
 const MAX_LOD_REMOVALS_PER_FRAME = 16;
+const APPLY_TIME_BUDGET_MS = 3;   // chunk-apply drain keeps taking rounds while under this
 
 // One LOD tile's live state. `stride` = detail of the APPLIED meshes (0 = none
 // yet); `wantStride` = what the current rescan wants; `inflightStride` = what
@@ -48,14 +58,17 @@ const MAX_LOD_REMOVALS_PER_FRAME = 16;
 type LodTile = {
   tx: number, tz: number,
   tileChunks: number,     // 8 (near ring) or 16 (far megatile) — tx/tz are in THIS grid's units
-  terrain: Three.Mesh | null,
-  canopy: Three.Mesh | null,
+  // Batched geometry handles (LOD tiles render through the BatchPool — one
+  // draw call per page instead of 1-2 per tile). null = not built yet.
+  terrainH: BatchHandle | null,
+  canopyH: BatchHandle | null,
   stride: number,
   wantStride: number,
   inflightStride: number,
   queued: boolean,
   near: number,           // Chebyshev chunk-distance (for nearest-first ordering)
   miss: number,           // consecutive rescans outside the desired set (see LOD_REMOVAL_GRACE)
+  shown: boolean,         // last visibility decision (coverage cull) — mirrored into setVisibleAt
 };
 
 type chunkCoords = { x: number, z: number };
@@ -64,14 +77,14 @@ const FACE_NEIGHBOURS: ReadonlyArray<readonly [number, number, number]> = [
   [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1],
 ];
 
-// Reconstruct typed-array geometry from the buffers transferred by the worker.
+// Reconstruct typed-array geometry from the buffers transferred by the worker
+// (quantized vertex format — see chunkMesh.ts).
 function payloadToArrays(p: GeometryPayload): GeometryArrays | null {
   if (!p) return null;
   return {
-    positions: new Float32Array(p.positions),
-    normals: new Float32Array(p.normals),
-    uvs: new Float32Array(p.uvs),
-    layers: new Float32Array(p.layers),
+    positions: new Uint16Array(p.positions),
+    uvs: new Uint16Array(p.uvs),
+    layers: new Uint16Array(p.layers),
     indices: p.i16 ? new Uint16Array(p.indices) : new Uint32Array(p.indices),
     colors: p.colors ? new Uint8Array(p.colors) : undefined,
   };
@@ -130,8 +143,13 @@ export class World extends Three.Group {
       chunk.visible = true;
       for (const child of chunk.children) child.frustumCulled = v;
     }
-    // LOD tiles too (visible stays coverage-managed — only the cull flag here)
-    for (const mesh of this.lodGroup.children) mesh.frustumCulled = v;
+    // Batches: per-INSTANCE culling is the batched equivalent of the per-mesh
+    // frustumCulled flag (page-level frustumCulled must stay false).
+    this.lodTerrainPool.setPerObjectFrustumCulled(v);
+    this.lodCanopyPool.setPerObjectFrustumCulled(v);
+    this.casterPool.setPerObjectFrustumCulled(v);
+    this.leafPool.setPerObjectFrustumCulled(v);
+    this.plantPool.setPerObjectFrustumCulled(v);
   }
 
   // ---- LOD far-terrain state ------------------------------------------------
@@ -140,6 +158,28 @@ export class World extends Three.Group {
   // downward offset so the overlap ring sits strictly UNDER real terrain.
   lodDistance = 0;
   readonly lodGroup = new Three.Group();
+  // LOD render batches: every tile's terrain/canopy lives in a BatchedMesh page
+  // (one draw call per page, per-instance frustum culling inside) — at high view
+  // distances this collapses ~1000 LOD draws into ~4-8.
+  private lodTerrainPool = new BatchPool(this.lodGroup, blockArrayMaterial,
+    { pageVerts: 2_000_000, pageInstances: 1024, castShadow: false, colorAttr: 'tintColor' });
+  private lodCanopyPool = new BatchPool(this.lodGroup, leafArrayMaterial,
+    { pageVerts: 1_000_000, pageInstances: 1024, castShadow: false, colorAttr: 'tintColor' });
+
+  // Chunk render batches (chunks beyond NEAR_BATCH_KEEP). Casters/leaves cast
+  // shadows like their individual counterparts; plants follow the ultra
+  // foliage-shadow toggle (refreshFoliageShadows syncs pages + meshes).
+  private casterPool = new BatchPool(this, blockArrayMaterial,
+    { pageVerts: 1_500_000, pageInstances: 2048, castShadow: true, colorAttr: 'tintColor' });
+  private leafPool = new BatchPool(this, leafArrayMaterial,
+    { pageVerts: 1_000_000, pageInstances: 2048, castShadow: true, colorAttr: 'tintColor' });
+  private plantPool = new BatchPool(this, plantMaterial,
+    { pageVerts: 750_000, pageInstances: 2048, castShadow: false, colorAttr: 'plantColor' });
+  // chunkKey → batch handles for chunks rendering through the pools
+  private batched = new Map<string, { caster: BatchHandle | null, leaf: BatchHandle | null, plant: BatchHandle | null }>();
+
+  get batchedChunkCount() { return this.batched.size; }
+  get chunkPageCount() { return this.casterPool.pageCount + this.leafPool.pageCount + this.plantPool.pageCount; }
   private lodMap = new Map<string, LodTile>();
   private lodPending: string[] = [];
   private lodApplyQueue: LodMeshMessage[] = [];
@@ -153,6 +193,10 @@ export class World extends Three.Group {
   private lodDirty = new Set<string>();
 
   get lodTileCount() { return this.lodMap.size; }
+  // Built tiles (have batched geometry) + page (= draw-call) counts, for stats/tests.
+  get lodBuiltCount() { let n = 0; for (const t of this.lodMap.values()) if (t.terrainH || t.canopyH) n++; return n; }
+  get lodPageCount() { return this.lodTerrainPool.pageCount + this.lodCanopyPool.pageCount; }
+  private optimizeTick = 0;
 
   // Per-frame work budgets keep streaming smooth.
   maxChunkRequestsPerFrame = 6; // sync (no-worker) fallback
@@ -266,8 +310,11 @@ export class World extends Three.Group {
   }
 
   private initWorkers() {
-    // Leave a couple of cores for the main/render thread.
-    const count = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 2));
+    // Leave a couple of cores for the main/render thread. Cap at 8: beyond
+    // that the main-thread apply path is the bottleneck, and the per-worker
+    // module/sampler RAM stops paying for itself. (The old cap of 4 left most
+    // of a modern machine idle during streaming bursts.)
+    const count = Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 4) - 2));
     for (let i = 0; i < count; i++) {
       const w = this.spawnWorker();
       if (w) this.workers.push(w);
@@ -406,8 +453,10 @@ export class World extends Three.Group {
       this.pending = visibleChunks
         .filter(({ x, z }) => !this.chunkMap.has(this.chunkKey(x, z)))
         .sort((a, b) => ((a.x - c.x) ** 2 + (a.z - c.z) ** 2) - ((b.x - c.x) ** 2 + (b.z - c.z) ** 2));
-      // Player crossed a chunk boundary → re-evaluate which chunks show foliage.
+      // Player crossed a chunk boundary → re-evaluate which chunks show foliage
+      // and swap render representations across the near-batch boundary.
       this.refreshFoliageVisibility();
+      this.rebalanceBatchBoundary(c.x, c.z);
       // LOD ring: re-evaluate tile membership + detail bands. The down-offset
       // (which keeps overlapped LOD strictly under real terrain, no z-fight)
       // scales with drawDistance because depth-buffer precision worsens with
@@ -508,7 +557,7 @@ export class World extends Three.Group {
       this.lodDesired.add(key);
       let t = this.lodMap.get(key);
       if (!t) {
-        t = { tx, tz, tileChunks, terrain: null, canopy: null, stride: 0, wantStride: stride, inflightStride: -1, queued: false, near, miss: 0 };
+        t = { tx, tz, tileChunks, terrainH: null, canopyH: null, stride: 0, wantStride: stride, inflightStride: -1, queued: false, near, miss: 0, shown: true };
         this.lodMap.set(key, t);
       }
       // Stride hysteresis: if the tile's APPLIED stride would still be chosen
@@ -533,7 +582,7 @@ export class World extends Three.Group {
       }
       // visibleKeys just changed with this rescan → re-evaluate hiding for
       // every tile that can overlap loaded chunks (the rest are plain visible).
-      if (t.terrain || t.canopy) this.refreshLodVisibility(t);
+      if (t.terrainH || t.canopyH) this.refreshLodVisibility(t);
     };
 
     // Iterate the 16-chunk PARENT grid: a parent fully beyond LOD_MEGA_START
@@ -601,12 +650,9 @@ export class World extends Three.Group {
   }
 
   private disposeLodTile(t: LodTile) {
-    for (const mesh of [t.terrain, t.canopy]) {
-      if (!mesh) continue;
-      mesh.geometry.dispose();
-      this.lodGroup.remove(mesh);
-    }
-    t.terrain = t.canopy = null;
+    this.lodTerrainPool.remove(t.terrainH);
+    this.lodCanopyPool.remove(t.canopyH);
+    t.terrainH = t.canopyH = null;
   }
 
   // ---- LOD visibility -------------------------------------------------------
@@ -647,51 +693,83 @@ export class World extends Three.Group {
       }
     }
     const visible = !(hide && anyLoaded);
-    if (t.terrain) t.terrain.visible = visible;
-    if (t.canopy) t.canopy.visible = visible;
+    t.shown = visible;
+    this.lodTerrainPool.setVisible(t.terrainH, visible);
+    this.lodCanopyPool.setVisible(t.canopyH, visible);
   }
 
   // Drain a bounded slice of the work each frame so the world streams in
   // without a main-thread burst (which used to freeze/crash at high distances).
   processQueues() {
-    // 1) Turn a bounded number of finished worker results into meshes. This is
-    // the main-thread cost (BufferGeometry + GPU upload); budgeting it keeps the
-    // frame short while chunks stream in. `outstanding` (gen slots) is freed here
-    // on apply, so generation is naturally throttled to the apply rate.
-    // Two passes so a batch is internally consistent: adopt ALL the batch's block
-    // data FIRST, then mesh. An edit-driven local rebuild (hasEditsAround) reads
-    // neighbour chunks; if a neighbour was applied later in the same batch it would
-    // otherwise be read as air → an exposed seam never re-fixed in the async path.
-    const batch: { chunk: WorldChunk, msg: MeshMessage }[] = [];
-    let applied = 0;
-    while (applied < this.maxAppliesPerFrame && this.applyQueue.length > 0) {
-      const msg = this.applyQueue.shift()!;
-      this.outstanding = Math.max(0, this.outstanding - 1);
-      this.inflightWorker.delete(msg.key);
-      const chunk = this.chunkMap.get(msg.key);
-      if (!chunk) continue;        // unloaded before we got to it
-      if (chunk.loaded) continue;  // duplicate/stale reply for a chunk re-created at the same coords
-      chunk.setData(new Uint8Array(msg.data));
-      batch.push({ chunk, msg });
-      applied++;
-    }
-    for (const { chunk, msg } of batch) {
-      // Isolate per-chunk apply: a single bad geometry payload skips ONE chunk
-      // (logged) instead of throwing out of the per-frame loop and freezing the game.
-      try {
-        if (this.hasEditsAround(chunk)) chunk.buildMeshes(this.getWorldBlock, this.getGrassTint);  // also rescans emitters + rebuilds the map tile
-        else {
-          chunk.applyGeometry(payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters), payloadToArrays(msg.plants));
-          chunk.setEmitters(new Float32Array(msg.emitters));
-          chunk.setMapTile(new Uint8Array(msg.mapTile));
-        }
-        this.applyFoliageVisibility(chunk);
-        this.noteChunkOverTile(chunk);   // re-evaluate the covering LOD tile's visibility
-      } catch (e) {
-        console.error('chunk apply failed, skipping', msg.key, e);
+    // 1) Turn finished worker results into meshes. This is the main-thread cost
+    // (BufferGeometry + GPU upload); budgeting it keeps the frame short while
+    // chunks stream in. `outstanding` (gen slots) is freed here on apply, so
+    // generation is naturally throttled to the apply rate.
+    // Budget = ROUNDS of maxAppliesPerFrame under a small TIME box: the fixed
+    // 6/frame was tuned when every apply built individual 40B/vertex meshes —
+    // far applies are now a memcpy into a batch page (bounds pre-set), so burst
+    // backlogs (teleport, distance change) drain several× faster while a heavy
+    // frame still exits after one round.
+    // Two passes per round so a round is internally consistent: adopt ALL the
+    // round's block data FIRST, then mesh. An edit-driven local rebuild
+    // (hasEditsAround) reads neighbour chunks; if a neighbour was applied later
+    // in the same round it would otherwise be read as air → an exposed seam
+    // never re-fixed in the async path. (Across rounds the ordering hazard is
+    // the same as the pre-existing across-frames one.)
+    const applyT0 = performance.now();
+    let appliedAny = false;
+    do {
+      const batch: { chunk: WorldChunk, msg: MeshMessage }[] = [];
+      let applied = 0;
+      while (applied < this.maxAppliesPerFrame && this.applyQueue.length > 0) {
+        const msg = this.applyQueue.shift()!;
+        this.outstanding = Math.max(0, this.outstanding - 1);
+        this.inflightWorker.delete(msg.key);
+        const chunk = this.chunkMap.get(msg.key);
+        if (!chunk) continue;        // unloaded before we got to it
+        // Duplicate/stale gen reply for a chunk re-created at the same coords —
+        // but a REMESH reply targets an already-loaded chunk by design.
+        if (chunk.loaded && !msg.remesh) continue;
+        if (!msg.remesh) chunk.setData(new Uint8Array(msg.data));   // remesh = same data, keep the existing array
+        batch.push({ chunk, msg });
+        applied++;
       }
-    }
-    if (batch.length) this.mapTileEpoch++;   // new tiles → let the minimap repaint once
+      for (const { chunk, msg } of batch) {
+        // Isolate per-chunk apply: a single bad geometry payload skips ONE chunk
+        // (logged) instead of throwing out of the per-frame loop and freezing the game.
+        try {
+          const c = chunk.userData as chunkCoords;
+          const cheb = Math.max(Math.abs(c.x - this.lastPlayerChunkX), Math.abs(c.z - this.lastPlayerChunkZ));
+          if (msg.remesh) {
+            // Demotion re-mesh, built OFF-THREAD: adopt the individual meshes
+            // and drop the batch copy (in that order — never a hole).
+            chunk.applyGeometry(payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters), payloadToArrays(msg.plants));
+            chunk.setEmitters(new Float32Array(msg.emitters));
+            chunk.setMapTile(new Uint8Array(msg.mapTile));
+            this.unbatchChunk(chunk);
+          }
+          else if (this.hasEditsAround(chunk)) chunk.buildMeshes(this.getWorldBlock, this.getGrassTint);  // also rescans emitters + rebuilds the map tile
+          else if (cheb > NEAR_BATCH_KEEP) {
+            // FAR chunk → straight into the render batches (no per-chunk meshes,
+            // no per-chunk draw calls). Emitters/map tile adopt as usual.
+            this.batchChunk(chunk,
+              payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters), payloadToArrays(msg.plants));
+            chunk.setEmitters(new Float32Array(msg.emitters));
+            chunk.setMapTile(new Uint8Array(msg.mapTile));
+          } else {
+            chunk.applyGeometry(payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters), payloadToArrays(msg.plants));
+            chunk.setEmitters(new Float32Array(msg.emitters));
+            chunk.setMapTile(new Uint8Array(msg.mapTile));
+          }
+          this.applyFoliageVisibility(chunk);
+          this.noteChunkOverTile(chunk);   // re-evaluate the covering LOD tile's visibility
+        } catch (e) {
+          console.error('chunk apply failed, skipping', msg.key, e);
+        }
+      }
+      appliedAny = appliedAny || batch.length > 0;
+    } while (this.applyQueue.length > 0 && performance.now() - applyT0 < APPLY_TIME_BUDGET_MS);
+    if (appliedAny) this.mapTileEpoch++;   // new tiles → let the minimap repaint once
 
     // 1b) LOD tile applies, budgeted by VERTEX COUNT (not tile count): a far
     // stride-8 tile is a few thousand verts but a stride-2 mountain tile can be
@@ -720,15 +798,18 @@ export class World extends Three.Group {
         if (t.wantStride !== t.stride && !t.queued) { t.queued = true; this.lodPending.push(msg.key); }
         continue;
       }
-      if (msg.stride === t.stride && t.terrain) continue; // duplicate reply
+      if (msg.stride === t.stride && t.terrainH) continue; // duplicate reply
       try {
         this.disposeLodTile(t);
-        t.terrain = this.buildLodMesh(payloadToArrays(msg.terrain), blockArrayMaterial, t);
-        t.canopy = this.buildLodMesh(payloadToArrays(msg.canopy), leafArrayMaterial, t);
+        const tileBlocks = t.tileChunks * this.chunkSize.width;
+        const terr = payloadToArrays(msg.terrain);
+        const can = payloadToArrays(msg.canopy);
+        if (terr && terr.indices.length) t.terrainH = this.lodTerrainPool.add(terr, t.tx * tileBlocks, 0, t.tz * tileBlocks);
+        if (can && can.indices.length) t.canopyH = this.lodCanopyPool.add(can, t.tx * tileBlocks, 0, t.tz * tileBlocks);
         t.stride = msg.stride;
         this.refreshLodVisibility(t);
         lodApplied++;
-        lodVertsApplied += ((msg.terrain?.positions.byteLength ?? 0) + (msg.canopy?.positions.byteLength ?? 0)) / 12;
+        lodVertsApplied += ((msg.terrain?.positions.byteLength ?? 0) + (msg.canopy?.positions.byteLength ?? 0)) / 6;   // u16×3 per vertex
       } catch (e) {
         console.error('lod tile apply failed, skipping', msg.key, e);
       }
@@ -742,6 +823,25 @@ export class World extends Three.Group {
         if (t) this.refreshLodVisibility(t);
       }
       this.lodDirty.clear();
+    }
+
+    // 1c2) Deferred demotions: retried once the chunk backlog lightens, so a
+    // player who stopped moving still gets pickable near-ring meshes.
+    if (this.demotionsDeferred && this.outstanding < this.maxOutstanding / 2 &&
+      Number.isFinite(this.lastPlayerChunkX)) {
+      this.rebalanceBatchBoundary(this.lastPlayerChunkX, this.lastPlayerChunkZ);
+    }
+
+    // 1d) Batch-page compaction, low frequency: deleted tile/chunk geometry
+    // leaves holes in the append-only page buffers; compact at most one page
+    // per pool every ~2s of frames (optimize() is O(pageVerts) — never per
+    // frame, and only when a page is ≥25% waste).
+    if ((this.optimizeTick++ & 127) === 0) {
+      this.lodTerrainPool.maybeOptimize();
+      this.lodCanopyPool.maybeOptimize();
+      this.casterPool.maybeOptimize();
+      this.leafPool.maybeOptimize();
+      this.plantPool.maybeOptimize();
     }
 
     // 2) Request more generation (gated by in-flight = sent-but-not-applied).
@@ -809,6 +909,7 @@ export class World extends Three.Group {
       this.meshQueue.delete(chunk);
       if (chunk.hasData && chunk.parent === this) {
         chunk.buildMeshes(this.getWorldBlock, this.getGrassTint);
+        this.unbatchChunk(chunk);   // it now has individual meshes — drop any batch copy (demotion / far edit)
         this.applyFoliageVisibility(chunk);
         this.noteChunkOverTile(chunk);   // first build via the sync/no-worker path affects LOD visibility too
         this.mapTileEpoch++;   // rebuilt tile (edit/neighbour remesh) → minimap repaint
@@ -817,38 +918,115 @@ export class World extends Three.Group {
     }
   }
 
-  // Turn a transferred LOD geometry payload into a mesh under lodGroup. LOD
-  // tiles are pure scenery: castShadow=false (don't double the shadow-pass
-  // node count), inert to raycasts (the pick ray is 4 units / nearby-chunks
-  // only, but a no-op raycast makes them structurally unhittable), and static.
-  // receiveShadow MUST be true: it shares the chunk materials, and three keys
-  // the compiled program on (material, object.receiveShadow) — mixing values
-  // on one material made the renderer re-resolve the program (getParameters +
-  // cache-key build) on EVERY chunk↔LOD alternation in the draw order, a
-  // profiled multi-ms/frame CPU sink. Matching the chunks keeps one stable
-  // program; far tiles are outside the shadow camera anyway.
-  private buildLodMesh(arrays: GeometryArrays | null, material: Three.Material, t: LodTile): Three.Mesh | null {
-    if (!arrays || arrays.indices.length === 0) return null;
-    const geometry = new Three.BufferGeometry();
-    geometry.setAttribute('position', new Three.BufferAttribute(arrays.positions, 3));
-    geometry.setAttribute('normal', new Three.BufferAttribute(arrays.normals, 3));
-    geometry.setAttribute('tileUv', new Three.BufferAttribute(arrays.uvs, 2));
-    geometry.setAttribute('layerIndex', new Three.BufferAttribute(arrays.layers, 1));
-    if (arrays.colors) geometry.setAttribute('tintColor', new Three.BufferAttribute(arrays.colors, 4, true));
-    geometry.setIndex(new Three.BufferAttribute(arrays.indices, 1));
-    geometry.computeBoundingSphere();
-    const mesh = new Three.Mesh(geometry, material);
-    mesh.castShadow = false;
-    mesh.receiveShadow = true;
-    mesh.raycast = () => {};
-    const tileBlocks = t.tileChunks * this.chunkSize.width;
-    mesh.position.set(t.tx * tileBlocks, 0, t.tz * tileBlocks);
-    mesh.matrixAutoUpdate = false;
-    mesh.updateMatrix();
-    mesh.frustumCulled = this._frustumCulling;
-    this.lodGroup.add(mesh);
-    mesh.updateMatrixWorld(true);   // world subtree is frozen — compose once, AFTER parenting (needs lodGroup's y)
-    return mesh;
+  // (LOD geometry renders through lodTerrainPool/lodCanopyPool BatchedMesh
+  // pages — one draw call per page with per-instance frustum culling, instead
+  // of 1-2 meshes per tile. Pages: castShadow=false, raycast-inert, static.)
+
+  // ---- chunk batching --------------------------------------------------------
+  // Far chunks render through the caster/leaf/plant pools. The chunk keeps its
+  // DATA (physics/edits/emitters/map tile all unaffected) — only the render
+  // representation moves out of the scene graph.
+  private batchChunk(chunk: WorldChunk, casters: GeometryArrays | null, leaves: GeometryArrays | null, plants: GeometryArrays | null) {
+    const { x, z } = chunk.userData as chunkCoords;
+    const key = this.chunkKey(x, z);
+    this.unbatchChunk(chunk);   // defensive: never double-add
+    const px = chunk.position.x, pz = chunk.position.z;
+    const entry = {
+      caster: casters && casters.indices.length ? this.casterPool.add(casters, px, 0, pz) : null,
+      leaf: leaves && leaves.indices.length ? this.leafPool.add(leaves, px, 0, pz) : null,
+      plant: plants && plants.indices.length ? this.plantPool.add(plants, px, 0, pz) : null,
+    };
+    this.batched.set(key, entry);
+    chunk.loaded = true;   // render representation exists (batched); physics may stand on it
+  }
+
+  // Remove a chunk's batched geometry (stream-out, or it re-meshed into
+  // individual meshes — demotion into the near ring / an edit landed on it).
+  private unbatchChunk(chunk: WorldChunk) {
+    const { x, z } = chunk.userData as chunkCoords;
+    const key = this.chunkKey(x, z);
+    const e = this.batched.get(key);
+    if (!e) return;
+    this.casterPool.remove(e.caster);
+    this.leafPool.remove(e.leaf);
+    this.plantPool.remove(e.plant);
+    this.batched.delete(key);
+  }
+
+  // Promotion: an individual near-ring chunk drifted beyond NEAR_BATCH_KEEP →
+  // move its EXISTING geometry into the pools (pure memcpy, no re-mesh) and
+  // drop the per-chunk meshes. Inverse runs through the meshQueue (buildMeshes
+  // re-creates individual meshes, then unbatchChunk removes the batch copy).
+  private promoteChunkToBatch(chunk: WorldChunk) {
+    if (!chunk.loaded || chunk.children.length === 0) return;
+    const grab = (material: Three.Material): GeometryArrays | null => {
+      for (const child of chunk.children) {
+        const mesh = child as Three.Mesh;
+        if (mesh.material !== material || !mesh.geometry) continue;
+        const g = mesh.geometry;
+        const col = (g.getAttribute('tintColor') ?? g.getAttribute('plantColor')) as Three.BufferAttribute | undefined;
+        return {
+          positions: g.getAttribute('position').array as Uint16Array,
+          uvs: g.getAttribute('tileUv').array as Uint16Array,
+          layers: g.getAttribute('layerIndex').array as Uint16Array,
+          indices: g.getIndex()!.array as Uint16Array | Uint32Array,
+          colors: col?.array as Uint8Array | undefined,
+        };
+      }
+      return null;
+    };
+    const casters = grab(blockArrayMaterial), leaves = grab(leafArrayMaterial), plants = grab(plantMaterial);
+    if (!casters && !leaves && !plants) return;
+    this.batchChunk(chunk, casters, leaves, plants);
+    chunk.clearMeshes();
+    chunk.loaded = true;   // clearMeshes resets it; the batch copy IS the render representation
+  }
+
+  // Set when a demotion was deferred behind a heavy chunk backlog — retried
+  // from processQueues so a player who STOPS moving (no further rescans) still
+  // gets the near ring demoted to pickable individual meshes.
+  private demotionsDeferred = false;
+
+  // On rescan: chunks crossing the near-keep boundary swap representations.
+  // Only the boundary band is scanned (O(keep²), not O(chunkMap)).
+  private rebalanceBatchBoundary(pcx: number, pcz: number) {
+    this.demotionsDeferred = false;
+    const K = NEAR_BATCH_KEEP;
+    for (let dx = -K - 2; dx <= K + 2; dx++) {
+      for (let dz = -K - 2; dz <= K + 2; dz++) {
+        const chunk = this.getChunk(pcx + dx, pcz + dz);
+        if (!chunk || !chunk.loaded) continue;
+        const cheb = Math.max(Math.abs(dx), Math.abs(dz));
+        const key = this.chunkKey(pcx + dx, pcz + dz);
+        const isBatched = this.batched.has(key);
+        if (cheb <= K && isBatched) {
+          // demote: rebuild individual meshes OFF-THREAD (a worker 'remesh' of
+          // the existing data — running the full mesher on the main thread for
+          // every boundary crossing was a profiled multi-ms/frame cost). The
+          // batch copy keeps rendering until the reply applies (no hole).
+          // Deferred while the chunk-gen backlog is heavy: remeshes are pure
+          // cosmetics (the batch copy is identical), so fresh chunks win the
+          // worker slots; the still-batched entry retries on a later rescan.
+          if (this.workers.length > 0 && !this.inflightWorker.has(key) && this.outstanding < this.maxOutstanding / 2) {
+            const request: WorkerRequest = {
+              type: 'remesh', version: this.worldVersion, key,
+              worldX: chunk.position.x, worldZ: chunk.position.z,
+              data: chunk.data.slice().buffer,   // copy — the live array stays with physics
+            };
+            const w = this.workers[this.nextWorker++ % this.workers.length];
+            w.postMessage(request, [request.data]);
+            this.outstanding++;
+            this.inflightWorker.set(key, w);
+          } else if (this.workers.length === 0) {
+            this.meshQueue.add(chunk);   // no-worker fallback: budgeted local rebuild
+          } else {
+            this.demotionsDeferred = true;   // backlog heavy — retried from processQueues
+          }
+        } else if (cheb > K && !isBatched && chunk.children.length > 0 && !this.hasEditsAround(chunk)) {
+          this.promoteChunkToBatch(chunk);
+        }
+      }
+    }
   }
 
   // Called once when a chunk first receives data: already-built neighbours drew
@@ -870,12 +1048,13 @@ export class World extends Three.Group {
   // Toggle a chunk's plant mesh by distance from the player's chunk. Plants cast
   // no shadow, so hiding them never affects the shadow pass (unlike terrain).
   private applyFoliageVisibility(chunk: WorldChunk) {
-    const mesh = chunk.plantMesh;
-    if (!mesh) return;
-    if (!this.foliageEnabled) { mesh.visible = false; return; }
     const { x, z } = chunk.userData as chunkCoords;
     const cheb = Math.max(Math.abs(x - this.lastPlayerChunkX), Math.abs(z - this.lastPlayerChunkZ));
-    mesh.visible = cheb <= this.foliageDistance;
+    const vis = this.foliageEnabled && cheb <= this.foliageDistance;
+    const e = this.batched.get(this.chunkKey(x, z));
+    if (e) { this.plantPool.setVisible(e.plant, vis); return; }
+    const mesh = chunk.plantMesh;
+    if (mesh) mesh.visible = vis;
   }
   refreshFoliageVisibility() {
     for (const chunk of this.chunkMap.values()) this.applyFoliageVisibility(chunk);
@@ -883,6 +1062,8 @@ export class World extends Three.Group {
   // Toggle ultra foliage/leaf cutout shadows on every loaded chunk (no rebuild).
   refreshFoliageShadows(on: boolean) {
     for (const chunk of this.chunkMap.values()) chunk.applyFoliageShadows(on);
+    this.plantPool.setShadows(on, on ? cutoutDepthMaterial : null);
+    this.leafPool.setShadows(true, on ? cutoutDepthMaterial : null);
   }
   setFoliage(enabled: boolean, distance: number) {
     this.foliageEnabled = enabled;
@@ -945,6 +1126,7 @@ export class World extends Three.Group {
       if (removed >= this.maxRemovalsPerFrame) break;
       if (!this.visibleKeys.has(key)) {
         this.meshQueue.delete(chunk);
+        this.unbatchChunk(chunk);        // free its batch-page slice (if batched)
         this.noteChunkOverTile(chunk);   // LOD tile over it may need to show again
         chunk.disposeInstance();
         this.remove(chunk);
@@ -1067,11 +1249,20 @@ export class World extends Three.Group {
     // Invalidate any in-flight worker results from the previous world.
     this.worldVersion++;
     this.disposeChunks();
-    // LOD teardown BEFORE this.clear(): dispose every tile's geometry explicitly
+    // LOD teardown BEFORE this.clear(): dispose the batch pages explicitly
     // (Group.clear() only detaches — the GPU buffers would leak on every
-    // regenerate/load/host-init) and reset all LOD queues/accounting.
-    for (const t of this.lodMap.values()) this.disposeLodTile(t);
+    // regenerate/load/host-init) and reset all LOD queues/accounting. Pages
+    // are recreated lazily by the pools as the new world's tiles stream in.
+    this.lodTerrainPool.disposeAll();
+    this.lodCanopyPool.disposeAll();
+    for (const t of this.lodMap.values()) { t.terrainH = t.canopyH = null; }
     this.lodMap.clear();
+    // Chunk batches: dispose the pages outright (recreated lazily as the new
+    // world streams) and forget every handle.
+    this.casterPool.disposeAll();
+    this.leafPool.disposeAll();
+    this.plantPool.disposeAll();
+    this.batched.clear();
     this.lodPending.length = 0;
     this.lodApplyQueue.length = 0;
     this.lodOutstanding = 0;
@@ -1197,6 +1388,9 @@ export class World extends Three.Group {
       const chunk = this.getChunk(coords.chunk.x, coords.chunk.z);
       if (chunk && chunk.loaded) {
         chunk.setBlockEdit(coords.block.x, coords.block.y, coords.block.z, id, this.getWorldBlock, this.getGrassTint);
+        // A remote edit can land on a BATCHED far chunk: setBlockEdit just
+        // rebuilt its individual meshes, so drop the (now stale) batch copy.
+        this.unbatchChunk(chunk);
         this.remeshAround(x, y, z, chunk);
       } else {
         this.dataStore.set({

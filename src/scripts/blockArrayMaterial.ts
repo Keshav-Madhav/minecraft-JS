@@ -220,6 +220,43 @@ LAYER_URLS[TEXTURE_LAYER.jackLanternTop] = B + 'jack_lantern_top.png';
 
 const TILE = 16;
 
+// Cutout-mip fix (Voxy's "solidify" pass): transparent texels in our PNGs carry
+// RGB(0,0,0), so the driver's mip chain averages BLACK into every cutout layer —
+// distant leaves/foliage read darker the further the mip (the LOD canopy
+// noticeably darkened with distance). Before upload, dilate the nearest opaque
+// RGB into transparent texels (alpha untouched — the cutout still cuts) so the
+// mip blend only ever averages real surface colour.
+function dilateTransparentRGB(px: Uint8ClampedArray) {
+  const N = TILE * TILE;
+  let hasTransparent = false;
+  for (let i = 0; i < N; i++) if (px[i * 4 + 3] < 16) { hasTransparent = true; break; }
+  if (!hasTransparent) return;
+  const filled = new Uint8Array(N);   // 1 = has usable RGB (opaque or already dilated)
+  for (let i = 0; i < N; i++) filled[i] = px[i * 4 + 3] >= 16 ? 1 : 0;
+  // few passes of 4-neighbour dilation — TILE is 16, this converges fast
+  for (let pass = 0; pass < TILE; pass++) {
+    let changed = false;
+    for (let y = 0; y < TILE; y++) {
+      for (let x = 0; x < TILE; x++) {
+        const i = y * TILE + x;
+        if (filled[i]) continue;
+        let r = 0, g = 0, b = 0, n = 0;
+        const consider = (j: number) => { if (filled[j]) { r += px[j * 4]; g += px[j * 4 + 1]; b += px[j * 4 + 2]; n++; } };
+        if (x > 0) consider(i - 1);
+        if (x < TILE - 1) consider(i + 1);
+        if (y > 0) consider(i - TILE);
+        if (y < TILE - 1) consider(i + TILE);
+        if (n > 0) {
+          px[i * 4] = r / n; px[i * 4 + 1] = g / n; px[i * 4 + 2] = b / n;
+          filled[i] = 2;   // mark filled, but don't let this pass cascade within itself unfairly — fine for our purposes
+          changed = true;
+        }
+      }
+    }
+    if (!changed) break;
+  }
+}
+
 function createArrayTexture(): THREE.DataArrayTexture {
   // Allocate the full RGBA array upfront so the uniform is always a valid
   // sampler; pixel data streams in as each PNG decodes. White layer is filled
@@ -259,6 +296,7 @@ function createArrayTexture(): THREE.DataArrayTexture {
       ctx.clearRect(0, 0, TILE, TILE);
       ctx.drawImage(img, 0, 0, TILE, TILE);
       const pixels = ctx.getImageData(0, 0, TILE, TILE).data;
+      dilateTransparentRGB(pixels);
       data.set(pixels, layer * TILE * TILE * 4);
       done();
     };
@@ -311,9 +349,21 @@ export function updateCubeUniforms(timeSeconds: number, sea: number, caustics: b
 // Replaces three's <fog_fragment>; reuses three's fogColor/fogNear/fogFar uniforms.
 // `worldVar` is the fragment's world-position varying (vWorldPos for cube/plant,
 // vWaterPos for water). All fogged materials share uCamXZ, updated each frame.
+// AERIAL PERSPECTIVE on top of the plain fog mix: a SUBTLE desaturation +
+// blue shift confined to the FAR band (last ~30% before the fog wall). The
+// first version of this started at 35% of the fog distance at 55% strength
+// with a black-lift — it milk-washed the entire mid-field and read as
+// "blurry / non-HD". Distance cues must whisper, not shout: mid-range terrain
+// stays fully vivid, only the horizon breathes a little atmosphere before the
+// real fog finishes the job.
 export const CYL_FOG_FRAGMENT = (worldVar: string) => /* glsl */`
   #ifdef USE_FOG
     float vFogCyl = length(${worldVar}.xz - uCamXZ);
+    float aerial = smoothstep( fogNear * 0.7, fogFar, vFogCyl ) * 0.3;
+    float lum = dot( gl_FragColor.rgb, vec3( 0.299, 0.587, 0.114 ) );
+    vec3 hazed = mix( gl_FragColor.rgb, vec3( lum ), aerial * 0.5 );      // gentle desaturate
+    hazed = mix( hazed, hazed * vec3( 0.95, 0.985, 1.05 ), aerial );      // faint blue shift, NO black lift
+    gl_FragColor.rgb = hazed;
     float fogFactor = smoothstep( fogNear, fogFar, vFogCyl );
     gl_FragColor.rgb = mix( gl_FragColor.rgb, fogColor, fogFactor );
   #endif
@@ -334,6 +384,14 @@ function injectCubeShader(shader: THREE.WebGLProgramParametersWithUniforms) {
   shader.uniforms.uCaustics = { value: 0 };
   cubeShaders.push(shader);
   registerFogShader(shader);   // cylindrical fog (uses vWorldPos, declared below)
+  // QUANTIZED VERTEX FORMAT (Sodium-style, 40 B → 16 B/vertex):
+  //  • position: normalized u16, world = local·QSCALE − QOFF, decoded by the
+  //    MESH/INSTANCE MATRIX (scale+offset baked in) so three's depth/shadow/
+  //    distance materials all decode for free — no shader change needed there.
+  //  • tileUv: normalized u16, same (v+8)·64 scheme — decoded HERE.
+  //  • layerIndex: normalized u16 carrying (texture layer | faceId << 12);
+  //    the 3-bit face id replaces the 12-byte normal attribute entirely (every
+  //    face we emit is axis-aligned; plants are always 'up').
   shader.vertexShader = shader.vertexShader
     .replace('#include <common>', /* glsl */`
       #include <common>
@@ -345,14 +403,28 @@ function injectCubeShader(shader: THREE.WebGLProgramParametersWithUniforms) {
       varying vec3 vTintCol;
       varying float vEmis;
       varying vec3 vWorldPos;
+      const vec3 FACE_NORMALS[6] = vec3[6](
+        vec3(1,0,0), vec3(-1,0,0), vec3(0,1,0), vec3(0,-1,0), vec3(0,0,1), vec3(0,0,-1));
+    `)
+    .replace('#include <beginnormal_vertex>', /* glsl */`
+      int _ldi = int(floor(layerIndex * 65535.0 + 0.5));
+      vec3 objectNormal = FACE_NORMALS[_ldi >> 12];
     `)
     .replace('#include <begin_vertex>', /* glsl */`
       #include <begin_vertex>
-      vTileUv = tileUv;
-      vLayer = layerIndex;
+      vTileUv = tileUv * 1023.984375 - 8.0;   // u16-normalized → block coords ((v+8)·64 encode)
+      vLayer = float(_ldi & 4095);
       vTintCol = tintColor.rgb;
       vEmis = tintColor.a;
-      vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+      // BatchedMesh applies the per-instance transform LATER (project_vertex:
+      // batchingMatrix * mvPosition) — 'transformed' here is still geometry-
+      // local. Our world-position varying (cylindrical fog + caustics) must
+      // apply it manually or every batched chunk fogs as if at the origin.
+      vec3 _wpLocal = transformed;
+      #ifdef USE_BATCHING
+        _wpLocal = (batchingMatrix * vec4(_wpLocal, 1.0)).xyz;
+      #endif
+      vWorldPos = (modelMatrix * vec4(_wpLocal, 1.0)).xyz;
     `);
   shader.fragmentShader = shader.fragmentShader
     .replace('#include <common>', /* glsl */`
@@ -448,20 +520,34 @@ plantMaterial.onBeforeCompile = (shader) => {
       varying vec3 vTint;
       varying vec3 vWorldPos;
     `)
+    .replace('#include <beginnormal_vertex>', /* glsl */`
+      // quantized format: plants always carry faceId 2 ('up') — even lighting,
+      // no stored normal (see the cube shader's FACE_NORMALS rationale)
+      vec3 objectNormal = vec3(0.0, 1.0, 0.0);
+    `)
     .replace('#include <begin_vertex>', /* glsl */`
       #include <begin_vertex>
-      vTileUv = tileUv;
-      vLayer = layerIndex;
+      vTileUv = tileUv * 1023.984375 - 8.0;   // u16-normalized → block coords
+      vLayer = float(int(floor(layerIndex * 65535.0 + 0.5)) & 4095);
       vTint = plantColor.rgb;
-      // Wind: phase from WORLD position (modelMatrix folds in the chunk offset) so
-      // neighbouring plants/chunks sway coherently. Scaled by the per-vertex sway
-      // weight (0 at the rooted base, 1 at the tip).
+      // Wind: phase from WORLD position so neighbouring plants/chunks sway
+      // coherently. Scaled by the per-vertex sway weight (0 at the rooted
+      // base, 1 at the tip). Batched plants: the per-instance (chunk) offset
+      // lives in batchingMatrix, applied later in project_vertex — fold it in
+      // here or batched plants would fog/sway as if at the world origin.
+      // Displacement happens in QUANTIZED local units (1 unit = 65535/64
+      // blocks, the mesh matrix descales) → scale block-space amplitudes down.
       float sway = plantColor.a;
-      vec3 wpos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+      vec3 _ppLocal = transformed;
+      #ifdef USE_BATCHING
+        _ppLocal = (batchingMatrix * vec4(_ppLocal, 1.0)).xyz;
+      #endif
+      vec3 wpos = (modelMatrix * vec4(_ppLocal, 1.0)).xyz;
       vWorldPos = wpos;           // for cylindrical fog
       float ph = wpos.x * 0.6 + wpos.z * 0.45;
-      transformed.x += (sin(uTime * 1.6 + ph) + 0.3 * sin(uTime * 3.1 + ph * 1.7)) * 0.07 * sway;
-      transformed.z += cos(uTime * 1.3 + ph * 1.1) * 0.06 * sway;
+      const float Q2L = 64.0 / 65535.0;   // blocks → quantized-local units
+      transformed.x += (sin(uTime * 1.6 + ph) + 0.3 * sin(uTime * 3.1 + ph * 1.7)) * 0.07 * Q2L * sway;
+      transformed.z += cos(uTime * 1.3 + ph * 1.1) * 0.06 * Q2L * sway;
     `);
 
   shader.fragmentShader = shader.fragmentShader
@@ -517,7 +603,9 @@ cutoutDepthMaterial.onBeforeCompile = (shader) => {
   shader.uniforms.uArray = { value: arrayTexture };
   shader.vertexShader = shader.vertexShader
     .replace('#include <common>', '#include <common>\nattribute vec2 tileUv;\nattribute float layerIndex;\nvarying vec2 vTileUv;\nvarying float vLayer;')
-    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvTileUv = tileUv;\nvLayer = layerIndex;');
+    // quantized format decode (see injectCubeShader) — positions descale via the
+    // mesh/instance matrix, so the depth pass needs only the uv/layer decode
+    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvTileUv = tileUv * 1023.984375 - 8.0;\nvLayer = float(int(floor(layerIndex * 65535.0 + 0.5)) & 4095);');
   shader.fragmentShader = shader.fragmentShader
     .replace('#include <common>', '#include <common>\nuniform sampler2DArray uArray;\nvarying vec2 vTileUv;\nvarying float vLayer;')
     .replace('#include <clipping_planes_fragment>', '#include <clipping_planes_fragment>\nvec2 _auv = fract(vTileUv); _auv.y = 1.0 - _auv.y;\nif (textureGrad(uArray, vec3(_auv, vLayer), dFdx(vTileUv), dFdy(vTileUv)).a < 0.5) discard;');

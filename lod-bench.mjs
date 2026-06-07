@@ -80,7 +80,7 @@ try {
           updMsPerFrame: +(((W.updMs - B.updMs0) / Math.max(1, W.updN - B.updN0))).toFixed(3),
           pqMsPerFrame: +(((W.pqMs - B.pqMs0) / Math.max(1, W.updN - B.updN0))).toFixed(3),
           draws: r.calls, tris: r.triangles,
-          chunks: w.chunkCount, lodTiles: w.lodTileCount, lodMeshes: w.lodGroup.children.length,
+          chunks: w.chunkCount, lodTiles: w.lodTileCount, lodMeshes: w.lodBuiltCount, lodPages: w.lodGroup.children.length,
           geometries: m.geometries,
           heapMB: performance.memory ? +((performance.memory.usedJSHeapSize) / 1048576).toFixed(0) : 0,
           heapDeltaMB: performance.memory ? +((performance.memory.usedJSHeapSize - B.heap0) / 1048576).toFixed(1) : 0,
@@ -99,7 +99,7 @@ try {
     await page.evaluate(() => { window.__settle = { c: -1, l: -1, stable: 0 }; });
     await page.waitForFunction(() => {
       const s = window.__settle, w = window.__mcDebug.world;
-      const c = w.chunkCount, l = w.lodGroup.children.length;
+      const c = w.chunkCount, l = w.lodBuiltCount;
       if (c === s.c && l === s.l) s.stable++; else { s.stable = 0; s.c = c; s.l = l; }
       return s.stable >= 3;   // 3 consecutive polls (1s apart) unchanged
     }, null, { timeout: capMs, polling: 1000 }).catch(() => console.log('  (settle cap hit)'));
@@ -236,7 +236,7 @@ try {
         const bubble = performance.now() - t0;
         // far ring: until LOD meshes reappear ahead
         await new Promise((res) => {
-          const check = () => { if (world.lodGroup.children.length > 20) res(); else setTimeout(check, 250); };
+          const check = () => { if (world.lodBuiltCount > 20) res(); else setTimeout(check, 250); };
           check();
         });
         return { bubbleMs: Math.round(bubble), lodMs: Math.round(performance.now() - t0) };

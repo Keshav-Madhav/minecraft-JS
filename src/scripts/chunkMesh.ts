@@ -15,11 +15,28 @@ export type TintGetter = (localX: number, localZ: number) => readonly [number, n
 // maps them to world space. Used to cull faces along shared chunk borders.
 export type OutsideBlockGetter = (localX: number, y: number, localZ: number) => number;
 
+// QUANTIZED VERTEX FORMAT (16 B/vertex, was 40): Sodium-style compression —
+// the dominant cost at high settings was geometry RAM + GPU vertex bandwidth.
+//  • positions/uvs: normalized u16, encode q=(v+8)·64 (1/64-block precision,
+//    range −8..1015 covers chunk+LOD+megatile local space). Positions decode
+//    via the mesh/instance MATRIX (scale 65535/64, offset −8 baked in) so
+//    every material — incl. three's built-in shadow depth — decodes for free;
+//    uvs decode in our injected shader code.
+//  • layers: u16 = textureLayer | faceId<<12. The 3-bit face id replaces the
+//    old 12-byte normal attribute entirely (every face we emit is one of the
+//    6 axis directions; plants are always 'up' = face 2). The shader looks the
+//    normal up in a 6-entry const table.
+export const Q_SCALE = 64;          // quantization steps per block
+export const Q_OFFSET = 8;          // blocks of negative range
+export function quantize(v: number): number {
+  const q = ((v + Q_OFFSET) * Q_SCALE + 0.5) | 0;
+  return q < 0 ? 0 : q > 65535 ? 65535 : q;
+}
+
 export type GeometryArrays = {
-  positions: Float32Array,
-  normals: Float32Array,
-  uvs: Float32Array,
-  layers: Float32Array,
+  positions: Uint16Array,   // quantized, normalized attr; decoded by the mesh/instance matrix
+  uvs: Uint16Array,         // quantized, normalized attr; decoded in-shader
+  layers: Uint16Array,      // textureLayer | faceId<<12 (normalized attr, exact u16 round-trip in f32)
   // Uint16 when the group's vertex count fits (the common case for a single
   // heightmap chunk split into casters/non-casters) — half the index VRAM and
   // upload bandwidth vs Uint32 across thousands of streamed chunks. Falls back to
@@ -46,32 +63,31 @@ type DirMeta = {
   aAxis: number, sign: number,
   pAxis: number, qAxis: number,
   uAxis: number, vAxis: number,
-  normal: readonly [number, number, number],
+  face: number,   // 0..5 = +x,-x,+y,-y,+z,-z — packed into the layer word (shader normal LUT)
 };
 // pAxis × qAxis points outward (sign·aAxis) so a fixed winding gives correct
 // normals; uAxis/vAxis keep vertical-face textures upright (V follows world-Y).
 const DIR_META: ReadonlyArray<DirMeta> = [
-  { aAxis: 0, sign: 1,  pAxis: 1, qAxis: 2, uAxis: 2, vAxis: 1, normal: [1, 0, 0] },   // +x
-  { aAxis: 0, sign: -1, pAxis: 2, qAxis: 1, uAxis: 2, vAxis: 1, normal: [-1, 0, 0] },  // -x
-  { aAxis: 1, sign: 1,  pAxis: 2, qAxis: 0, uAxis: 0, vAxis: 2, normal: [0, 1, 0] },   // +y
-  { aAxis: 1, sign: -1, pAxis: 0, qAxis: 2, uAxis: 0, vAxis: 2, normal: [0, -1, 0] },  // -y
-  { aAxis: 2, sign: 1,  pAxis: 0, qAxis: 1, uAxis: 0, vAxis: 1, normal: [0, 0, 1] },   // +z
-  { aAxis: 2, sign: -1, pAxis: 1, qAxis: 0, uAxis: 0, vAxis: 1, normal: [0, 0, -1] },  // -z
+  { aAxis: 0, sign: 1,  pAxis: 1, qAxis: 2, uAxis: 2, vAxis: 1, face: 0 },   // +x
+  { aAxis: 0, sign: -1, pAxis: 2, qAxis: 1, uAxis: 2, vAxis: 1, face: 1 },   // -x
+  { aAxis: 1, sign: 1,  pAxis: 2, qAxis: 0, uAxis: 0, vAxis: 2, face: 2 },   // +y
+  { aAxis: 1, sign: -1, pAxis: 0, qAxis: 2, uAxis: 0, vAxis: 2, face: 3 },   // -y
+  { aAxis: 2, sign: 1,  pAxis: 0, qAxis: 1, uAxis: 0, vAxis: 1, face: 4 },   // +z
+  { aAxis: 2, sign: -1, pAxis: 1, qAxis: 0, uAxis: 0, vAxis: 1, face: 5 },   // -z
 ];
 
 // `col` (vec4/vertex) is filled for ALL groups now: plants carry tint rgb + sway a;
 // casters/nonCasters carry the baked biome tint rgb (white where untinted) + a=1.
-type Accumulator = { pos: number[], norm: number[], uv: number[], layer: number[], col: number[], idx: number[] };
-const newAccumulator = (): Accumulator => ({ pos: [], norm: [], uv: [], layer: [], col: [], idx: [] });
+type Accumulator = { pos: number[], uv: number[], layer: number[], col: number[], idx: number[] };
+const newAccumulator = (): Accumulator => ({ pos: [], uv: [], layer: [], col: [], idx: [] });
 
 function finalize(acc: Accumulator): GeometryArrays | null {
   if (acc.idx.length === 0) return null;
   const vtx = acc.pos.length / 3;
   return {
-    positions: new Float32Array(acc.pos),
-    normals: new Float32Array(acc.norm),
-    uvs: new Float32Array(acc.uv),
-    layers: new Float32Array(acc.layer),
+    positions: Uint16Array.from(acc.pos, quantize),
+    uvs: Uint16Array.from(acc.uv, quantize),
+    layers: Uint16Array.from(acc.layer),   // already layer|face<<12
     indices: vtx > 65535 ? new Uint32Array(acc.idx) : new Uint16Array(acc.idx),
     // pack 0..1 tint/sway into normalized bytes (shader reads them back as 0..1)
     colors: acc.col.length ? Uint8Array.from(acc.col, (v) => v < 0 ? 0 : v > 1 ? 255 : (v * 255 + 0.5) | 0) : undefined,
@@ -79,14 +95,13 @@ function finalize(acc: Accumulator): GeometryArrays | null {
 }
 
 // Append one plant vertex (explicit world-local position + tint + sway). Plants
-// use an UP normal regardless of quad orientation so a billboard is lit evenly
-// like the ground it grows from (no dark-side flicker as you orbit it).
+// carry face id 2 ('up') so a billboard is lit evenly like the ground it grows
+// from (no dark-side flicker as you orbit it).
 function pushPlantVert(acc: Accumulator, x: number, y: number, z: number, u: number, v: number,
   layer: number, r: number, g: number, b: number, sway: number) {
   acc.pos.push(x, y, z);
-  acc.norm.push(0, 1, 0);
   acc.uv.push(u, v);
-  acc.layer.push(layer);
+  acc.layer.push(layer | (2 << 12));
   acc.col.push(r, g, b, sway);
 }
 
@@ -102,14 +117,13 @@ function pushVert(acc: Accumulator, meta: DirMeta, aCoord: number, pc: number, q
   switch (meta.pAxis) { case 0: x = pc; break; case 1: y = pc; break; default: z = pc; }
   switch (meta.qAxis) { case 0: x = qc; break; case 1: y = qc; break; default: z = qc; }
   acc.pos.push(x, y, z);
-  acc.norm.push(meta.normal[0], meta.normal[1], meta.normal[2]);
   // +0.5 aligns texture tile boundaries to block edges; the shader fract()s this
   // so merged quads tile the texture once per block.
   acc.uv.push(
     (meta.uAxis === 0 ? x : meta.uAxis === 1 ? y : z) + 0.5,
     (meta.vAxis === 0 ? x : meta.vAxis === 1 ? y : z) + 0.5,
   );
-  acc.layer.push(layer);
+  acc.layer.push(layer | (meta.face << 12));
   acc.col.push(r, g, b, emis);   // rgb = biome tint (white = untinted); a = emissive amount (0 = none)
 }
 

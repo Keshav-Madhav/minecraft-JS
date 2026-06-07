@@ -52,7 +52,7 @@ try {
   await page.waitForTimeout(20000);
   console.log('streamed:', await page.evaluate(() => {
     const w = window.__mcDebug.world;
-    return JSON.stringify({ chunks: w.chunkCount, lod: w.lodTileCount, meshes: w.lodGroup.children.length });
+    return JSON.stringify({ chunks: w.chunkCount, lod: w.lodTileCount, built: w.lodBuiltCount, pages: w.lodGroup.children.length });
   }));
 
   // Wrap hot entry points with timers + start gameplay motion (fly forward + turn).
