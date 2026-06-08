@@ -100,9 +100,9 @@ export class World extends Three.Group {
     // scale = feature breadth (continents ~3.5x this); magnitude = mountain
     // height; offset = land-height bias above sea (higher => more/larger land).
     // Large scale keeps the world traversible (broad, gentle terrain) instead of a
-    // pretty-but-miniature diorama. magnitude = the BASE mountain amplitude (modest,
-    // normal mounds/peaks); a +110 RANGE bonus in columnSurface lifts ONLY the cold
-    // very-low-erosion mountain RANGES to their extreme, snow-capped height.
+    // pretty-but-miniature diorama. magnitude = the BASE mountain amplitude; a +82
+    // RANGE bonus in columnSurface lifts ONLY the cool low-erosion segments of the
+    // orogenic spine chains (see the spine field there) to alpine, snow-capped height.
     seed: 0,
     terrain: { scale: 260, magnitude: 60, offset: 10, waterOffset: 128 },
     trees: {
@@ -1072,9 +1072,9 @@ export class World extends Three.Group {
   }
 
   // The cached top-down canvas for a loaded chunk (for the in-sync minimap blit).
-  getChunkMapTileCanvas(cx: number, cz: number): HTMLCanvasElement | null {
+  getChunkMapTileCanvas(cx: number, cz: number, build = true): HTMLCanvasElement | null {
     const chunk = this.chunkMap.get(this.chunkKey(cx, cz));
-    return chunk && chunk.loaded ? chunk.getMapTileCanvas() : null;
+    return chunk && chunk.loaded ? chunk.getMapTileCanvas(build) : null;
   }
 
   // Force the next update() to re-evaluate the visible set (e.g. after toggling

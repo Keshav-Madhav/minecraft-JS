@@ -552,8 +552,11 @@ const DEFAULT_WATER_HEX = 0x2f6aa6;
 // cheap N–S slope term so relief reads. Mirrors the map worker's `shade`.
 function tileShade(height: number, slope: number, sea: number, r: number, g: number, b: number, out: Uint8Array, di: number) {
   if (height < sea) { const f = 1 - 0.45 * Math.min(Math.max((sea - height) / 40, 0), 1); r *= f; g *= f; b *= f; }
-  else { const f = 0.92 + Math.min(Math.max((height - sea) / 80, 0), 1) * 0.16; r *= f; g *= f; b *= f; }
-  const sh = Math.min(Math.max(1 + slope * 0.07, 0.55), 1.45);
+  // Hypsometric brightness scaled to the POST-OROGENY world (peaks ~+170, not
+  // +80): 0.84 at sea → 1.30 on the summits, so elevation reads at a glance.
+  else { const f = 0.84 + Math.min(Math.max((height - sea) / 170, 0), 1) * 0.46; r *= f; g *= f; b *= f; }
+  // Hillshade strengthened to match (steeper ranges deserve real relief shading).
+  const sh = Math.min(Math.max(1 + slope * 0.12, 0.45), 1.6);
   out[di] = Math.min(r * sh, 255); out[di + 1] = Math.min(g * sh, 255); out[di + 2] = Math.min(b * sh, 255); out[di + 3] = 255;
 }
 
@@ -590,8 +593,10 @@ export function buildChunkMapTile(data: Uint8Array, size: ChunkSize, sea: number
       } else {
         const mc = blockMapColor(id); r = mc[0]; g = mc[1]; b = mc[2];
       }
+      // NW light (classic cartographic): combine the north + west gradients.
       const north = topYs[(lz > 0 ? lz - 1 : lz) * W + lx];
-      tileShade(y, y - north, sea, r, g, b, out, di);
+      const west = topYs[lz * W + (lx > 0 ? lx - 1 : lx)];
+      tileShade(y, ((y - north) + (y - west)) * 0.6, sea, r, g, b, out, di);
     }
   }
   return out;

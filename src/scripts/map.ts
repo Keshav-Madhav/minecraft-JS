@@ -43,7 +43,9 @@ function pickTileWorld(worldPerPixel: number): number {
 export type WorldMapOptions = {
   getPlayer: () => { x: number, z: number, yaw: number },
   // Cached top-down canvas for a loaded chunk, or null if not loaded (minimap).
-  getChunkTile: (chunkX: number, chunkZ: number) => HTMLCanvasElement | null,
+  // `allowBuild=false` returns only an already-wrapped canvas (no synchronous
+  // canvas creation) — the fullscreen overlay budgets creation per frame.
+  getChunkTile: (chunkX: number, chunkZ: number, allowBuild?: boolean) => HTMLCanvasElement | null,
   // Monotonic counter bumped whenever a chunk's minimap tile changes (stream-in /
   // edit). Lets the minimap skip its stationary heartbeat repaint when nothing new.
   getMapEpoch?: () => number,
@@ -67,15 +69,20 @@ export class WorldMap {
   private sig = '0';        // world signature — IDB key prefix + stale-result guard
   private chunkW = 16;      // chunk width in blocks (set in configure)
 
-  // Minimap recomposite gate: the composite is pixel-identical until the integer
-  // screen origin shifts (player moved ≥1px), so we cache the last origin and skip
-  // redrawing the ~13×13 tile grid every frame while standing still / moving sub-
-  // pixel. A low heartbeat still recomposites a few times/sec so freshly-streamed
-  // tiles fill in even when stationary.
+  // Minimap render path: tiles are stitched into a CHUNK-ANCHORED offscreen
+  // BUFFER (one chunk of margin all around), and the per-frame work while
+  // moving is a SINGLE drawImage of that buffer at the scroll offset. The
+  // buffer itself is rebuilt only when the player crosses a chunk boundary
+  // (anchor moves) or a tile actually changed (epoch heartbeat) — the old path
+  // redrew the full ~13×13 tile grid EVERY frame while moving, which made the
+  // minimap one of the most expensive DOM consumers in the frame.
   private miniOx = NaN;
   private miniOz = NaN;
   private miniTick = 0;
-  private lastMiniEpoch = -1;   // map-tile epoch at the last composite (M3 dirty gate)
+  private lastMiniEpoch = -1;   // map-tile epoch at the last buffer rebuild
+  private miniBuf: HTMLCanvasElement | null = null;
+  private miniBufAx = NaN;      // buffer anchor (world coords of its top-left, chunk-aligned)
+  private miniBufAz = NaN;
 
   // minimap
   private miniWrap: HTMLElement;
@@ -93,6 +100,15 @@ export class WorldMap {
   private dragMoved = false;
   private px = 0;
   private py = 0;
+  // Fullscreen composite buffer: the tile mosaic + loaded-chunk overlay are
+  // recomposited only when the VIEW changes (pan/zoom), a worker tile lands,
+  // or chunk tiles change (epoch heartbeat) — the per-frame cost while open is
+  // one full-canvas blit + the player dot (the old path redrew the whole
+  // mosaic incl. up-to-41² chunk overlays EVERY frame).
+  private bigBuf: HTMLCanvasElement | null = null;
+  private bigTileAdopted = false;
+  private lastBigView = '';
+  private lastBigEpoch = -1;
 
   constructor(opts: WorldMapOptions) {
     this.opts = opts;
@@ -148,8 +164,15 @@ export class WorldMap {
     this.requested.clear();
     this.outstanding = 0;
     this.chunkW = size.width;
+    // invalidate both composite buffers — the world changed under them
+    this.miniBufAx = NaN; this.miniBufAz = NaN; this.miniOx = NaN;
+    this.lastBigView = ''; this.bigTileAdopted = false;
     const t = params.terrain;
-    this.sig = `${params.seed}_${t.scale}_${t.magnitude}_${t.offset}_${t.waterOffset}`;
+    // `v2` = map RENDER-algorithm version. Bump it whenever the tile shader
+    // changes (hypsometric ramp, hillshade, tree/structure overlays, coarse
+    // supersampling) so persisted IDB tiles from an older render don't show
+    // mismatched alongside freshly-rendered ones.
+    this.sig = `v2_${params.seed}_${t.scale}_${t.magnitude}_${t.offset}_${t.waterOffset}`;
     const msg: MapWorkerRequest = { type: 'config', params, size, sea };
     for (const w of this.workers) w.postMessage(msg);   // every worker needs the world config
   }
@@ -176,6 +199,7 @@ export class WorldMap {
       return;   // don't cache/persist a broken tile (slot already freed → re-requested)
     }
     this.cache.set(key, canvas);
+    this.bigTileAdopted = true;   // fullscreen buffer is stale — recomposite next frame
     if (this.cache.size > MAX_CACHE) {
       const oldest = this.cache.keys().next().value as string | undefined;
       if (oldest && oldest !== key) this.cache.delete(oldest);
@@ -249,25 +273,40 @@ export class WorldMap {
     this.opts.onClose?.();
   }
 
-  // ---- minimap: blit loaded chunk tiles directly (fast, in-sync) ------------
-  private compositeMini(px: number, pz: number) {
-    const ctx = this.mini.getContext('2d'); if (!ctx) return;
+  // ---- minimap: chunk-anchored buffer + 1-blit scroll ------------------------
+  // Rebuild the stitched buffer (≈14×14 tile drawImages) — only on anchor move
+  // or tile epoch change, NOT per frame.
+  private rebuildMiniBuffer(ax: number, az: number) {
+    const W = this.chunkW;
+    const side = this.mini.width + 2 * W;          // one chunk of margin each side
+    if (!this.miniBuf || this.miniBuf.width !== side) {
+      this.miniBuf = document.createElement('canvas');
+      this.miniBuf.width = this.miniBuf.height = side;
+    }
+    const ctx = this.miniBuf.getContext('2d'); if (!ctx) return;
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = '#0b0f17';
-    ctx.fillRect(0, 0, this.mini.width, this.mini.height);
-
-    const W = this.chunkW;
-    const half = this.mini.width / 2;
-    // Integer screen origin so adjacent tiles abut perfectly (no seams/gaps).
-    const ox = Math.round(half - px), oz = Math.round(half - pz);
-    const cx0 = Math.floor((px - half) / W), cx1 = Math.floor((px + half) / W);
-    const cz0 = Math.floor((pz - half) / W), cz1 = Math.floor((pz + half) / W);
-    for (let cz = cz0; cz <= cz1; cz++) {
-      for (let cx = cx0; cx <= cx1; cx++) {
+    ctx.fillRect(0, 0, side, side);
+    const cx0 = Math.floor(ax / W), cz0 = Math.floor(az / W);
+    const n = Math.ceil(side / W);
+    for (let cz = cz0; cz < cz0 + n; cz++) {
+      for (let cx = cx0; cx < cx0 + n; cx++) {
         const tile = this.opts.getChunkTile(cx, cz);
-        if (tile) ctx.drawImage(tile, ox + cx * W, oz + cz * W, W, W);
+        if (tile) ctx.drawImage(tile, cx * W - ax, cz * W - az, W, W);
       }
     }
+    this.miniBufAx = ax; this.miniBufAz = az;
+  }
+
+  // Per-frame: one buffer blit at the integer scroll offset.
+  private blitMini(px: number, pz: number) {
+    if (!this.miniBuf) return;
+    const ctx = this.mini.getContext('2d'); if (!ctx) return;
+    ctx.imageSmoothingEnabled = false;
+    const half = this.mini.width / 2;
+    ctx.fillStyle = '#0b0f17';
+    ctx.fillRect(0, 0, this.mini.width, this.mini.height);
+    ctx.drawImage(this.miniBuf, Math.round(this.miniBufAx - (px - half)), Math.round(this.miniBufAz - (pz - half)));
   }
 
   // ---- fullscreen map: composite cached tiles; queue missing ones -----------
@@ -355,27 +394,49 @@ export class WorldMap {
       this.lastMarkerYaw = yawQ;
       this.miniMarker.style.transform = `translate(-50%, -50%) rotate(${p.yaw}rad)`;
     }
-    // Only recomposite when the result would actually differ: the integer screen
-    // origin (same maths as compositeMini) MOVED, or the heartbeat fired AND a tile
-    // actually changed since the last paint (epoch). So a stationary player over
-    // fully-loaded terrain costs ZERO composites (was a full ~169-tile repaint 5×/s).
-    // The marker rotation above stays per-frame so the compass still turns smoothly.
+    // BUFFER REBUILD only when the chunk-aligned anchor moved (crossed a chunk
+    // boundary) or a tile actually changed (epoch, on the heartbeat). The
+    // per-frame cost while merely MOVING is one buffer blit; standing still
+    // with loaded terrain costs zero canvas work at all.
+    const W = this.chunkW;
     const half = this.mini.width / 2;
-    const ox = Math.round(half - p.x), oz = Math.round(half - p.z);
+    const ax = Math.floor((p.x - half) / W) * W - W;   // buffer top-left, one chunk of margin
+    const az = Math.floor((p.z - half) / W) * W - W;
     const epoch = this.opts.getMapEpoch ? this.opts.getMapEpoch() : 0;
-    const moved = ox !== this.miniOx || oz !== this.miniOz;
     const heartbeat = (this.miniTick++ % 12) === 0 && epoch !== this.lastMiniEpoch;
-    if (moved || heartbeat) {
-      this.miniOx = ox; this.miniOz = oz; this.lastMiniEpoch = epoch;
-      this.compositeMini(p.x, p.z);
+    if (ax !== this.miniBufAx || az !== this.miniBufAz || heartbeat) {
+      this.lastMiniEpoch = epoch;
+      this.rebuildMiniBuffer(ax, az);
+      this.miniOx = NaN;                                // force the blit below
+    }
+    // Single blit, only when the integer scroll origin moved (or buffer rebuilt).
+    const ox = Math.round(half - p.x), oz = Math.round(half - p.z);
+    if (ox !== this.miniOx || oz !== this.miniOz) {
+      this.miniOx = ox; this.miniOz = oz;
+      this.blitMini(p.x, p.z);
     }
 
     if (this.open) {
-      this.want.length = 0;
-      this.composite(this.big, this.centerX, this.centerZ, this.wpp);
-      this.overlayLoadedChunks(p.x, p.z);   // instant + in-sync over the (slower) worker tiles
-      this.drawPlayerOnMap(p.x, p.z);
-      this.pumpRequests();
+      // Recomposite the buffer only when the view / content actually changed.
+      const view = `${this.big.width},${this.big.height},${this.centerX},${this.centerZ},${this.wpp}`;
+      const bigHeartbeat = (this.miniTick % 12) === 1 && epoch !== this.lastBigEpoch;
+      if (view !== this.lastBigView || this.bigTileAdopted || bigHeartbeat) {
+        this.lastBigView = view; this.bigTileAdopted = false; this.lastBigEpoch = epoch;
+        if (!this.bigBuf || this.bigBuf.width !== this.big.width || this.bigBuf.height !== this.big.height) {
+          this.bigBuf = document.createElement('canvas');
+          this.bigBuf.width = this.big.width; this.bigBuf.height = this.big.height;
+        }
+        this.want.length = 0;
+        this.composite(this.bigBuf, this.centerX, this.centerZ, this.wpp);
+        this.overlayLoadedChunks(this.bigBuf, p.x, p.z);   // instant + in-sync over the (slower) worker tiles
+        this.pumpRequests();
+      }
+      // Per-frame: one buffer blit + the live player dot.
+      const ctx = this.big.getContext('2d');
+      if (ctx && this.bigBuf) {
+        ctx.drawImage(this.bigBuf, 0, 0);
+        this.drawPlayerOnMap(p.x, p.z);
+      }
     }
   }
 
@@ -384,21 +445,33 @@ export class WorldMap {
   // match the world (no worker round-trip / regeneration) — the map opens crisp at
   // the centre while distant/panned tiles stream in behind. Only when zoomed in
   // enough that a chunk is a couple of pixels, and bounded to the loaded radius.
-  private overlayLoadedChunks(px: number, pz: number) {
+  private overlayLoadedChunks(canvas: HTMLCanvasElement, px: number, pz: number) {
     if (this.wpp > 8) return;
-    const ctx = this.big.getContext('2d'); if (!ctx) return;
+    const ctx = canvas.getContext('2d'); if (!ctx) return;
     ctx.imageSmoothingEnabled = false;
     const W = this.chunkW, wpp = this.wpp, ss = W / wpp;
-    const leftW = this.centerX - this.big.width / 2 * wpp;
-    const topW = this.centerZ - this.big.height / 2 * wpp;
+    const leftW = this.centerX - canvas.width / 2 * wpp;
+    const topW = this.centerZ - canvas.height / 2 * wpp;
     const pcx = Math.floor(px / W), pcz = Math.floor(pz / W), RAD = 20;   // > max draw distance
     const cx0 = Math.max(Math.floor(leftW / W), pcx - RAD);
-    const cx1 = Math.min(Math.floor((leftW + this.big.width * wpp) / W), pcx + RAD);
+    const cx1 = Math.min(Math.floor((leftW + canvas.width * wpp) / W), pcx + RAD);
     const cz0 = Math.max(Math.floor(topW / W), pcz - RAD);
-    const cz1 = Math.min(Math.floor((topW + this.big.height * wpp) / W), pcz + RAD);
+    const cz1 = Math.min(Math.floor((topW + canvas.height * wpp) / W), pcz + RAD);
+    // BUDGETED canvas creation: a first open over a big loaded ring used to
+    // wrap ~1700 chunk tiles into canvases synchronously (putImageData each) —
+    // a visible main-thread freeze. Spend at most ~150 creations per composite;
+    // already-wrapped tiles always draw, the rest fill in over the next frames
+    // (bigTileAdopted re-triggers the composite until the budget stops binding).
+    let builds = 0;
+    const BUILD_BUDGET = 150;
     for (let chz = cz0; chz <= cz1; chz++) {
       for (let chx = cx0; chx <= cx1; chx++) {
-        const tile = this.opts.getChunkTile(chx, chz);
+        let tile = this.opts.getChunkTile(chx, chz, false);
+        if (!tile) {
+          if (builds >= BUILD_BUDGET) { this.bigTileAdopted = true; continue; }   // finish next frame
+          tile = this.opts.getChunkTile(chx, chz, true);   // unloaded chunks return null cheaply (no budget spent)
+          if (tile) builds++;
+        }
         if (tile) ctx.drawImage(tile, (chx * W - leftW) / wpp, (chz * W - topW) / wpp, ss, ss);
       }
     }

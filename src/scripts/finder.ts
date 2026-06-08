@@ -5,7 +5,7 @@
 import {
   structInfo, structureFitsBiome, STRUCT_CELL, BIOME,
   ST_TOWER, ST_PYRAMID, ST_VILLAGE, ST_MANSION, ST_IGLOO, ST_CAMPSITE,
-  ST_RUINS, ST_OUTPOST, ST_LIGHTHOUSE, ST_WITCH_HUT,
+  ST_RUINS, ST_OUTPOST, ST_LIGHTHOUSE, ST_WITCH_HUT, ST_MONASTERY,
   type WorldSampler,
 } from './chunkGen';
 
@@ -75,4 +75,5 @@ export const STRUCTURE_TARGETS: ReadonlyArray<{ kind: number, label: string }> =
   { kind: ST_LIGHTHOUSE, label: 'Lighthouse' }, { kind: ST_WITCH_HUT, label: 'Witch Hut' },
   { kind: ST_IGLOO, label: 'Igloo' }, { kind: ST_OUTPOST, label: 'Outpost' },
   { kind: ST_RUINS, label: 'Ruins' }, { kind: ST_CAMPSITE, label: 'Campsite' },
+  { kind: ST_MONASTERY, label: 'Monastery' },
 ];

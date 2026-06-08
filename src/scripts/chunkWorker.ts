@@ -96,7 +96,7 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
     // LOD far-terrain tile: pure sampler → mesh, no voxel data. Same stateless
     // determinism as chunk gens (a neighbour tile computes identical borders).
     const geo = buildLodTile(sampler, config.params.terrain.waterOffset, config.size.height - 1,
-      msg.worldX, msg.worldZ, msg.tileBlocks, msg.stride);
+      msg.worldX, msg.worldZ, msg.tileBlocks, msg.stride, config.params.seed);
     const terrain = geometryToPayload(geo.terrain);
     const canopy = geometryToPayload(geo.canopy);
     const reply: LodMeshMessage = {

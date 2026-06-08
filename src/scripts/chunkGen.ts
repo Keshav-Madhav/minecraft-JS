@@ -1,6 +1,6 @@
 import { SimplexNoise } from 'three/examples/jsm/math/SimplexNoise.js';
 import { RNG } from './rng';
-import { BLOCK_IDS, ResourceGenInfo } from './blockTypes';
+import { BLOCK_IDS, ResourceGenInfo, isPlant } from './blockTypes';
 
 export type ChunkParams = {
   seed: number,
@@ -39,8 +39,18 @@ export function generateChunkData(
   size: ChunkSize, params: ChunkParams, worldX: number, worldZ: number, resources: ResourceGenInfo[],
   outTint?: Uint8Array,   // optional: filled with the per-column climate grass tint (rgb*255, index
                           // (x*width+z)*3) so the worker can tint plants without re-sampling columnSurface
-  opts?: { skipFoliage?: boolean }   // the map only reads top NON-plant blocks, so it skips the whole
-                                     // foliage pass (a big, fully-wasted cost for the voxel minimap)
+  opts?: {
+    skipFoliage?: boolean,    // the map only reads top NON-plant blocks, so it skips the whole
+                              // foliage pass (a big, fully-wasted cost for the voxel minimap)
+    surfaceOnly?: boolean,    // fill only the top ~4-block SKIN per column — skip the deep
+                              // subsurface fill (which runs cave/deepslate NOISE per cell:
+                              // ~89% of chunk-gen cost, and invisible from a top-down map).
+                              // Trees + structures still run (they sit on/above the surface),
+                              // so the map stays fully voxel-accurate — just ~9× cheaper.
+    outHeight?: Int16Array,   // optional: receives the per-column terrain height (W*W). Lets the
+                              // map bound its top-down scan to height+margin instead of from the
+                              // world ceiling (skips ~150 wasted air-reads per column).
+  }
 ): Uint8Array {
   const data = new Uint8Array(size.width * size.height * size.width); // 0 == air
 
@@ -58,11 +68,12 @@ export function generateChunkData(
   // Per-column surface height + biome + top-block, filled by generateTerrain and
   // reused by generateFeatures + generateFoliage (so neither re-runs columnSurface
   // for in-chunk columns — the heavy noise cost). 16×16.
-  const heightMap = new Int16Array(size.width * size.width);
+  const heightMap = opts?.outHeight && opts.outHeight.length === size.width * size.width
+    ? opts.outHeight : new Int16Array(size.width * size.width);
   const biomeMap = new Uint8Array(size.width * size.width);
   const surfaceMap = new Uint8Array(size.width * size.width);
 
-  generateTerrain(simplex, params, size, worldX, worldZ, set, heightMap, biomeMap, outTint, surfaceMap);
+  generateTerrain(simplex, params, size, worldX, worldZ, set, heightMap, biomeMap, outTint, surfaceMap, opts?.surfaceOnly);
   generateResources(rng, size, worldX, worldZ, resources, get, set, biomeMap);
 
   // Features (trees + ground decorations). generateFeatures re-seeds its own
@@ -83,7 +94,7 @@ export function generateChunkData(
   // Structures run LAST: they clear (air) and overwrite their footprint, so any
   // foliage/trees inside a building are removed. Multi-chunk via a deterministic
   // grid — see generateStructures.
-  generateStructures(simplex, params, size, worldX, worldZ, set);
+  generateStructures(simplex, params, size, worldX, worldZ, set, get);
 
   return data;
 }
@@ -704,30 +715,92 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   // --- base relief (float; floored ONCE at the end so there are no 1-block steps) ---
   let baseH = spline(c.cont, cfg.contSpline);
   const land = clamp((baseH - sea) / 14, 0, 1);
-  // Mountain RANGES, not pervasive lumps. The previous form averaged ~0.56 ridge
-  // (1-|fbm| clusters near 0.73 → pow 1.9 ≈ 0.56) over a mask covering ~44% of land
-  // ×1.25 → most land got tens of blocks of DC uplift ("everywhere is bumpy"). Fix:
-  //  • narrower mask (onset -0.20, squared) → ranges in ~25% of land, clustered;
-  //  • pow(...,3) + a -0.12 FLOOR → ground BETWEEN ridgelines sits at 0 (flat),
-  //    only the |n|≈0 ridgelines rise → genuine connected ranges;
-  //  • drop the ×1.25 and the fine octaves (the jagged spines).
-  const mountainous = sm(c.erosion, -0.20, -0.55);
-  // RANGE gate: ONLY the strongest (very-low-erosion) COOL terrain becomes an
-  // extreme, snow-capped mountain RANGE. Everywhere else, low-erosion terrain gets
-  // just the modest BASE amplitude (mountainAmp) → normal mounds / small peaks, so a
-  // random mountain between desert & forest no longer spikes to world height. The
-  // EXTRA height is added only where rangeGate is high (and that same gate tags the
-  // `mountains` biome below, so the tall ranges and the snowy biome coincide).
-  const rangeGate = sm(c.erosion, -0.32, -0.62) * (1 - sm(c.temp, 0.0, 0.20));
-  const rA = fbm(simplex, wx + 1300, wz + 1300, fs * 2.2, 3);    // big primary ridgelines (~570b)
-  const rB = fbm(simplex, wx + 4300, wz + 2300, fs * 1.3, 2);    // coarse secondary ridges
-  let ridge = Math.pow(1 - Math.abs(rA), 3) * 0.85 + Math.pow(1 - Math.abs(rB), 3) * 0.15;
-  ridge = Math.max(0, ridge - 0.12);                            // flat between ridgelines
-  // Range bonus capped at 90 (not higher) so the worst case — spline ceiling
-  // (baseLand+32 ≈ 170) + ridge(0.88)·(60+90) + ripple ≈ 304 — stays safely under
-  // maxY (319), i.e. no FLAT-TOPPED peaks clipped against the world ceiling.
-  const relief = ridge * land * (mountainous * mountainous) * (mountainAmp + 90 * rangeGate);
-  baseH += relief;
+  // OROGENY — mountain RANGES as long connected chains, not scattered mounds.
+  // The previous form gated a ridged-noise term by the SCALAR erosion field
+  // (624b-wavelength blobs), so no "range" could outlive one erosion blob and
+  // the 3-octave |fbm| zero-set fragments into short arcs → isolated cones.
+  // The structural fix: ranges follow the ZERO-CONTOUR of a dedicated very-low-
+  // frequency SPINE field. Level sets of smooth noise are long, connected,
+  // organically curving 1-D chains — exactly orogeny — and a |S|<w band around
+  // the contour gives the range its width. Erosion/temp now only MODULATE the
+  // chain (worn-down vs alpine segments, snowy biome tag), never fragment it.
+  //  • S is 2-OCTAVE on purpose: a 3rd octave (~585b) perturbs the contour by
+  //    more than the band half-width and pinches chains back into mounds.
+  //  • The warp is 1-octave (smooth km-scale bends; amp×freq ≈ 0.13 ≪ 1 so the
+  //    field never folds — see the climate-warp folding history above).
+  let spineCore = 0, massifMask = 0, relief = 0, rangeGate = 0;
+  let massifMem = 0, massifPeakM = 0;   // extreme-massif membership / its peak zones (biome tag)
+  if (land > 0) {
+    const spX = fbm(simplex, wx + 24000, wz + 24000, fs * 18, 1) * (fs * 1.2);
+    const spZ = fbm(simplex, wx + 25000, wz + 25000, fs * 18, 1) * (fs * 1.2);
+    const S = fbm(simplex, wx + 26000 + spX, wz + 26000 + spZ, fs * 9, 2);   // ~2340b chains, ~1.2km apart
+    // Zero-contours form a dense WEB over the whole map — real geography has a
+    // few distinct ranges with plains between. A very-low-freq strength mask
+    // (~7800b) keeps only some contour segments orogenic; because it fades over
+    // km scales, a chain peters out into foothills at its mask edge (natural
+    // range terminus) rather than being chopped.
+    const oro = sm(fbm(simplex, wx + 27000, wz + 27000, fs * 30, 2), -0.05, 0.30);
+    const aS = Math.abs(S);
+    // pow 1.35 + a narrower band SHARPENS the crest profile: more of the height
+    // arrives over fewer blocks, so chains read TALL (steep flanks), not just high.
+    spineCore = Math.pow(1 - sm(aS, 0.04, 0.14), 1.35) * oro;
+    massifMask = (1 - sm(aS, 0.14, 0.40)) * oro;   // wide foothill apron around it
+    // Secondary SHOULDER RIDGE paralleling the main chain at |S|≈0.26 — real
+    // ranges run sub-parallel ridgelines, not one isolated crest. Free: it's a
+    // second band of the SAME field, so it follows every bend of the chain and
+    // is disjoint from the crest band (no height stacking).
+    const subRidge = (1 - sm(Math.abs(aS - 0.26), 0.025, 0.09)) * oro;
+    // Crest texture: ridged |fbm| zero-spots become the summits ALONG the chain
+    // (and its ~570b spacing reads as peaks-and-saddles); a 0.35 floor keeps the
+    // ridgeline continuous between summits instead of gapping to the valley.
+    const rA = fbm(simplex, wx + 1300, wz + 1300, fs * 2.2, 3);
+    const rB = fbm(simplex, wx + 4300, wz + 2300, fs * 1.3, 2);
+    const ridge = Math.pow(1 - Math.abs(rA), 2) * 0.7 + Math.pow(1 - Math.abs(rB), 2) * 0.3;
+    // Erosion MODULATES height along the chain (peaks where erosion is low,
+    // worn saddles where high); the temp factor keeps the EXTREME alpine bonus
+    // out of hot regions (they still get rocky desert ranges at base amplitude,
+    // and the snow/rock overlay below keeps them snowless).
+    const mountainous = sm(c.erosion, -0.10, -0.50);
+    rangeGate = sm(c.erosion, -0.20, -0.55) * (1 - sm(c.temp, 0.0, 0.22));
+    // Foothills: a gentle treed swell SHOULDERING the range (×(1−spineCore): it
+    // hands off to the crest at the spine centre instead of stacking under it —
+    // stacked, the worst case overshot the world ceiling and flat-topped peaks).
+    // Crest: the tall ridgeline itself. Worst case now: spline ceiling 170 +
+    // crest (60+82)·1.0 + ripple ≈ 313 — peaks approach maxY (319) but never clip.
+    const foothill = massifMask * massifMask * (1 - spineCore) * land * mountainous * mountainAmp * 0.6;
+    const crest = spineCore * land * (0.35 + 0.65 * ridge) * (mountainAmp + 82 * rangeGate);
+    // Shoulder ridge rises off the foothill swell (~+20 with crest texture) —
+    // peaks at |S|≈0.26 where foothill ≈14, so 170+14+23 stays far under maxY.
+    const shoulder = subRidge * land * mountainous * (0.3 + 0.4 * ridge) * mountainAmp * 0.55;
+
+    // ---- CATEGORY 2: EXTREME MASSIF — rare, HUMONGOUS mountain lands --------
+    // One wavelength ≈ 11.7km with a high-tail threshold → regions spanning
+    // kilometres that are mountains THROUGHOUT: an elevated base studded with
+    // dense sharp ridged peaks, cut by a deep internal VALLEY NETWORK (the
+    // zero-contour web of a dedicated field). Valley floors keep only ~15% of
+    // the uplift, so 100-140-block rock walls stand a few hundred blocks from
+    // the valley you walk in — this is what makes you look UP. The chains
+    // (category 1) remain the mid-size system; foothills/shoulders the small.
+    const M = fbm(simplex, wx + 28000, wz + 28000, fs * 45, 2);
+    massifMem = sm(M, 0.30, 0.55) * land;
+    let massifRelief = 0;
+    if (massifMem > 0) {
+      const rugA = 1 - Math.abs(fbm(simplex, wx + 29000, wz + 29000, fs * 3.2, 2));
+      const rugB = 1 - Math.abs(fbm(simplex, wx + 30000, wz + 30000, fs * 1.2, 2));
+      const rug = Math.pow(rugA * 0.72 + rugB * 0.28, 2.2);     // dense, sharp summits
+      const V = fbm(simplex, wx + 31000, wz + 31000, fs * 5, 2);
+      const valley = 1 - sm(Math.abs(V), 0.04, 0.18);           // internal valley web
+      // uplifted base 45 + peaks to 140; valleys carve 85% of it back out
+      massifRelief = massifMem * (45 + rug * 95) * (1 - valley * 0.85);
+      massifPeakM = massifMem * (1 - valley) * sm(rug, 0.35, 0.75);
+    }
+
+    // The categories COMBINE by max(): where a chain crosses a massif the taller
+    // form wins (continuous — both fields are smooth), and the worst case stays
+    // max(142, 140) + spline 170 + ripple ≈ 313 < maxY.
+    relief = Math.max(foothill + crest + shoulder, massifRelief);
+    baseH += relief;
+  }
   // Fine ground ripple, gated to land (×land) so plains/coast stay smooth (it used
   // to ripple every column incl. beaches → ragged shorelines).
   baseH += fbm(simplex, wx + 5200, wz + 5200, 48, 2) * 1.5 * land;
@@ -770,8 +843,10 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
 
     // Mesa UPLIFT from the CLEAN field, and 0 at the badlands tag boundary (0.54)
     // so the mesa rises only inside the core (red-desert ring stays flat) and the
-    // surface has no dither-induced roughness.
-    const badCore = sm(mesaField, 0.54, 0.64);
+    // surface has no dither-induced roughness. Suppressed on existing mountain
+    // relief: a mesa stacking onto a range crest both looks wrong and is the one
+    // composition that could push past the world ceiling (170+36+142+65 > 319).
+    const badCore = sm(mesaField, 0.54, 0.64) * (1 - sm(relief, 20, 50));
     if (badCore > 0) {
       const lowEro = 1 - sm(c.erosion, -0.30, 0.20);                  // steep mesa at low erosion
       const mesaN = fbm(simplex, wx + 62000, wz + 62000, fs * 4, 3);  // big rolling plateau
@@ -814,13 +889,22 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   const channelBand = 1 - sm(Math.abs(riverW), 0.012, 0.034);     // narrow water channel
   const valleyBand = 1 - sm(Math.abs(riverW), 0.03, 0.09);        // gentler, ~half-width dale
   const onLand = sm(baseH, sea - 1, sea + 4);
-  const mtn = sm(baseH, sea + 50, sea + 88);                      // ONLY tall mountains suppress
+  // LOWLAND rivers only: the old gate (sea+50..88) let channels slot-canyon
+  // through 50-80-high foothill country — with the global water PLANE at the
+  // bottom of a sheer trench, it read as a gash, not a river. Rivers now fade
+  // out by ~sea+55 and (the key change) the CHANNEL shares the dale's relief
+  // gate below, so it pinches out at ridges/foothills and threads the LOW
+  // corridors between them instead of cutting across — rivers follow valleys
+  // and plains, like water actually would.
+  const mtn = sm(baseH, sea + 26, sea + 55);
   const rgate = onLand * (1 - mtn) * (1 - badlandsMem) * (1 - swampCore);
-  // Gentle DALE first (toward sea+4, only ×0.5, and NOT into mountain flanks via
-  // (1-sm(relief,...))) — a soft valley, not a deep wide gouge that channelized
-  // terrain and bloomed beach inland ...
+  // Gentle DALE first — a soft valley, not a deep wide gouge. Its strength
+  // GROWS with the ground it crosses (0.5 flat → 0.8 at rolling-hill height):
+  // higher crossings get a fuller, wider-shouldered dale, so where a river
+  // does pass raised ground the banks slope down to the water instead of
+  // dropping a sheer wall ("cut shallow, as if the water were dynamic").
   const valleyMem = valleyBand * rgate * (1 - sm(relief, 4, 16));
-  if (valleyMem > 0) height += valleyMem * ((sea + 4) - baseH) * 0.5;
+  if (valleyMem > 0) height += valleyMem * ((sea + 4) - baseH) * (0.5 + 0.3 * sm(baseH, sea + 10, sea + 30));
   // ... then the narrow channel carves the floor to sea-2 (continuous water). The
   // channel uses its OWN coast gate (NOT onLand): onLand faded to 0 at baseH=sea-1,
   // so the carve stopped ~1 block above sea and left the beach band (aboveSea 0..3)
@@ -828,7 +912,13 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   // stays full strength inland and only fades once already in genuine ocean
   // (baseH ≤ ~sea-4) — so the channel punches THROUGH the beach to meet the sea
   // (no open-ocean trenches, since it's 0 in deep water).
-  const channelGate = (1 - mtn) * (1 - badlandsMem) * (1 - swampCore) * sm(baseH, sea - 4, sea + 2);
+  // (1 - massifMem): the massif's internal valley floors sit BELOW the river
+  // mtn gate — without this a channel would gouge a sea-level canyon through a
+  // high mountain valley (the single water plane can't do perched rivers).
+  // (1 - sm(relief, 6, 18)): the channel never cuts ridged/foothill ground —
+  // it tapers to a brook and vanishes as terrain roughens (see gate comment).
+  const channelGate = (1 - mtn) * (1 - badlandsMem) * (1 - swampCore) * (1 - massifMem)
+    * (1 - sm(relief, 6, 18)) * sm(baseH, sea - 4, sea + 2);
   const riverMem = channelBand * channelGate;
   if (riverMem > 0) height += riverMem * ((sea - 2) - height);    // from the post-valley floor
 
@@ -871,12 +961,15 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   const iceSpikesMem = sm(tempEff, -0.30, -0.52)
     * sm(fbm(simplex, wx + 44000, wz + 44000, fs * 4, 2), 0.40, 0.58);
 
-  // MOUNTAIN-RANGE biome: tagged by the SAME rangeGate that gives the extreme height
-  // (so the tall ranges and the snowy biome coincide), once the column is actually
-  // high. Smooth borders (all-continuous gates). Hot regions keep their desert/savanna
-  // identity (rangeGate≈0 there → bare-rock tops, no snow) so the range only appears
-  // where snow makes sense.
-  const mountainsMem = rangeGate * sm(aboveSea, 40, 72);
+  // MOUNTAIN-RANGE biome: tagged by the SAME spine band / massif peak zones
+  // that give the height (so the ranges and the biome coincide — the biome
+  // paints ALONG the chains and over massif summits, with foothills keeping
+  // their climate identity), once the column is actually high. COOL-gated
+  // only: erosion modulates the HEIGHT profile along the chain but must not
+  // gate the tag, or the 624b erosion blobs chop the biome into flickering
+  // segments along a continuous ridgeline. Hot regions keep their desert/
+  // savanna identity (bare-rock tops via the climate snowline below).
+  const mountainsMem = Math.max(spineCore, massifPeakM) * (1 - sm(c.temp, 0.0, 0.22)) * sm(aboveSea, 36, 64);
 
   // --- biome selection: specials (by gate, priority order) → water bands → grid ---
   // The badlands shells (core → red-desert → desert) are checked before the grid
@@ -928,17 +1021,33 @@ function columnSurface(simplex: SimplexNoise, cfg: SurfaceConfig, wx: number, wz
   const coloured = biome === BIOME.badlands || biome === BIOME.redDesert
     || biome === BIOME.mushroom || biome === BIOME.swamp || biome === BIOME.mangroveSwamp;
   if (!coloured && biome !== BIOME.ocean && biome !== BIOME.beach) {
-    // CLIMATE-AWARE: HOT climates (deserts/savanna/warm) NEVER snow — even on tall
-    // peaks they get bare exposed rock instead ("no snow in deserts"). Cold/temperate
-    // peaks snow (alpine height OR a lapse-cooled freezing summit). The snowy
-    // mountain-range biome ALWAYS snow-caps above the line (it's defined as snowy).
-    const arid = c.temp > 0.20 || c.humid < -0.15;   // hot OR dry → bare rock, no snow
     // Wobble the rock/snow contour with a broad low-freq field so the lines snake
     // up and down the slopes instead of ringing every peak at a dead-flat altitude
     // (the old topographic-map look). Pure fn of (wx,wz) → apron-safe.
     const lineWob = fbm(simplex, wx + 33000, wz + 33000, fs * 0.6, 2) * 11;
-    if (aboveSea > 48 + lineWob) { surfaceId = BLOCK_IDS.stone; subId = BLOCK_IDS.stone; }   // exposed rock (any climate)
-    if ((biome === BIOME.mountains || !arid) && (aboveSea > 66 + lineWob || tempEff < -0.46)) surfaceId = BLOCK_IDS.snow;
+    // ROCK LINE — about exposure/erosion, only mildly climate (scree and bare
+    // batholiths form at altitude in any climate; hot regions a touch higher).
+    if (aboveSea > 50 + c.temp * 35 + lineWob) {
+      // IGNEOUS VARIETY: big coherent granite and andesite intrusions through
+      // the base stone (low-freq field → bands tens-to-hundreds of blocks wide,
+      // like real exposed batholiths), so the alpine band isn't one uniform
+      // grey. The LOD sampler reads surfaceId → far ranges match for free.
+      const rv = fbm(simplex, wx + 35000, wz + 35000, fs * 1.5, 2);
+      surfaceId = rv > 0.42 ? BLOCK_IDS.granite : rv < -0.45 ? BLOCK_IDS.andesite : BLOCK_IDS.stone;
+      subId = surfaceId;
+    }
+    // SNOWLINE — pure CLIMATE, like the real one: cold lowers it, heat raises
+    // it out of reach, and DRYNESS raises it too (the dry Andes/Atacama carry
+    // bare 6km summits while wet Patagonia snows at 1km). Replaces the old
+    // `tempEff < -0.46` lapse branch, which undercut the nominal 66 line so
+    // badly (taiga: snow from aboveSea ≈36!) that every modest cool hill wore
+    // a cap — that was the "snow everywhere regardless of climate" bug.
+    //   snowy/-0.5 → ~24 (it IS the snow biome) · taiga/-0.25 → ~71 (boreal
+    //   caps on real peaks) · temperate/0 → ~128 (only major summits) ·
+    //   temperate-DRY → ~160+ (bare rock ranges) · warm/hot → unreachable.
+    const snowAlt = Math.max(24, 128 + c.temp * 230 + Math.max(0, -c.humid) * 110);
+    const snowDither = (hash01(wx + 51, wz + 87) - 0.5) * 5;
+    if (aboveSea > snowAlt + lineWob + snowDither) surfaceId = BLOCK_IDS.snow;
   }
 
   // Taiga floor: smooth podzol patches (low-freq noise — coherent blobs, not the
@@ -1152,7 +1261,7 @@ export function createCaveSampler(params: ChunkParams) {
 }
 
 function generateTerrain(simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number,
-  set: SetFn, outHeight: Int16Array, outBiome: Uint8Array, outTint?: Uint8Array, outSurface?: Uint8Array) {
+  set: SetFn, outHeight: Int16Array, outBiome: Uint8Array, outTint?: Uint8Array, outSurface?: Uint8Array, surfaceOnly?: boolean) {
   const cfg = makeSurfaceConfig(params, size);
   const W = size.width;
   for (let x = 0; x < W; x++) {
@@ -1174,7 +1283,11 @@ function generateTerrain(simplex: SimplexNoise, params: ChunkParams, size: Chunk
       }
       const band = BIOMES[cs.biome].band;
       const wx = worldX + x, wz = worldZ + z;
-      for (let y = 0; y <= cs.height; y++) {
+      // surfaceOnly (map): fill only the top skin — enough for the top-down
+      // scan + structure foundations to read solid, skipping the deep cave/
+      // deepslate NOISE fill that dominates cost and is invisible from above.
+      const y0 = surfaceOnly ? Math.max(0, cs.height - 4) : 0;
+      for (let y = y0; y <= cs.height; y++) {
         if (band) {
           // Keep the biome's banded subsurface (badlands terracotta), but route its
           // DEEP plain-stone fill through deepCell so mesas get deepslate, bedrock
@@ -1533,6 +1646,12 @@ function generateFeatures(treeRng: RNG, simplex: SimplexNoise, params: ChunkPara
       const biome = cs.biome;
       const f = BIOMES[biome].features;
       if (!f) continue;
+      // ALPINE TREELINE BLEND: thin the forest out probabilistically as the
+      // ground climbs toward the rock line (~50+) instead of a hard wall of
+      // trees against bare stone — sparse struggling conifers from ~38, none
+      // by ~60. Pure hash of world coords (consumes NO rng → cell placement
+      // identical across chunks); lodMesh mirrors the same band statistically.
+      if (hash01(wx + 137, wz + 593) < sm(cs.height - cfg.sea, 38, 60)) continue;
       // RIVERS AS SEPARATORS: skip trees/decorations hugging a lowland river channel
       // so forests don't bleed across the water (deterministic — same river field the
       // carve uses). Only near sea level (where rivers actually run), so mountain
@@ -1826,10 +1945,11 @@ function generateFoliage(simplex: SimplexNoise, params: ChunkParams, size: Chunk
 // ===========================================================================
 export const STRUCT_CELL = 144;    // one potential structure per region (~half as dense as before)
 const STRUCT_INSET = 48;    // origin jitter stays ≥48 from the cell edge (no cross-cell overlap)
-const STRUCT_MAX_R = 56;    // largest footprint half-extent (mansion / village spread) — chunk overlap scan range
+export const STRUCT_MAX_R = 56;    // largest footprint half-extent (mansion / village spread) — chunk overlap scan range (also the LOD proxy scan pad)
 export const ST_WELL = 1, ST_TOWER = 2, ST_PYRAMID = 3, ST_HOUSE = 4, ST_VILLAGE = 5, ST_MANSION = 6, ST_IGLOO = 7;
 // Extras: bring more variety. Each fits a niche biome via structureFitsBiome.
 export const ST_CAMPSITE = 8, ST_RUINS = 9, ST_OUTPOST = 10, ST_LIGHTHOUSE = 11, ST_WITCH_HUT = 12;
+export const ST_MONASTERY = 13;   // stone hall + bell tower on high ground (pairs with the orogenic ranges)
 const WELL_SHAFT = 8;       // a well's centre column is carved this many blocks below ground
 
 // Does a structure of `kind` build in `biome`? Shared by the generator AND the map
@@ -1847,7 +1967,8 @@ const structAnyLand = (b: number) => b !== BIOME.ocean && b !== BIOME.frozenOcea
 export function structureFitsBiome(kind: number, biome: number): boolean {
   switch (kind) {
     case ST_PYRAMID: return biome === BIOME.desert || biome === BIOME.redDesert;
-    case ST_VILLAGE: case ST_HOUSE: return structGrassy(biome);
+    case ST_VILLAGE: return structGrassy(biome) || biome === BIOME.desert;   // desert villages build in sandstone (palette below)
+    case ST_HOUSE: return structGrassy(biome);
     case ST_MANSION: return biome === BIOME.darkForest;   // woodland mansion is dark-forest-exclusive (MC)
     case ST_IGLOO: return structCold(biome);
     case ST_CAMPSITE: return structGrassy(biome) || structCold(biome);
@@ -1855,7 +1976,34 @@ export function structureFitsBiome(kind: number, biome: number): boolean {
     case ST_OUTPOST: return structDryLand(biome);
     case ST_LIGHTHOUSE: return biome === BIOME.beach;
     case ST_WITCH_HUT: return biome === BIOME.swamp || biome === BIOME.mangroveSwamp;
+    // High-country biomes only; the builder additionally requires elevation
+    // (base ≥ sea+26) so monasteries actually sit on the range flanks.
+    case ST_MONASTERY: return biome === BIOME.mountains || biome === BIOME.taiga || biome === BIOME.meadow
+      || biome === BIOME.snowy || biome === BIOME.coldPlains || biome === BIOME.forest || biome === BIOME.redwoodForest;
     default: return true;   // well / tower on any land (platform null-check excludes water)
+  }
+}
+
+// Map footprint half-extent (blocks) + dominant top-down colour per structure
+// kind, so the FAST sampler map can paint structures accurately WITHOUT
+// generating their voxels (the sampler path only knows terrain). Mirrors the
+// LOD proxy footprints; colour ≈ each build's dominant roof/wall material.
+// `r=0` → too small to mark on the map (well). Returns null for those.
+export function structureMapMark(kind: number): { r: number, col: readonly [number, number, number] } | null {
+  switch (kind) {
+    case ST_VILLAGE: return { r: 30, col: [140, 104, 60] };    // house-cluster spread (brown roofs)
+    case ST_MANSION: return { r: 15, col: [74, 58, 40] };      // dark-oak mass
+    case ST_PYRAMID: return { r: 14, col: [220, 206, 158] };   // sandstone
+    case ST_MONASTERY: return { r: 7, col: [146, 146, 150] };  // stone-brick hall + tower
+    case ST_TOWER: return { r: 4, col: [122, 122, 126] };      // stone brick
+    case ST_LIGHTHOUSE: return { r: 3, col: [210, 92, 80] };   // red/white stripes
+    case ST_OUTPOST: return { r: 3, col: [120, 100, 70] };
+    case ST_IGLOO: return { r: 5, col: [224, 234, 244] };
+    case ST_RUINS: return { r: 6, col: [120, 116, 108] };
+    case ST_CAMPSITE: return { r: 4, col: [188, 78, 64] };     // wool tent
+    case ST_WITCH_HUT: return { r: 4, col: [78, 64, 70] };
+    case ST_HOUSE: return { r: 5, col: [150, 110, 60] };
+    default: return null;   // ST_WELL — a 1-block rim, invisible on the map
   }
 }
 
@@ -1880,7 +2028,8 @@ export function structInfo(cellX: number, cellZ: number, seed: number): StructIn
     k < 0.76 ? ST_RUINS :
     k < 0.84 ? ST_OUTPOST :
     k < 0.92 ? ST_LIGHTHOUSE :
-    ST_WITCH_HUT;
+    k < 0.96 ? ST_WITCH_HUT :
+    ST_MONASTERY;
   const sseed = (Math.imul(cellX, 374761393) ^ Math.imul(cellZ, 668265263) ^ Math.imul(seed | 0, 2246822519)) | 0;
   return { kind, ox, oz, seed: sseed };
 }
@@ -1912,7 +2061,7 @@ export function wellShaftRange(params: ChunkParams, sample: WorldSampler, wx: nu
   return base === null ? null : [base - WELL_SHAFT + 1, base];
 }
 
-function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number, set: SetFn) {
+function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number, set: SetFn, get: GetFn) {
   const cfg = makeSurfaceConfig(params, size);
   const W = size.width, H = size.height, sea = cfg.sea, B = BLOCK_IDS;
   const colMemo = new Map<string, ColumnSurface>();
@@ -1924,10 +2073,28 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
   };
   // Write a block at WORLD coords; set() bounds-checks, so out-of-chunk writes no-op.
   const place = (wx: number, wy: number, wz: number, id: number) => { if (wy >= 0 && wy < H) set(wx - worldX, wy, wz - worldZ, id); };
+  // Read at WORLD coords; out-of-chunk reads return air (get bounds-checks).
+  const getW = (wx: number, wy: number, wz: number) => get(wx - worldX, wy, wz - worldZ);
+  // Paths overwrite ONLY the surface cell, but generateFoliage already ran and
+  // may have left a plant (or a snowLayer stack, ≤3 tall) at height+1.. — grass
+  // and flowers poking through a gravel road. Clear the decoration column above
+  // a path tile. Pure: foliage is a pure fn of (wx,wz) and the path a pure fn
+  // of cell+seed, so every overlapping chunk computes the identical clears
+  // (byte-identical borders); above-surface air only → apron-safe. Anything
+  // SOLID (a tree trunk) stops the scan — a trail ducking under a tree keeps
+  // the tree planted instead of leaving a floating canopy.
+  const clearPlantsAbove = (wx: number, h: number, wz: number) => {
+    for (let dy = 1; dy <= 3; dy++) {
+      if (!isPlant(getW(wx, h + dy, wz))) break;
+      place(wx, h + dy, wz, B.air);
+    }
+  };
 
   // Flat platform: base = max ground height over the footprint. null if in water
   // or too steep (so buildings sit on flat-ish, dry land — MC-style site check).
-  const platform = (ox: number, oz: number, r: number): number | null => {
+  // maxSpread MUST stay 7 for anything wellBaseAt mirrors (well/village plaza) —
+  // only crag-tolerant builds (monastery) pass a bigger value.
+  const platform = (ox: number, oz: number, r: number, maxSpread = 7): number | null => {
     // sample EVERY column (not a coarse grid) so `base` is the TRUE max — a missed
     // 1-block spike would otherwise let the air-clear below dig under it (a hole).
     let base = 0, lo = 1e9;
@@ -1936,7 +2103,7 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
       if (hh > base) base = hh;
       if (hh < lo) lo = hh;
     }
-    return (base <= sea || base - lo > 7) ? null : base;
+    return (base <= sea || base - lo > maxSpread) ? null : base;
   };
   // Foundation fill up to `base` (above each column's surface) + clear building air.
   // Clearing starts ABOVE max(base, column surface) so it NEVER digs below a
@@ -1976,6 +2143,47 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
       const x = sx + dxs * i, z = sz + dzs * i, y = y0 + i;
       place(x, y, z, stairId);
       for (let hy = y + 1; hy <= ceilY + 1; hy++) place(x, hy, z, B.air);   // headroom + open the floor above
+    }
+  };
+
+  // ---- DOORWAY GUARANTEE (all door'd builders carve the door into the -z wall
+  // at base+2/+3 with the approach running outward toward -z) ---------------
+  // Two failure modes on sloped sites blocked entrances: (a) approach terrain
+  // ABOVE base → the door opened into an uncleared bank (lay() never digs below
+  // a column's own surface — apron rule); (b) approach BELOW base → the single
+  // fixed doorstep left an unclimbable >1-block drop.
+  // platformDoor closes (a) by folding the door's 3-cell approach lane into the
+  // site scan: `base` then bounds every lane column, so clearing above base is
+  // always above-surface (apron-safe), and a bank in front either lifts the
+  // build or rejects the site. clearApproach then opens the walk-out headroom
+  // and grades a stair run down to the terrain — one block per cell, stairs not
+  // slabs (the tower-spiral climbability lesson: 0.6 auto-step needs the half-
+  // height stair front). Neither consumes rng → village layouts unshuffled.
+  const platformDoor = (ox: number, oz: number, r: number, doorXs: readonly number[], z0: number, maxSpread = 7): number | null => {
+    const fp = platform(ox, oz, r, maxSpread);
+    if (fp === null) return null;
+    let base = fp, lo = fp;
+    for (const wx of doorXs) for (let i = 1; i <= 3; i++) {
+      const hh = colAt(wx, z0 - i).height;
+      if (hh > base) base = hh;
+      if (hh < lo) lo = hh;
+    }
+    // A bank >3 above the footprint would put the build on stilts; a lane
+    // spanning >maxSpread is the same steepness rule platform() applies.
+    return (base - fp > 3 || base - lo > maxSpread) ? null : base;
+  };
+  const clearApproach = (doorXs: readonly number[], z0: number, base: number, stairs: StairSet, foundId: number) => {
+    for (const wx of doorXs) {
+      for (let i = 1; i <= 4; i++) {
+        const wz = z0 - i, sh = colAt(wx, wz).height;
+        // walk-out headroom over the descending run (always above-surface: the
+        // lane is bounded by base via platformDoor for i≤3; the max() guards i=4)
+        for (let wy = Math.max(base + 1 - i, sh) + 1; wy <= base + 3; wy++) place(wx, wy, wz, B.air);
+        const stepY = base + 2 - i;            // i=1 → the classic base+1 doorstep
+        if (sh >= stepY) break;                // ground meets the run — flush walk-off
+        place(wx, stepY, wz, stairs[2]);       // PZ stair: tall back toward the door
+        for (let wy = sh + 1; wy < stepY; wy++) place(wx, wy, wz, foundId);   // solid under the step
+      }
     }
   };
 
@@ -2079,6 +2287,7 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
       if (!onSurfaceAllowed(c.surfaceId)) return;
       const block = hash01(wx * 13 + 7, wz * 17 + 11) < 0.18 ? accentBlock : mainBlock;
       place(wx, c.height, wz, block);
+      clearPlantsAbove(wx, c.height, wz);   // no grass/flowers poking through the road
     };
     const dxv = bx - ax, dzv = bz - az;
     const dist = Math.max(1, Math.hypot(dxv, dzv));
@@ -2116,6 +2325,7 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
         if (c.height <= sea || !onSurfaceAllowed(c.surfaceId)) continue;
         const r2 = hash01(wx + 99, wz + 31);
         place(wx, c.height, wz, r2 < 0.6 ? B.gravel : r2 < 0.88 ? B.dirt : B.cobblestone);
+        clearPlantsAbove(wx, c.height, wz);
       }
     }
   };
@@ -2126,12 +2336,13 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
   // chimney through the ridge. Front entrance has a stair "step up" to the
   // door, log header above, and trapdoor shutters next to the front window —
   // the bread-and-butter village house.
-  const cabin = (ox: number, oz: number, logId: number, plankId: number) => {
+  const cabin = (ox: number, oz: number, logId: number, plankId: number, roofSt: StairSet = OAK_ST, roofSlab: number = B.oakSlab) => {
     const rx = 4, rz = 3;
-    const base = platform(ox, oz, Math.max(rx, rz));
+    const base = platformDoor(ox, oz, Math.max(rx, rz), [ox], oz - rz);
     if (base === null) return;
     lay(ox, oz, Math.max(rx, rz) + 1, base, B.cobblestone, 9);
     const x0 = ox - rx, x1 = ox + rx, z0 = oz - rz, z1 = oz + rz;
+    clearApproach([ox], z0, base, roofSt, B.cobblestone);
     // STONE FOUNDATION (base+1): weathered cobble strip — grounds the build.
     for (let wx = x0; wx <= x1; wx++) for (let wz = z0; wz <= z1; wz++) {
       if (wx === x0 || wx === x1 || wz === z0 || wz === z1)
@@ -2148,13 +2359,13 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     // TOP PLATE: log
     walls(x0, z0, x1, z1, base + 5, base + 5, logId);
     // GABLE ROOF (with 1-block eave overhang) — ridge runs along x (longer side)
-    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 6, OAK_ST, B.oakSlab);
+    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 6, roofSt, roofSlab);
     // CHIMNEY through the ridge on the +x gable
     chimney(x1 - 1, z1 - 1, base + 1, base + 9);
     // FRONT DOOR + step up + log lintel
     place(ox, base + 2, z0, B.oakDoorLowerClosed); place(ox, base + 3, z0, B.oakDoorUpperClosed);
     place(ox, base + 4, z0, logId);
-    place(ox, base + 1, z0 - 1, OAK_ST[2]);   // PZ stair: step up to door from -z
+    // (doorstep + graded walk-out handled by clearApproach above)
     // FRONT WINDOW (next to door) + trapdoor shutter accents
     place(ox + 2, base + 3, z0, B.glass);
     place(ox + 2, base + 4, z0, OAK_ST[3]);   // overhang lintel (NZ stair)
@@ -2186,11 +2397,12 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
   // stair with stone-brick stairwell wall, two upstairs bedrooms, side
   // balcony with fence rail. Corner trim follows community medieval-style
   // rules: vertical logs every 4 blocks of wall.
-  const bigHouse = (ox: number, oz: number, logId: number, plankId: number) => {
-    const r = 4, base = platform(ox, oz, r);
+  const bigHouse = (ox: number, oz: number, logId: number, plankId: number, roofSt: StairSet = OAK_ST, roofSlab: number = B.oakSlab) => {
+    const r = 4, base = platformDoor(ox, oz, r, [ox], oz - r);
     if (base === null) return;
     lay(ox, oz, r + 1, base, B.cobblestone, 14);
     const x0 = ox - r, x1 = ox + r, z0 = oz - r, z1 = oz + r;
+    clearApproach([ox], z0, base, roofSt, B.cobblestone);
     // STONE FOUNDATION (base+1): weathered cobble strip
     for (let wx = x0; wx <= x1; wx++) for (let wz = z0; wz <= z1; wz++) {
       if (wx === x0 || wx === x1 || wz === z0 || wz === z1)
@@ -2216,13 +2428,12 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     fillRect(x0 + 1, z0 + 1, x1 - 1, z1 - 1, base + 5, plankId);
     fillRect(x0 + 1, z0 + 1, x1 - 1, z1 - 1, base + 9, plankId);
     // GABLE ROOF with overhang
-    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 10, OAK_ST, B.oakSlab);
+    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 10, roofSt, roofSlab);
     // CHIMNEY through the +x gable
     chimney(x1 - 1, z1 - 1, base + 1, base + 13);
     // FRONT DOOR + porch awning supported by fence posts
     place(ox, base + 2, z0, B.oakDoorLowerClosed); place(ox, base + 3, z0, B.oakDoorUpperClosed);
     place(ox, base + 4, z0, logId);
-    place(ox, base + 1, z0 - 1, OAK_ST[2]);   // step up
     place(ox - 2, base + 2, z0 - 1, B.oakFence);
     place(ox + 2, base + 2, z0 - 1, B.oakFence);
     for (let dx = -2; dx <= 2; dx++) place(ox + dx, base + 3, z0 - 1, B.oakSlab);
@@ -2288,10 +2499,11 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
   // corner trim, dark-oak gable roof, bookshelf-lined inner walls, lectern,
   // window arches with stair lintels.
   const library = (ox: number, oz: number) => {
-    const r = 4, base = platform(ox, oz, r);
+    const r = 4, base = platformDoor(ox, oz, r, [ox], oz - r);
     if (base === null) return;
     lay(ox, oz, r + 1, base, B.cobblestone, 11);
     const x0 = ox - r, x1 = ox + r, z0 = oz - r, z1 = oz + r;
+    clearApproach([ox], z0, base, STN_ST, B.cobblestone);
     fillRect(x0, z0, x1, z1, base + 1, B.smoothStone);                       // polished floor
     // WEATHERED STONE-BRICK WALLS (level 2-6)
     for (let wy = base + 2; wy <= base + 6; wy++) for (let wx = x0; wx <= x1; wx++) for (let wz = z0; wz <= z1; wz++) {
@@ -2312,8 +2524,6 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     place(ox, base + 2, z0, B.oakDoorLowerClosed); place(ox, base + 3, z0, B.oakDoorUpperClosed);
     place(ox, base + 4, z0, B.chiseledStoneBricks);
     place(ox - 1, base + 4, z0, OAK_ST[1]); place(ox + 1, base + 4, z0, OAK_ST[0]);
-    // ENTRY STEP
-    place(ox, base + 1, z0 - 1, STN_ST[2]);
     // WINDOWS (with stair-arch lintels)
     for (const [px, pz, ax] of [[x0, oz, 0] as const, [x1, oz, 0] as const, [ox, z1, 1] as const]) {
       place(px, base + 5, pz, B.glass);
@@ -2332,10 +2542,11 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
   // magma "fire" + cobble chimney + iron-block anvil, work-bench. Distinct
   // silhouette so the village reads as having an industrial corner.
   const blacksmith = (ox: number, oz: number) => {
-    const rx = 4, rz = 3, base = platform(ox, oz, Math.max(rx, rz));
+    const rx = 4, rz = 3, base = platformDoor(ox, oz, Math.max(rx, rz), [ox], oz - rz);
     if (base === null) return;
     lay(ox, oz, Math.max(rx, rz) + 1, base, B.cobblestone, 9);
     const x0 = ox - rx, x1 = ox + rx, z0 = oz - rz, z1 = oz + rz;
+    clearApproach([ox], z0, base, STN_ST, B.cobblestone);
     fillRect(x0, z0, x1, z1, base + 1, B.smoothStone);
     // WEATHERED STONE-BRICK SHELL
     for (let wy = base + 2; wy <= base + 5; wy++) for (let wx = x0; wx <= x1; wx++) for (let wz = z0; wz <= z1; wz++)
@@ -2350,7 +2561,6 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     // ENTRANCE (open arch — no door, blacksmiths stay open)
     place(ox, base + 2, z0, B.air); place(ox, base + 3, z0, B.air); place(ox, base + 4, z0, B.air);
     place(ox - 1, base + 4, z0, OAK_ST[1]); place(ox + 1, base + 4, z0, OAK_ST[0]);
-    place(ox, base + 1, z0 - 1, STN_ST[2]);
     // WINDOWS
     place(x0, base + 4, oz, B.glass); place(x1, base + 4, oz, B.glass);
     // FORGE: cobble fire-pit with campfire "fire" + chimney rising through the
@@ -2374,10 +2584,11 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
   // covered porch with fence rail, hay-bale roof (thatched look), warm
   // glowstone interior. Distinct silhouette so a village reads as varied.
   const tavern = (ox: number, oz: number) => {
-    const rx = 5, rz = 4, base = platform(ox, oz, Math.max(rx, rz));
+    const rx = 5, rz = 4, base = platformDoor(ox, oz, Math.max(rx, rz), [ox - 1, ox], oz - rz);
     if (base === null) return;
     lay(ox, oz, Math.max(rx, rz) + 1, base, B.cobblestone, 12);
     const x0 = ox - rx, x1 = ox + rx, z0 = oz - rz, z1 = oz + rz;
+    clearApproach([ox - 1, ox], z0, base, OAK_ST, B.cobblestone);
     // STONE-BRICK GROUND FLOOR
     for (let wy = base + 1; wy <= base + 3; wy++) for (let wx = x0; wx <= x1; wx++) for (let wz = z0; wz <= z1; wz++)
       if (wx === x0 || wx === x1 || wz === z0 || wz === z1) place(wx, wy, wz, weatheredStoneBricks(wx, wy, wz));
@@ -2408,8 +2619,6 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     // PORCH AWNING (fence-supported, slab roof)
     for (const dx of [-2, 2]) place(ox + dx, base + 2, z0 - 1, B.oakFence);
     for (const dx of [-3, -2, -1, 0, 1, 2, 3]) place(ox + dx, base + 3, z0 - 1, B.oakSlab);
-    // STEP UP
-    for (const dx of [-1, 0]) place(ox + dx, base + 1, z0 - 1, OAK_ST[2]);
     // WINDOWS upstairs
     for (const dx of [-3, -1, 1, 3]) place(ox + dx, base + 5, z0, B.glass);
     for (const dx of [-3, -1, 1, 3]) place(ox + dx, base + 5, z1, B.glass);
@@ -3103,10 +3312,15 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     place(tx, ROOF + 7, tz, B.lantern);
     place(tx, ROOF + 8, tz, B.chiseledStoneBricks);
     // ===== APPROACH PATH to the entrance — short stone path =====
-    for (let wz = mz0 - 4; wz <= mz0 - 8; wz++) {
+    // (the old loop ran wz UP from mz0-4 to mz0-8 — start > end, so the path
+    // never existed; walk OUTWARD instead)
+    for (let wz = mz0 - 4; wz >= mz0 - 8; wz--) {
       for (let dx = -1; dx <= 1; dx++) {
         const c = colAt(ox + dx, wz);
-        if (c.height > sea) place(ox + dx, c.height, wz, weatheredCobble(ox + dx, c.height, wz));
+        if (c.height > sea) {
+          place(ox + dx, c.height, wz, weatheredCobble(ox + dx, c.height, wz));
+          clearPlantsAbove(ox + dx, c.height, wz);
+        }
       }
     }
   };
@@ -3154,13 +3368,13 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     // ---- TENT: 7-wide (x: ox-3..ox+3) × 5-deep (z: oz+3..oz+7) ridge A-frame ----
     const tz0 = oz + 3, tz1 = oz + 7, RIDGE = base + 4;
     fillRect(ox - 3, tz0, ox + 3, tz1, base, B.oakPlanks);       // plank groundsheet
-    for (let dz = tz0; dz <= tz1; dz++) {
+    for (let wz = tz0; wz <= tz1; wz++) {                       // wz is ABSOLUTE world-z (tz0..tz1 already include oz)
       for (let dx = -3; dx <= 3; dx++) {
         const ry = RIDGE - Math.abs(dx);                        // A-frame: peak at the ridge, eaves low
         const roof = (Math.abs(dx) === 3) ? B.woolWhite : B.woolRed;   // white eaves, red canvas
-        place(ox + dx, ry, oz + dz, roof);
-        if (dz === tz1) for (let wy = F; wy < ry; wy++)          // closed BACK gable wall
-          place(ox + dx, wy, oz + dz, Math.abs(dx) === 3 ? B.woolWhite : B.woolRed);
+        place(ox + dx, ry, wz, roof);
+        if (wz === tz1) for (let wy = F; wy < ry; wy++)          // closed BACK gable wall
+          place(ox + dx, wy, wz, Math.abs(dx) === 3 ? B.woolWhite : B.woolRed);
       }
     }
     // guy-rope fence pegs at the open front corners
@@ -3486,6 +3700,87 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     // Interior overhead light — hanging lantern (overworld appropriate)
     place(ox, fy + 5, oz, B.lantern);
   };
+  // Mountain monastery (13×9 hall + 3×3 bell tower): weathered stone-brick hall
+  // with a stone gable roof, a bell tower rising through the +x/+z corner with
+  // open arches and a lantern "bell", a scholars' interior (bookshelf rows,
+  // lectern, two beds) and a smooth-stone patio at the door. HIGH GROUND only
+  // (base ≥ sea+26) so it reads as a retreat up on the new range flanks — the
+  // biome gate (structureFitsBiome) keeps it to the cool high-country biomes.
+  // All at/above base + zero sub-surface carving → apron-safe; rng draws sit at
+  // the END (trail only), after all placement, mirroring the other builders.
+  const monastery = (ox: number, oz: number, rng: RNG) => {
+    if (colAt(ox, oz).height < sea + 18) return;        // valley cell — no retreat here
+    const rx = 6, rz = 4;
+    // Crag-tolerant: spread ≤10 (vs the default 7) — high ground is sloped, and
+    // a monastery on a tall cobble footing reads RIGHT; the default rule made
+    // viable sites near-mythical (13 in a 23km square at the old sea+26 gate).
+    const base = platformDoor(ox, oz, rx, [ox], oz - rz, 10);
+    if (base === null) return;
+    lay(ox, oz, rx + 1, base, B.cobblestone, 13);
+    const x0 = ox - rx, x1 = ox + rx, z0 = oz - rz, z1 = oz + rz;
+    clearApproach([ox], z0, base, STN_ST, B.cobblestone);
+    // FLOOR + weathered cobble footing course
+    fillRect(x0, z0, x1, z1, base + 1, B.smoothStone);
+    for (let wx = x0; wx <= x1; wx++) for (let wz = z0; wz <= z1; wz++)
+      if (wx === x0 || wx === x1 || wz === z0 || wz === z1)
+        place(wx, base + 1, wz, weatheredCobble(wx, base + 1, wz));
+    // WEATHERED STONE-BRICK WALLS (storey-and-a-half hall)
+    for (let wy = base + 2; wy <= base + 6; wy++) for (let wx = x0; wx <= x1; wx++) for (let wz = z0; wz <= z1; wz++)
+      if (wx === x0 || wx === x1 || wz === z0 || wz === z1) place(wx, wy, wz, weatheredStoneBricks(wx, wy, wz));
+    // DARK-OAK CORNER POSTS + TOP PLATE (timber banding like the library)
+    for (let wy = base + 1; wy <= base + 7; wy++) {
+      place(x0, wy, z0, B.darkOakLog); place(x1, wy, z0, B.darkOakLog);
+      place(x0, wy, z1, B.darkOakLog); place(x1, wy, z1, B.darkOakLog);
+    }
+    walls(x0, z0, x1, z1, base + 7, base + 7, B.darkOakLog);
+    // STONE GABLE ROOF (stair slopes, slab ridge) — reads as slate at distance
+    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 8, STN_ST, B.stoneSlab);
+    // DOOR (-z wall) + chiseled lintel + entry alcove
+    place(ox, base + 2, z0 + 1, B.air); place(ox, base + 3, z0 + 1, B.air);
+    place(ox, base + 2, z0, B.oakDoorLowerClosed); place(ox, base + 3, z0, B.oakDoorUpperClosed);
+    place(ox, base + 4, z0, B.chiseledStoneBricks);
+    // PATIO: smooth-stone landing in front of the door + lantern posts
+    for (let dx = -2; dx <= 2; dx++) {
+      const c = colAt(ox + dx, z0 - 1);
+      if (c.height >= base - 1) place(ox + dx, base + 1, z0 - 1, B.smoothStone);
+    }
+    lampPost(ox - 2, z0 - 2, base + 1, B.darkOakLog);
+    lampPost(ox + 2, z0 - 2, base + 1, B.darkOakLog);
+    // ARCHED WINDOWS (glass + stair lintels, library-style)
+    for (const [px, pz, ax] of [[x0, oz, 0] as const, [x1, oz, 0] as const, [ox - 3, z1, 1] as const, [ox + 3, z1, 1] as const]) {
+      place(px, base + 4, pz, B.glass);
+      if (ax === 0) { place(px, base + 5, pz - 1, STN_ST[2]); place(px, base + 5, pz + 1, STN_ST[3]); }
+      else { place(px - 1, base + 5, pz, STN_ST[0]); place(px + 1, base + 5, pz, STN_ST[1]); }
+    }
+    // BELL TOWER: 3×3 shaft through the +x/+z corner of the hall, rising well
+    // above the roofline; open arches on all four faces at the bell stage and
+    // a hanging lantern as the "bell"; slab cap.
+    const tx = x1 - 2, tz = z1 - 2;
+    for (let wy = base + 1; wy <= base + 12; wy++) {
+      for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) {
+        if (dx === 0 && dz === 0) { place(tx, wy, tz, B.air); continue; }   // hollow core
+        const arch = wy >= base + 10 && wy <= base + 11 && (dx === 0 || dz === 0);
+        place(tx + dx, wy, tz + dz, arch ? B.air : weatheredStoneBricks(tx + dx, wy, tz + dz));
+      }
+    }
+    for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) place(tx + dx, base + 13, tz + dz, B.stoneSlab);
+    place(tx, base + 11, tz, B.lantern);             // the "bell"
+    place(tx, base + 1, tz, B.smoothStone);          // tower floor
+    // SCHOLARS' INTERIOR: bookshelf rows along the back wall, a lectern, two
+    // beds with chests, a crafting corner, hanging lanterns.
+    for (let wx = x0 + 1; wx <= ox + 1; wx++) place(wx, base + 2, z1 - 1, B.bookshelf);
+    for (let wx = x0 + 1; wx <= ox - 1; wx++) place(wx, base + 3, z1 - 1, B.bookshelf);
+    place(ox, base + 2, oz, B.darkOakLog); place(ox, base + 3, oz, B.oakSlab);   // lectern
+    place(x0 + 1, base + 2, z0 + 1, B.bedHead); place(x0 + 2, base + 2, z0 + 1, B.bedFoot);
+    place(x0 + 1, base + 2, z0 + 2, B.chest);
+    place(x0 + 4, base + 2, z0 + 1, B.bedHead); place(x0 + 5, base + 2, z0 + 1, B.bedFoot);
+    place(x0 + 4, base + 2, z0 + 2, B.barrel);
+    place(x1 - 1, base + 2, z0 + 1, B.craftingTable); place(x1 - 1, base + 3, z0 + 1, B.flowerPot);
+    place(ox - 2, base + 6, oz, B.lantern); place(ox + 2, base + 6, oz, B.lantern);
+    // PILGRIMS' TRAIL leaving the front (rng LAST — nothing after consumes it)
+    const ang = -Math.PI / 2 + (rng.random() - 0.5) * 1.2;
+    drawTrailPath(ox, z0 - 3, 16 + Math.floor(rng.random() * 10), ang);
+  };
 
   // ===========================================================================
   //  VILLAGE — bigger, with a road network: a central plaza with the well, 2-3
@@ -3495,7 +3790,23 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
   //  through houses (per the user's request). 9-12 buildings. Mixed building
   //  types: cabin / bigHouse / tavern / library / blacksmith / farm.
   // ===========================================================================
+  // Biome-driven village palette: [logId, plankId, roofStairs, roofSlab], or
+  // null → the classic per-slot oak/birch rng mix. Pure fn of the origin biome
+  // (no rng) so every overlapping chunk picks the identical palette, and the
+  // rng stream keeps its exact shape (the per-slot palette draw still happens —
+  // it's just overridden when the biome dictates a wood).
+  const villagePalette = (b: number): readonly [number, number, StairSet, number] | null => {
+    if (b === BIOME.taiga || b === BIOME.redwoodForest || b === BIOME.coldPlains || b === BIOME.snowy)
+      return [B.spruceLog, B.sprucePlanks, OAK_ST, B.oakSlab];
+    if (b === BIOME.savanna || b === BIOME.scrub) return [B.acaciaLog, B.acaciaPlanks, OAK_ST, B.oakSlab];
+    if (b === BIOME.cherry) return [B.cherryLog, B.cherryPlanks, OAK_ST, B.oakSlab];
+    if (b === BIOME.desert || b === BIOME.redDesert) return [B.cutSandstone, B.sandstone, SS_ST, B.sandstoneSlab];
+    if (b === BIOME.darkForest) return [B.darkOakLog, B.darkOakPlanks, OAK_ST, B.oakSlab];
+    return null;
+  };
+
   const village = (ox: number, oz: number, rng: RNG) => {
+    const pal = villagePalette(colAt(ox, oz).biome);
     // ---- 1) CENTRAL PLAZA: 7×7 cobble paving + the well in the middle ----
     const plazaR = 3;
     const plazaBase = platform(ox, oz, plazaR);
@@ -3593,10 +3904,11 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
 
     // ---- 4) BUILD THE BUILDINGS ----
     for (const s of placed) {
-      const wood: readonly [number, number] = s.palette === 0 ? [B.tree, B.oakPlanks] : [B.birchLog, B.birchPlanks];
+      const wood: readonly [number, number, StairSet, number] = pal
+        ?? (s.palette === 0 ? [B.tree, B.oakPlanks, OAK_ST, B.oakSlab] : [B.birchLog, B.birchPlanks, OAK_ST, B.oakSlab]);
       switch (s.kind) {
-        case 0: cabin(s.x, s.z, wood[0], wood[1]); break;
-        case 1: bigHouse(s.x, s.z, wood[0], wood[1]); break;
+        case 0: cabin(s.x, s.z, wood[0], wood[1], wood[2], wood[3]); break;
+        case 1: bigHouse(s.x, s.z, wood[0], wood[1], wood[2], wood[3]); break;
         case 2: farm(s.x, s.z); break;
         case 3: tavern(s.x, s.z); break;
         case 4: library(s.x, s.z); break;
@@ -3647,10 +3959,14 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
           // tower-on-mountain bias: a high-elevation lone house becomes a tower
           // (no shaft → apron unaffected; only wells carry a sub-surface shaft).
           if (colAt(s.ox, s.oz).height > sea + 42 && rng.random() < 0.8) { tower(s.ox, s.oz, rng); break; }
-          const warm = b === BIOME.warmForest;
+          // Lone houses follow the biome palette (spruce in taiga, acacia in
+          // savanna…) like villages; warm forest keeps its jungle-wood look.
+          const hp = b === BIOME.warmForest
+            ? [B.jungleLog, B.junglePlanks, OAK_ST, B.oakSlab] as const
+            : villagePalette(b) ?? [B.tree, B.oakPlanks, OAK_ST, B.oakSlab] as const;
           // Variation: 35% bigHouse, otherwise cabin — a lone-in-the-woods house.
-          if (rng.random() < 0.35) bigHouse(s.ox, s.oz, warm ? B.jungleLog : B.tree, warm ? B.junglePlanks : B.oakPlanks);
-          else cabin(s.ox, s.oz, warm ? B.jungleLog : B.tree, warm ? B.junglePlanks : B.oakPlanks);
+          if (rng.random() < 0.35) bigHouse(s.ox, s.oz, hp[0], hp[1], hp[2], hp[3]);
+          else cabin(s.ox, s.oz, hp[0], hp[1], hp[2], hp[3]);
           break;
         }
         case ST_WELL: well(s.ox, s.oz); break;
@@ -3659,6 +3975,7 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
         case ST_OUTPOST: outpost(s.ox, s.oz, rng); break;
         case ST_LIGHTHOUSE: lighthouse(s.ox, s.oz); break;
         case ST_WITCH_HUT: witchHut(s.ox, s.oz); break;
+        case ST_MONASTERY: monastery(s.ox, s.oz, rng); break;
       }
     }
   }

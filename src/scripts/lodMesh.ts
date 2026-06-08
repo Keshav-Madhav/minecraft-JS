@@ -1,4 +1,8 @@
-import { WorldSampler, lodSurfaceBlock, climateGrassTint, ICE_SURFACE_TEMP, LOD_CANOPY, BIOME } from './chunkGen';
+import {
+  WorldSampler, lodSurfaceBlock, climateGrassTint, ICE_SURFACE_TEMP, LOD_CANOPY, BIOME,
+  structInfo, structureFitsBiome, STRUCT_CELL, STRUCT_MAX_R,
+  ST_TOWER, ST_PYRAMID, ST_HOUSE, ST_VILLAGE, ST_MANSION, ST_OUTPOST, ST_LIGHTHOUSE, ST_MONASTERY,
+} from './chunkGen';
 import { BLOCK_IDS, BLOCK_FACE_LAYERS } from './blockTypes';
 import { quantize } from './chunkMesh';
 import type { GeometryArrays } from './chunkMesh';
@@ -143,6 +147,7 @@ export type LodTileGeometry = { terrain: GeometryArrays | null, canopy: Geometry
 export function buildLodTile(
   sample: WorldSampler, sea: number, maxY: number,
   worldX: number, worldZ: number, tileBlocks: number, stride: number,
+  seed: number,
 ): LodTileGeometry {
   const N = (tileBlocks / stride) | 0;   // cells per side
   const G = N + 2;                       // sampled grid incl. a 1-cell ring from neighbour tiles
@@ -327,6 +332,10 @@ export function buildLodTile(
       const c = LOD_CANOPY[biom[o]];
       if (!c) continue;
       if (hash01(wx, wz) >= c.prob) continue;       // per-4×4-cell chance, same as generateFeatures
+      // alpine treeline blend — same 38..60 thinning band generateFeatures
+      // applies (statistical mirror; the canopy never matches tree-for-tree)
+      const tl = (hgt[o] - sea - 38) / 22;
+      if (tl > 0 && hash01(wx + 137, wz + 593) < Math.min(1, tl)) continue;
       const blobW = 3 + ((h2 * 3) | 0);             // 3..5 blocks
       const ground = hgt[o];
       const y0 = ground + c.base;
@@ -372,5 +381,165 @@ export function buildLodTile(
     }
   }
 
+  // ---- STRUCTURE PROXIES ----------------------------------------------------
+  // Structures used to exist only as real chunk voxels, so a tower/pyramid/
+  // village POPPED OUT of the world beyond the chunk ring. Emit coarse opaque
+  // boxes for the visible-at-distance kinds straight into the terrain Acc —
+  // they then inherit the tile's hide-when-chunks-cover rule for free (never a
+  // double-render in steady state; during streaming the proxies are inset a
+  // block inside the real builds, so no coplanar z-fighting either).
+  emitStructureProxies(terrain, sample, sea, worldX, worldZ, tileBlocks, stride, seed);
+
   return { terrain: terrain.finalize(), canopy: canopy.finalize() };
+}
+
+// One proxy box, world coords in BLOCK indices (inclusive), clipped to the
+// tile: a structure can straddle a tile border (origins up to STRUCT_MAX_R
+// outside still overlap), and tile-local quantization only supports ≥ -8 —
+// each overlapping tile emits its clipped piece, and the pieces union into the
+// closed box (the cut planes are interior, never visible). Walls are emitted
+// only where the box's real edge lies inside this tile.
+function proxyBox(acc: Acc, worldX: number, worldZ: number, tileBlocks: number,
+  wx0: number, wz0: number, wx1: number, wz1: number, y0: number, y1: number,
+  L: ArrayLike<number>) {
+  const tx0 = -0.5, tx1 = tileBlocks - 0.5;
+  const x0 = wx0 - worldX - 0.5, x1 = wx1 - worldX + 0.5;
+  const z0 = wz0 - worldZ - 0.5, z1 = wz1 - worldZ + 0.5;
+  const cx0 = Math.max(x0, tx0), cx1 = Math.min(x1, tx1);
+  const cz0 = Math.max(z0, tx0), cz1 = Math.min(z1, tx1);
+  if (cx0 >= cx1 || cz0 >= cz1 || y1 < y0) return;
+  const ya = y0 - 0.5, yb = y1 + 0.5;
+  topQuad(acc, cx0, cx1, cz0, cz1, yb, L[2], 255, 255, 255);
+  if (x1 <= tx1) xWall(acc, cx1, ya, yb, cz0, cz1, 1, L[0], 255, 255, 255);
+  if (x0 >= tx0) xWall(acc, cx0, ya, yb, cz0, cz1, -1, L[1], 255, 255, 255);
+  if (z1 <= tx1) zWall(acc, cz1, ya, yb, cx0, cx1, 1, L[4], 255, 255, 255);
+  if (z0 >= tx0) zWall(acc, cz0, ya, yb, cx0, cx1, -1, L[5], 255, 255, 255);
+}
+
+function emitStructureProxies(terrain: Acc, sample: WorldSampler, sea: number,
+  worldX: number, worldZ: number, tileBlocks: number, stride: number, seed: number) {
+  // Approximate the builder's platform(): max ground over the footprint with
+  // the same null rule (water / too steep → the real builder skipped the site,
+  // so no proxy either). Sampled on a coarse sub-grid — the real scan is every
+  // column, but viable sites are ≤7 blocks of spread, so a stride-2/4 max is
+  // within a block or two; invisible at LOD range, and the proxy never renders
+  // beside the real build (the tile hides once its chunks load).
+  const baseAt = (ox: number, oz: number, r: number, maxSpread = 7): number | null => {
+    let hi = 0, lo = 1e9;
+    const st = r <= 4 ? 2 : 4;
+    for (let dx = -r; dx <= r; dx += st) for (let dz = -r; dz <= r; dz += st) {
+      const h = sample(ox + dx, oz + dz).height;
+      if (h > hi) hi = h;
+      if (h < lo) lo = h;
+    }
+    return (hi <= sea || hi - lo > maxSpread) ? null : hi;
+  };
+  const SB = BLOCK_FACE_LAYERS[BLOCK_IDS.stoneBricks];
+  const SS = BLOCK_FACE_LAYERS[BLOCK_IDS.sandstone];
+  const DO = BLOCK_FACE_LAYERS[BLOCK_IDS.darkOakPlanks];
+  const OP = BLOCK_FACE_LAYERS[BLOCK_IDS.oakPlanks];
+  const CB = BLOCK_FACE_LAYERS[BLOCK_IDS.cobblestone];
+  const WR = BLOCK_FACE_LAYERS[BLOCK_IDS.woolRed];
+  const QZ = BLOCK_FACE_LAYERS[BLOCK_IDS.quartzBlock];
+  const box = (wx0: number, wz0: number, wx1: number, wz1: number, y0: number, y1: number, L: ArrayLike<number>) =>
+    proxyBox(terrain, worldX, worldZ, tileBlocks, wx0, wz0, wx1, wz1, y0, y1, L);
+  // Tower height mirrors the builder's elevation curve (the rng spread isn't
+  // reproducible from cell+seed — a fixed mid-spread value reads right at range).
+  const towerBox = (ox: number, oz: number, base: number) => {
+    const elev = Math.min(1, Math.max(0, (base - sea) / 70));
+    const h = Math.round(22 - 12 * elev) + 4;
+    box(ox - 2, oz - 2, ox + 2, oz + 2, base + 1, base + h, SB);
+  };
+
+  const cx0 = Math.floor((worldX - STRUCT_MAX_R) / STRUCT_CELL), cx1 = Math.floor((worldX + tileBlocks + STRUCT_MAX_R) / STRUCT_CELL);
+  const cz0 = Math.floor((worldZ - STRUCT_MAX_R) / STRUCT_CELL), cz1 = Math.floor((worldZ + tileBlocks + STRUCT_MAX_R) / STRUCT_CELL);
+  for (let cx = cx0; cx <= cx1; cx++) {
+    for (let cz = cz0; cz <= cz1; cz++) {
+      const s = structInfo(cx, cz, seed);
+      if (!s) continue;
+      if (s.ox + STRUCT_MAX_R < worldX || s.ox - STRUCT_MAX_R >= worldX + tileBlocks) continue;
+      if (s.oz + STRUCT_MAX_R < worldZ || s.oz - STRUCT_MAX_R >= worldZ + tileBlocks) continue;
+      if (!structureFitsBiome(s.kind, sample(s.ox, s.oz).biome)) continue;
+      // Megatiles (stride 16, ≥1.5km out) keep only the BIG silhouettes; the
+      // small kinds are sub-pixel there and the per-house ground scans aren't
+      // worth paying that far out.
+      const bigOnly = stride >= 16;
+      switch (s.kind) {
+        case ST_TOWER: {
+          const base = baseAt(s.ox, s.oz, 4);
+          if (base !== null) towerBox(s.ox, s.oz, base);
+          break;
+        }
+        case ST_PYRAMID: {
+          const base = baseAt(s.ox, s.oz, 14);
+          if (base === null) break;
+          // plinth + 3 merged step tiers ≈ the 29×29 foundation + 11 1-block steps
+          box(s.ox - 13, s.oz - 13, s.ox + 13, s.oz + 13, base + 1, base + 5, SS);
+          box(s.ox - 11, s.oz - 11, s.ox + 11, s.oz + 11, base + 6, base + 9, SS);
+          box(s.ox - 7, s.oz - 7, s.ox + 7, s.oz + 7, base + 10, base + 13, SS);
+          box(s.ox - 3, s.oz - 3, s.ox + 3, s.oz + 3, base + 14, base + 17, SS);
+          break;
+        }
+        case ST_MANSION: {
+          const base = baseAt(s.ox, s.oz, 18);
+          if (base === null) break;
+          box(s.ox - 13, s.oz - 10, s.ox + 13, s.oz + 15, base + 1, base + 17, DO);
+          box(s.ox - 9, s.oz - 6, s.ox + 9, s.oz + 11, base + 18, base + 20, DO);  // roof mass
+          break;
+        }
+        case ST_LIGHTHOUSE: {
+          const base = baseAt(s.ox, s.oz, 3);
+          if (base === null) break;
+          box(s.ox - 1, s.oz - 1, s.ox + 1, s.oz + 1, base + 1, base + 16, WR);   // striped shaft reads red at range
+          box(s.ox - 1, s.oz - 1, s.ox + 1, s.oz + 1, base + 17, base + 19, QZ);  // lantern room
+          break;
+        }
+        case ST_HOUSE: {
+          if (bigOnly) break;
+          const base = baseAt(s.ox, s.oz, 4);
+          if (base === null) break;
+          // mirror the builder's tower-on-mountain bias (height-gated, rng 80% —
+          // emit the dominant variant)
+          if (base > sea + 42) towerBox(s.ox, s.oz, base);
+          else box(s.ox - 3, s.oz - 2, s.ox + 3, s.oz + 2, base + 1, base + 6, OP);
+          break;
+        }
+        case ST_OUTPOST: {
+          if (bigOnly) break;
+          const base = baseAt(s.ox, s.oz, 3);
+          if (base !== null) box(s.ox - 1, s.oz - 1, s.ox + 1, s.oz + 1, base + 1, base + 12, CB);
+          break;
+        }
+        case ST_MONASTERY: {
+          if (bigOnly) break;
+          // mirror the builder's gates: high ground (sea+18) + crag-tolerant
+          // spread 10 — a valley cell builds nothing, so no proxy either
+          const base = baseAt(s.ox, s.oz, 6, 10);
+          if (base === null || base < sea + 18) break;
+          box(s.ox - 5, s.oz - 3, s.ox + 5, s.oz + 3, base + 1, base + 8, SB);    // hall
+          box(s.ox + 3, s.oz + 1, s.ox + 5, s.oz + 3, base + 9, base + 13, SB);   // bell tower above the roofline
+          break;
+        }
+        case ST_VILLAGE: {
+          if (bigOnly) break;
+          // The real layout is rng-driven (not reproducible from cell+seed) —
+          // a STATISTICAL hamlet, same philosophy as the canopy: hash-scattered
+          // house boxes on their own ground + the watchtower silhouette. Reads
+          // as "a village there" from afar; the real one swaps in on approach.
+          const wtAng = hash01(s.ox + 5, s.oz + 9) * Math.PI * 2;
+          const wtBase = baseAt(s.ox + Math.round(Math.cos(wtAng) * 42), s.oz + Math.round(Math.sin(wtAng) * 42), 4);
+          if (wtBase !== null) towerBox(s.ox + Math.round(Math.cos(wtAng) * 42), s.oz + Math.round(Math.sin(wtAng) * 42), wtBase);
+          for (let i = 0; i < 7; i++) {
+            const ang = hash01(s.ox + i * 7, s.oz + i * 13) * Math.PI * 2;
+            const dist = 13 + hash01(s.ox + i * 29, s.oz + i * 17) * 26;
+            const hx = s.ox + Math.round(Math.cos(ang) * dist);
+            const hz = s.oz + Math.round(Math.sin(ang) * dist);
+            const hb = baseAt(hx, hz, 4);
+            if (hb !== null) box(hx - 3, hz - 2, hx + 3, hz + 2, hb + 1, hb + 5, OP);
+          }
+          break;
+        }
+      }
+    }
+  }
 }

@@ -93,9 +93,12 @@ export class WorldChunk extends THREE.Group {
 
   // A tiny W×W canvas wrapping `mapTile`, built once and cached, for the minimap to
   // drawImage-scale directly (far cheaper than putImageData per frame).
-  getMapTileCanvas(): HTMLCanvasElement | null {
+  // `build=false` returns only an ALREADY-built canvas — the fullscreen map's
+  // overlay budgets canvas creation per frame (a first open used to create
+  // ~1700 of these synchronously = a visible freeze).
+  getMapTileCanvas(build = true): HTMLCanvasElement | null {
     if (this.mapTileCanvas) return this.mapTileCanvas;
-    if (!this.mapTile) return null;
+    if (!this.mapTile || !build) return null;
     const W = this.size.width;
     const c = document.createElement('canvas');
     c.width = c.height = W;
