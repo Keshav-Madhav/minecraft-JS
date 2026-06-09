@@ -6,6 +6,7 @@ import { ResourceGenInfo, BLOCK_IDS } from './blockTypes';
 import { blockArrayMaterial, leafArrayMaterial, plantMaterial, cutoutDepthMaterial, getFoliageShadows } from './blockArrayMaterial';
 import { buildChunkGeometry, buildChunkMapTile, scanEmitters, GeometryArrays } from './chunkMesh';
 import { setQuantizedBounds } from './batchPool';
+import { decodeColumnRLE } from './chunkRle';
 
 // Returns the block id at a world position, or 0 (air) when unknown. Used so a
 // chunk can cull faces against blocks that live in neighbouring chunks.
@@ -19,6 +20,14 @@ export class WorldChunk extends THREE.Group {
   size: ChunkSize;
   params: ChunkParams;
   data: Uint8Array;
+  // FAR (batched) chunks RLE-compress their idle voxel array to reclaim RAM (see
+  // chunkRle.ts / World.compressFarData). `data` is then a zero-length stub and
+  // `rle` holds the compressed bytes; ensureFlat() decodes back on demand. Every
+  // reader of `data` (getBlockId/setBlockId/buildMeshes + the demotion slice)
+  // calls ensureFlat first. hasData stays true (the chunk IS generated) — only
+  // `dataCompressed` distinguishes the storage form.
+  dataCompressed = false;
+  private rle: Uint8Array | null = null;
   dataStore: DataStore;
   // Light-emitter world positions [wx,wy,wz,id,…] in this chunk (set from the
   // worker mesh message, or rescanned locally on edit). Read by the point-light pool.
@@ -52,9 +61,30 @@ export class WorldChunk extends THREE.Group {
 
   // Adopt freshly generated block data, then layer any player edits on top.
   setData(data: Uint8Array) {
+    // Wholesale-replacing `data` clears any compressed form (single source of
+    // truth) — else the next read would decode stale `rle` over this fresh array.
+    this.dataCompressed = false;
+    this.rle = null;
     this.data = data;
     this.hasData = true;
     this.loadPlayerChanges();
+  }
+
+  // Decode the RLE-compressed voxel array back to flat form (no-op if already
+  // flat). Synchronous + O(runs); called by every `data` reader before it reads.
+  ensureFlat() {
+    if (!this.dataCompressed) return;
+    this.data = decodeColumnRLE(this.rle!, this.size);
+    this.rle = null;
+    this.dataCompressed = false;
+  }
+
+  // Drop the flat voxel array, keeping only its RLE form. Called by World once a
+  // chunk is far/batched and its bytes go idle. hasData stays true.
+  compress(rle: Uint8Array) {
+    this.rle = rle;
+    this.data = new Uint8Array(0);
+    this.dataCompressed = true;
   }
 
   loadPlayerChanges() {
@@ -69,6 +99,10 @@ export class WorldChunk extends THREE.Group {
   // Local meshing path (single-block edits, and the no-worker fallback). During
   // normal streaming the worker meshes off-thread and we call applyGeometry().
   buildMeshes(getWorldBlock?: WorldBlockGetter, getTint?: WorldTintGetter) {
+    // The mesher reads this.data directly (chunkMesh idAt), bypassing getBlockId —
+    // so decode here, not only in getBlockId. Covers the no-worker demotion
+    // fallback + the local edit/MP remesh of a still-compressed far chunk.
+    if (this.dataCompressed) this.ensureFlat();
     if (!this.hasData) return;
     const getOutside = (lx: number, y: number, lz: number) =>
       getWorldBlock ? getWorldBlock(this.position.x + lx, y, this.position.z + lz) : BLOCK_IDS.air;
@@ -190,6 +224,7 @@ export class WorldChunk extends THREE.Group {
 
   getBlockId(x: number, y: number, z: number) {
     if (!this.hasData || !this.inBounds(x, y, z)) return BLOCK_IDS.air;
+    if (this.dataCompressed) this.ensureFlat();   // seam-read backstop (rare: the freeze margin keeps near neighbours flat)
     return this.data[blockIndex(x, y, z, this.size)];
   }
 
@@ -208,6 +243,10 @@ export class WorldChunk extends THREE.Group {
 
   setBlockId(x: number, y: number, z: number, id: number) {
     if (this.inBounds(x, y, z)) {
+      // Decode before writing: a compressed chunk's `data` is a zero-length stub,
+      // so the write would silently no-op (the MP remote-edit-onto-a-far-chunk
+      // data-loss path). The caller re-meshes + unbatches right after.
+      if (this.dataCompressed) this.ensureFlat();
       this.data[blockIndex(x, y, z, this.size)] = id;
     }
   }
@@ -259,6 +298,8 @@ export class WorldChunk extends THREE.Group {
     this.clear();
     this.loaded = false;
     this.hasData = false;
+    this.dataCompressed = false;
+    this.rle = null;
     this.mapTile = null;
     this.mapTileCanvas = null;
   }

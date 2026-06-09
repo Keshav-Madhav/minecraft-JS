@@ -78,31 +78,78 @@ const DIR_META: ReadonlyArray<DirMeta> = [
 
 // `col` (vec4/vertex) is filled for ALL groups now: plants carry tint rgb + sway a;
 // casters/nonCasters carry the baked biome tint rgb (white where untinted) + a=1.
-type Accumulator = { pos: number[], uv: number[], layer: number[], col: number[], idx: number[] };
-const newAccumulator = (): Accumulator => ({ pos: [], uv: [], layer: [], col: [], idx: [] });
-
-function finalize(acc: Accumulator): GeometryArrays | null {
-  if (acc.idx.length === 0) return null;
-  const vtx = acc.pos.length / 3;
-  return {
-    positions: Uint16Array.from(acc.pos, quantize),
-    uvs: Uint16Array.from(acc.uv, quantize),
-    layers: Uint16Array.from(acc.layer),   // already layer|face<<12
-    indices: vtx > 65535 ? new Uint32Array(acc.idx) : new Uint16Array(acc.idx),
+// Growable TYPED-array accumulator (was five boxed number[] + a per-element
+// finalize re-walk — ~150-200k boxed doubles/chunk of worker-GC churn on the
+// now worker-bound streaming pipeline). pos/uv/col stay Float32/clamped scratch
+// and finalize applies the SAME quantize/clamp as before, so the emitted
+// GeometryArrays are byte-identical (mirrors lodMesh.ts's proven Acc). Verified
+// against a golden reference (mesh-parity.mjs).
+class Acc {
+  pos: Float32Array; uv: Float32Array; layer: Uint16Array; col: Float32Array; idx: Uint32Array;
+  v = 0; i = 0;   // vertex / index counts
+  constructor(vcap = 2048) {
+    this.pos = new Float32Array(vcap * 3);
+    this.uv = new Float32Array(vcap * 2);
+    this.layer = new Uint16Array(vcap);
+    this.col = new Float32Array(vcap * 4);
+    this.idx = new Uint32Array(vcap + (vcap >> 1));
+  }
+  private growVerts() {
+    const vcap = (this.layer.length * 2) | 0;
+    const g = <T extends Float32Array | Uint16Array>(a: T, n: number): T => {
+      const b = new (a.constructor as new (n: number) => T)(n); b.set(a as never); return b;
+    };
+    this.pos = g(this.pos, vcap * 3);
+    this.uv = g(this.uv, vcap * 2);
+    this.layer = g(this.layer, vcap);
+    this.col = g(this.col, vcap * 4);
+  }
+  // Append one vertex (caller passes the already-packed layer word + raw 0..1 col).
+  vert(x: number, y: number, z: number, u: number, vv: number, packedLayer: number, r: number, g: number, b: number, a: number) {
+    if (this.v >= this.layer.length) this.growVerts();
+    const p = this.v * 3, t = this.v * 2, c = this.v * 4;
+    this.pos[p] = x; this.pos[p + 1] = y; this.pos[p + 2] = z;
+    this.uv[t] = u; this.uv[t + 1] = vv;
+    this.layer[this.v] = packedLayer;
+    this.col[c] = r; this.col[c + 1] = g; this.col[c + 2] = b; this.col[c + 3] = a;
+    this.v++;
+  }
+  // The 6 indices of a quad whose first corner is vertex `base` (two CCW triangles).
+  quadIdx(base: number) {
+    if (this.i + 6 > this.idx.length) {
+      const icap = Math.max(this.i + 6, (this.idx.length * 2) | 0);
+      const b = new Uint32Array(icap); b.set(this.idx); this.idx = b;
+    }
+    const k = this.i;
+    this.idx[k] = base; this.idx[k + 1] = base + 1; this.idx[k + 2] = base + 2;
+    this.idx[k + 3] = base; this.idx[k + 4] = base + 2; this.idx[k + 5] = base + 3;
+    this.i += 6;
+  }
+  finalize(): GeometryArrays | null {
+    if (this.i === 0) return null;
+    const positions = new Uint16Array(this.v * 3);
+    for (let k = 0; k < positions.length; k++) positions[k] = quantize(this.pos[k]);
+    const uvs = new Uint16Array(this.v * 2);
+    for (let k = 0; k < uvs.length; k++) uvs[k] = quantize(this.uv[k]);
     // pack 0..1 tint/sway into normalized bytes (shader reads them back as 0..1)
-    colors: acc.col.length ? Uint8Array.from(acc.col, (v) => v < 0 ? 0 : v > 1 ? 255 : (v * 255 + 0.5) | 0) : undefined,
-  };
+    const colors = new Uint8Array(this.v * 4);
+    for (let k = 0; k < colors.length; k++) { const cv = this.col[k]; colors[k] = cv < 0 ? 0 : cv > 1 ? 255 : (cv * 255 + 0.5) | 0; }
+    return {
+      positions,
+      uvs,
+      layers: this.layer.slice(0, this.v),   // already layer|face<<12
+      indices: this.v > 65535 ? this.idx.slice(0, this.i) : Uint16Array.from(this.idx.subarray(0, this.i)),
+      colors,
+    };
+  }
 }
 
 // Append one plant vertex (explicit world-local position + tint + sway). Plants
 // carry face id 2 ('up') so a billboard is lit evenly like the ground it grows
 // from (no dark-side flicker as you orbit it).
-function pushPlantVert(acc: Accumulator, x: number, y: number, z: number, u: number, v: number,
+function pushPlantVert(acc: Acc, x: number, y: number, z: number, u: number, v: number,
   layer: number, r: number, g: number, b: number, sway: number) {
-  acc.pos.push(x, y, z);
-  acc.uv.push(u, v);
-  acc.layer.push(layer | (2 << 12));
-  acc.col.push(r, g, b, sway);
+  acc.vert(x, y, z, u, v, layer | (2 << 12), r, g, b, sway);
 }
 
 // Append one vertex to `acc` from a quad corner, WITHOUT allocating (the old
@@ -110,30 +157,27 @@ function pushPlantVert(acc: Accumulator, x: number, y: number, z: number, u: num
 // short-lived arrays per chunk mesh). aAxis/pAxis/qAxis are a permutation of
 // {0,1,2}, so each of aCoord/pc/qc maps to exactly one of x/y/z. Module-scope so
 // no closure is allocated per quad either.
-function pushVert(acc: Accumulator, meta: DirMeta, aCoord: number, pc: number, qc: number, layer: number,
+function pushVert(acc: Acc, meta: DirMeta, aCoord: number, pc: number, qc: number, layer: number,
   r = 1, g = 1, b = 1, emis = 0) {
   let x = 0, y = 0, z = 0;
   switch (meta.aAxis) { case 0: x = aCoord; break; case 1: y = aCoord; break; default: z = aCoord; }
   switch (meta.pAxis) { case 0: x = pc; break; case 1: y = pc; break; default: z = pc; }
   switch (meta.qAxis) { case 0: x = qc; break; case 1: y = qc; break; default: z = qc; }
-  acc.pos.push(x, y, z);
   // +0.5 aligns texture tile boundaries to block edges; the shader fract()s this
   // so merged quads tile the texture once per block.
-  acc.uv.push(
-    (meta.uAxis === 0 ? x : meta.uAxis === 1 ? y : z) + 0.5,
-    (meta.vAxis === 0 ? x : meta.vAxis === 1 ? y : z) + 0.5,
-  );
-  acc.layer.push(layer | (meta.face << 12));
-  acc.col.push(r, g, b, emis);   // rgb = biome tint (white = untinted); a = emissive amount (0 = none)
+  const u = (meta.uAxis === 0 ? x : meta.uAxis === 1 ? y : z) + 0.5;
+  const vv = (meta.vAxis === 0 ? x : meta.vAxis === 1 ? y : z) + 0.5;
+  // rgb = biome tint (white = untinted); a = emissive amount (0 = none)
+  acc.vert(x, y, z, u, vv, layer | (meta.face << 12), r, g, b, emis);
 }
 
 export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside: OutsideBlockGetter,
   getTint?: TintGetter): ChunkGeometry {
   const W = size.width, H = size.height;
   const dim = [W, H, W];
-  const casters = newAccumulator();
-  const nonCasters = newAccumulator();
-  const plants = newAccumulator();
+  const casters = new Acc();
+  const nonCasters = new Acc();
+  const plants = new Acc();
 
   // Climate grass/foliage tint per LOCAL column (cached). Baked into BOTH the
   // plant pass AND tinted cube faces (grass-block tops + the biome-varying leaf
@@ -204,12 +248,12 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
     const aCoord = la + meta.sign * 0.5;
     const pLo = p0 - 0.5, pHi = p1 - 0.5;
     const qLo = q0 - 0.5, qHi = q1 - 0.5;
-    const base = acc.pos.length / 3;
+    const base = acc.v;
     pushVert(acc, meta, aCoord, pLo, qLo, layer, r, g, b, emis);
     pushVert(acc, meta, aCoord, pHi, qLo, layer, r, g, b, emis);
     pushVert(acc, meta, aCoord, pHi, qHi, layer, r, g, b, emis);
     pushVert(acc, meta, aCoord, pLo, qHi, layer, r, g, b, emis);
-    acc.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    acc.quadIdx(base);
   };
 
   // Vertical band where exposed faces can exist. Above the surface is all-air and
@@ -333,12 +377,12 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
   const emitCross = (x: number, y: number, z: number, layer: number, r: number, g: number, b: number, swLo: number, swHi: number) => {
     const yB = y - 0.5, yT = y + 0.5, lo = -0.5 + INSET, hi = 0.5 - INSET;
     const quad = (ax: number, az: number, bx: number, bz: number) => {
-      const base = plants.pos.length / 3;
+      const base = plants.v;
       pushPlantVert(plants, x + ax, yB, z + az, 0, 0, layer, r, g, b, swLo);
       pushPlantVert(plants, x + bx, yB, z + bz, 1, 0, layer, r, g, b, swLo);
       pushPlantVert(plants, x + bx, yT, z + bz, 1, 1, layer, r, g, b, swHi);
       pushPlantVert(plants, x + ax, yT, z + az, 0, 1, layer, r, g, b, swHi);
-      plants.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      plants.quadIdx(base);
     };
     quad(lo, lo, hi, hi);   // main diagonal
     quad(lo, hi, hi, lo);   // anti-diagonal
@@ -350,12 +394,12 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
     r: number, g: number, b: number) => {
     const xLo = x0 - 0.5, xHi = x1 + 0.5, zLo = z0 - 0.5, zHi = z1 + 0.5;
     const nu = x1 - x0 + 1, nv = z1 - z0 + 1;
-    const base = plants.pos.length / 3;
+    const base = plants.v;
     pushPlantVert(plants, xLo, yTop, zLo, 0, 0, layer, r, g, b, 0);
     pushPlantVert(plants, xHi, yTop, zLo, nu, 0, layer, r, g, b, 0);
     pushPlantVert(plants, xHi, yTop, zHi, nu, nv, layer, r, g, b, 0);
     pushPlantVert(plants, xLo, yTop, zHi, 0, nv, layer, r, g, b, 0);
-    plants.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    plants.quadIdx(base);
   };
 
   // Vine quad flush against each horizontal face that has a solid backing.
@@ -364,7 +408,7 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
     const faces: ReadonlyArray<readonly [number, number]> = [[1, 0], [-1, 0], [0, 1], [0, -1]];
     for (const [dx, dz] of faces) {
       if (!solidAt(x + dx, y, z + dz)) continue;
-      const base = plants.pos.length / 3;
+      const base = plants.v;
       if (dx !== 0) {
         const px = x + dx * (0.5 - e);
         pushPlantVert(plants, px, yB, z - 0.5, 0, 0, layer, r, g, b, 0.5);
@@ -378,7 +422,7 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
         pushPlantVert(plants, x + 0.5, yT, pz, 1, 1, layer, r, g, b, 0.15);
         pushPlantVert(plants, x - 0.5, yT, pz, 0, 1, layer, r, g, b, 0.15);
       }
-      plants.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      plants.quadIdx(base);
     }
   };
 
@@ -392,12 +436,12 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
     const meta = DIR_META[d];
     const aCoord = meta.sign > 0 ? bnd[meta.aAxis][1] : bnd[meta.aAxis][0];
     const p0 = bnd[meta.pAxis][0], p1 = bnd[meta.pAxis][1], q0 = bnd[meta.qAxis][0], q1 = bnd[meta.qAxis][1];
-    const base = casters.pos.length / 3;
+    const base = casters.v;
     pushVert(casters, meta, aCoord, p0, q0, layer, 1, 1, 1, 0);
     pushVert(casters, meta, aCoord, p1, q0, layer, 1, 1, 1, 0);
     pushVert(casters, meta, aCoord, p1, q1, layer, 1, 1, 1, 0);
     pushVert(casters, meta, aCoord, p0, q1, layer, 1, 1, 1, 0);
-    casters.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    casters.quadIdx(base);
   };
   const emitSlab = (x: number, y: number, z: number, id: number, layer: number, off: number) => {
     const bnd: [number, number][] = [[x - 0.5, x + 0.5], [y - 0.5, y - 0.5 + off], [z - 0.5, z + 0.5]];
@@ -417,12 +461,12 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
     const x0 = x - 0.5, x1 = x + 0.5, y0 = y - 0.5, y1 = y + 0.5, z0 = z - 0.5, z1 = z + 0.5;
     const quad = (ax: number, ay: number, az: number, bx: number, by: number, bz: number,
       cx: number, cy: number, cz: number, dx: number, dy: number, dz: number) => {
-      const base = plants.pos.length / 3;
+      const base = plants.v;
       pushPlantVert(plants, ax, ay, az, 0, 0, layer, 1, 1, 1, 0);
       pushPlantVert(plants, bx, by, bz, 1, 0, layer, 1, 1, 1, 0);
       pushPlantVert(plants, cx, cy, cz, 1, 1, layer, 1, 1, 1, 0);
       pushPlantVert(plants, dx, dy, dz, 0, 1, layer, 1, 1, 1, 0);
-      plants.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      plants.quadIdx(base);
     };
     if (faceVisible(id, x, y, z, 1, 0, 0)) quad(x1, y0, z0, x1, y0, z1, x1, y1, z1, x1, y1, z0);
     if (faceVisible(id, x, y, z, -1, 0, 0)) quad(x0, y0, z1, x0, y0, z0, x0, y1, z0, x0, y1, z1);
@@ -441,12 +485,12 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
       const meta = DIR_META[d];
       const aCoord = meta.sign > 0 ? bnd[meta.aAxis][1] : bnd[meta.aAxis][0];
       const p0 = bnd[meta.pAxis][0], p1 = bnd[meta.pAxis][1], q0 = bnd[meta.qAxis][0], q1 = bnd[meta.qAxis][1];
-      const base = casters.pos.length / 3;
+      const base = casters.v;
       pushVert(casters, meta, aCoord, p0, q0, faces[d], 1, 1, 1, emis);
       pushVert(casters, meta, aCoord, p1, q0, faces[d], 1, 1, 1, emis);
       pushVert(casters, meta, aCoord, p1, q1, faces[d], 1, 1, 1, emis);
       pushVert(casters, meta, aCoord, p0, q1, faces[d], 1, 1, 1, emis);
-      casters.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      casters.quadIdx(base);
     }
   };
   const emitSolidBox = (x: number, y: number, z: number, id: number) => {
@@ -534,7 +578,7 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
     }
   }
 
-  return { casters: finalize(casters), nonCasters: finalize(nonCasters), plants: finalize(plants) };
+  return { casters: casters.finalize(), nonCasters: nonCasters.finalize(), plants: plants.finalize() };
 }
 
 // ===========================================================================

@@ -8,6 +8,7 @@ import { ResourceGenInfo, BLOCK_IDS, TOGGLE, DOOR_PART } from './blockTypes';
 import { GeometryArrays } from './chunkMesh';
 import { blockArrayMaterial, leafArrayMaterial, plantMaterial, cutoutDepthMaterial } from './blockArrayMaterial';
 import { BatchPool, BatchHandle } from './batchPool';
+import { encodeColumnRLE } from './chunkRle';
 import type { WorkerRequest, MeshMessage, LodMeshMessage, WorkerReply, GeometryPayload } from './chunkWorker';
 
 // Frustum-streaming tuning (see World.frustumStreaming):
@@ -196,6 +197,8 @@ export class World extends Three.Group {
   // Built tiles (have batched geometry) + page (= draw-call) counts, for stats/tests.
   get lodBuiltCount() { let n = 0; for (const t of this.lodMap.values()) if (t.terrainH || t.canopyH) n++; return n; }
   get lodPageCount() { return this.lodTerrainPool.pageCount + this.lodCanopyPool.pageCount; }
+  // FAR chunks whose voxel array is RLE-compressed (RAM reclaimed), for stats/tests.
+  get compressedChunkCount() { let n = 0; for (const c of this.chunkMap.values()) if (c.dataCompressed) n++; return n; }
   private optimizeTick = 0;
 
   // Per-frame work budgets keep streaming smooth.
@@ -339,6 +342,29 @@ export class World extends Three.Group {
     } catch { return null; /* fall back to fewer / no workers */ }
   }
 
+  // Least-loaded dispatch (vs blind round-robin): the per-worker gen/remesh queue
+  // is a non-reprioritisable postMessage FIFO, so a cost-skewed chunk (a tall
+  // mountain column runs far more caveAt noise per cell) head-of-line-blocks one
+  // lane while others idle — evening it out shaves burst-drain tail latency on
+  // teleport / draw-distance changes. Workers are stateless+deterministic so any
+  // lane is correct. Tracked per-Worker in a Map (NOT an index array — handleWorker-
+  // Death filters the workers array, which would misalign positional indices).
+  private workerLoad = new Map<Worker, number>();
+  private leastLoadedWorker(): Worker {
+    let best = this.workers[0], bestLoad = this.workerLoad.get(best) ?? 0;
+    for (let i = 1; i < this.workers.length; i++) {
+      const l = this.workerLoad.get(this.workers[i]) ?? 0;
+      if (l < bestLoad) { best = this.workers[i]; bestLoad = l; }
+    }
+    this.workerLoad.set(best, bestLoad + 1);
+    return best;
+  }
+  private freeWorker(w: Worker | undefined) {
+    if (!w) return;
+    const l = this.workerLoad.get(w);
+    if (l !== undefined && l > 0) this.workerLoad.set(w, l - 1);
+  }
+
   // A worker died (e.g. crashed mid-gen). Drop it AND reclaim its in-flight gen
   // slots, or `outstanding` stays permanently inflated and async streaming halts.
   // Orphaned (data-less) chunks it was generating are removed and re-requested via
@@ -346,6 +372,7 @@ export class World extends Three.Group {
   private handleWorkerDeath(w: Worker, e?: unknown) {
     console.error('chunk worker died, dropping it and reclaiming its work', e);
     this.workers = this.workers.filter(x => x !== w);
+    this.workerLoad.delete(w);   // its in-flight jobs are reclaimed below; drop its load with it
     let reclaimed = false;
     for (const [key, worker] of this.inflightWorker) {
       if (worker !== w) continue;
@@ -724,6 +751,7 @@ export class World extends Three.Group {
       while (applied < this.maxAppliesPerFrame && this.applyQueue.length > 0) {
         const msg = this.applyQueue.shift()!;
         this.outstanding = Math.max(0, this.outstanding - 1);
+        this.freeWorker(this.inflightWorker.get(msg.key));   // its lane has a slot free again
         this.inflightWorker.delete(msg.key);
         const chunk = this.chunkMap.get(msg.key);
         if (!chunk) continue;        // unloaded before we got to it
@@ -756,6 +784,7 @@ export class World extends Three.Group {
               payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters), payloadToArrays(msg.plants));
             chunk.setEmitters(new Float32Array(msg.emitters));
             chunk.setMapTile(new Uint8Array(msg.mapTile));
+            this.compressFarData(chunk);   // far chunk renders from the batch slice → free its idle voxel array
           } else {
             chunk.applyGeometry(payloadToArrays(msg.casters), payloadToArrays(msg.nonCasters), payloadToArrays(msg.plants));
             chunk.setEmitters(new Float32Array(msg.emitters));
@@ -980,6 +1009,24 @@ export class World extends Three.Group {
     this.batchChunk(chunk, casters, leaves, plants);
     chunk.clearMeshes();
     chunk.loaded = true;   // clearMeshes resets it; the batch copy IS the render representation
+    this.compressFarData(chunk);
+  }
+
+  // A batched chunk renders entirely from its BatchPool slice; its ~80KB voxel
+  // array is then idle (read only by the demotion remesh + a seam backstop). RLE-
+  // compress it to reclaim RAM — decoded back synchronously on demand
+  // (WorldChunk.ensureFlat). Only fires WELL outside the near ring: the
+  // >=NEAR_BATCH_KEEP+2 Chebyshev margin keeps every chunk a boundary edit could
+  // pull (a cheb==K edit's neighbour-remesh reaches cheb==K+1) in flat form, so
+  // the getBlockId/buildMeshes/setBlockId decode shims are a correctness backstop,
+  // never a per-edit re-alloc next to the player. Edited chunks are left flat
+  // (they may demote/remesh) — cheap insurance, a handful of chunks.
+  private compressFarData(chunk: WorldChunk) {
+    if (chunk.dataCompressed || !chunk.hasData || this.hasEditsAround(chunk)) return;
+    const { x, z } = chunk.userData as chunkCoords;
+    const cheb = Math.max(Math.abs(x - this.lastPlayerChunkX), Math.abs(z - this.lastPlayerChunkZ));
+    if (cheb < NEAR_BATCH_KEEP + 2) return;   // LOAD-BEARING freeze margin (>=5) — do not lower
+    chunk.compress(encodeColumnRLE(chunk.data, chunk.size));
   }
 
   // Set when a demotion was deferred behind a heavy chunk backlog — retried
@@ -1008,12 +1055,13 @@ export class World extends Three.Group {
           // cosmetics (the batch copy is identical), so fresh chunks win the
           // worker slots; the still-batched entry retries on a later rescan.
           if (this.workers.length > 0 && !this.inflightWorker.has(key) && this.outstanding < this.maxOutstanding / 2) {
+            chunk.ensureFlat();   // decode the (possibly compressed) far chunk in the SAME tick as the slice below — never defer to the async reply (would slice an empty array → render hole)
             const request: WorkerRequest = {
               type: 'remesh', version: this.worldVersion, key,
               worldX: chunk.position.x, worldZ: chunk.position.z,
               data: chunk.data.slice().buffer,   // copy — the live array stays with physics
             };
-            const w = this.workers[this.nextWorker++ % this.workers.length];
+            const w = this.leastLoadedWorker();
             w.postMessage(request, [request.data]);
             this.outstanding++;
             this.inflightWorker.set(key, w);
@@ -1163,7 +1211,7 @@ export class World extends Three.Group {
         worldX: chunk.position.x,
         worldZ: chunk.position.z,
       };
-      const w = this.workers[this.nextWorker++ % this.workers.length];
+      const w = this.leastLoadedWorker();
       w.postMessage(request);
       this.outstanding++;
       this.inflightWorker.set(this.chunkKey(x, z), w); // track for worker-death reclaim
@@ -1278,6 +1326,7 @@ export class World extends Three.Group {
     this.applyQueue.length = 0;
     this.outstanding = 0; // in-flight results from the old world are version-rejected
     this.inflightWorker.clear(); // their (now version-stale) replies won't reach processQueues
+    this.workerLoad.clear(); // …so their freeWorker() never fires — drop the stranded load with them, else least-loaded dispatch skews across regenerates
     this.lastPlayerChunkX = NaN; // force a visibility rescan next update()
     this.sampler = createWorldSampler(this.params, this.chunkSize);
     this.lastGenSignature = this.genSignature();

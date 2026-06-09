@@ -136,10 +136,15 @@ renderer.shadowMap.type = THREE.PCFShadowMap; // soft shadow edges (r182+: PCFSo
 // so the stats overlay shows the true scene draw count even in ultra mode where
 // the EffectComposer issues several post-process passes after the scene render.
 renderer.info.autoReset = false;
-// No per-frame z-sort of the render list: with thousands of opaque voxel draws
-// the projectObject+sort cost is real CPU while early-Z already handles overdraw.
-// The only transparent object is the single water plane, so ordering is moot.
-renderer.sortObjects = false;
+// Front-to-back opaque sort so the GPU's early-Z rejects overdraw BEFORE the heavy
+// fragment shader (textureGrad aniso + pow + cylindrical fog + caustics) runs. The
+// sort is cheap now that BatchedMesh collapsed the opaque list to ~100-300 objects —
+// the old "thousands of draws → projectObject+sort cost dominates" no longer holds
+// post-draw-collapse. Measured pixel-identical NET wins on an M5 Pro over a dense
+// horizon: Low +51%, Balanced +7-17%, MAX neutral (vertex-bound at 22M tris); no
+// preset regressed. Opaque draw order can't change the image; the lone transparent
+// water plane still sorts last. (sort-sweep.mjs.)
+renderer.sortObjects = true;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.2;
 document.body.appendChild(renderer.domElement);
@@ -859,7 +864,42 @@ world.onAfterGenerate = () => { configureMap(); net.sendInit(); };
 // Debug/test handle — mp-smoke.mjs / lod-bench.mjs drive real game paths
 // through this (host edits → guest world, avatar tracking, perf metrics).
 // Read-only convenience in prod.
-(window as unknown as Record<string, unknown>).__mcDebug = { world, player, net, remote, BLOCK_IDS, renderer };
+(window as unknown as Record<string, unknown>).__mcDebug = {
+  world, player, net, remote, BLOCK_IDS, renderer,
+  // Automated fragment-vs-vertex-bound GATE (perf-roadmap.md §0). Run on a REAL
+  // GPU — `await __mcDebug.gate()` from the console while standing still over
+  // dense terrain. It uncaps the loop, samples loop-fps at resolutionScale 1.0
+  // then 0.5 (¼ the shaded pixels at identical geometry), restores your settings,
+  // and prints the verdict + which same-visual-look optimizations to ship.
+  // NOTE: meaningless under headless SwiftShader (CPU rasterizer is always
+  // fill-bound) — must be your actual GPU.
+  gate: async (opts: { settleMs?: number, sampleMs?: number } = {}) => {
+    const settleMs = opts.settleMs ?? 1200, sampleMs = opts.sampleMs ?? 2000;
+    if (paused || worldMap.isOpen()) { console.warn('[gate] resume into the world first — the uncapped loop only runs while playing'); return; }
+    const saved = { scale: settings.resolutionScale, uncap: settings.uncapFPS, cap: settings.fpsCap };
+    settings.uncapFPS = true; settings.fpsCap = 0;   // let the loop run as fast as the GPU allows
+    const sampleAt = async (scale: number) => {
+      settings.resolutionScale = scale; applyResolution();
+      await new Promise((r) => setTimeout(r, settleMs));   // let it settle past the resize
+      let sum = 0, n = 0; const t0 = performance.now();
+      while (performance.now() - t0 < sampleMs) { await new Promise((r) => setTimeout(r, 250)); sum += fps; n++; }
+      return n ? sum / n : fps;
+    };
+    console.log('[gate] measuring — hold the camera still over dense terrain…');
+    const full = await sampleAt(1.0);
+    const half = await sampleAt(0.5);
+    settings.resolutionScale = saved.scale; applyResolution();
+    settings.uncapFPS = saved.uncap; settings.fpsCap = saved.cap;
+    const ratio = half / full; const r = renderer.info.render;
+    let verdict: string, advice: string;
+    if (ratio >= 1.4) { verdict = 'FRAGMENT-BOUND'; advice = 'ship (same look): z-prepass · anisotropy 8→2 · cheap far-LOD material · god-rays half-res'; }
+    else if (ratio <= 1.1) { verdict = 'VERTEX/TRIANGLE-BOUND (or CPU/worker-bound)'; advice = 'ship (same look): face-orientation culling · cave/occlusion culling · LOD wall-merge. If fps stays low even at 0.5 you are CPU/worker-bound → mesher typed-Acc · least-loaded dispatch'; }
+    else { verdict = 'MIXED'; advice = 'partly fragment-bound — start with the cheap fragment wins (aniso 8→2, god-rays half-res) and re-measure'; }
+    console.log(`[gate] fps @1.0=${full.toFixed(0)}  @0.5=${half.toFixed(0)}  ratio=${ratio.toFixed(2)}   (draws ${r.calls}, tris ${r.triangles.toLocaleString()})`);
+    console.log(`[gate] VERDICT: ${verdict}  →  ${advice}`);
+    return { full, half, ratio, verdict, draws: r.calls, tris: r.triangles };
+  },
+};
 
 // While connected as GUEST, the host owns the world: regenerating or loading a
 // local save here would silently desync every future edit (same coords,
@@ -973,9 +1013,31 @@ player.enabled = false;
 menu.open();
 updateHudVisibility();
 
-// draw loop
+// draw loop. The loop self-schedules: the ONLY re-arm is scheduleFrame() in the
+// finally below, so any throw escaping renderFrame() would freeze the game
+// permanently (world.ts onWorkerMessage names this exact hazard). Wrapping it turns
+// one bad frame into one skipped frame. Pre-boot throws still propagate so the
+// boot-fail overlay (window 'error' → showFatal) shows instead of busy-looping.
+let lastFrameErrAt = 0;
 function animate() {
   const currentTime = performance.now();
+  let threw = false;
+  try {
+    renderFrame(currentTime);
+  } catch (e) {
+    threw = true;
+    if (!booted) throw e;
+    if (currentTime - lastFrameErrAt > 1000) {   // rate-limit: a persistent per-frame error must not spam the console
+      console.error('animate(): skipped a frame after an error', e);
+      lastFrameErrAt = currentTime;
+    }
+  } finally {
+    previousTime = currentTime;
+    if (booted || !threw) scheduleFrame();   // re-arm — except a pre-boot failure (surfaces the overlay, then stops)
+  }
+}
+
+function renderFrame(currentTime: number) {
   renderer.info.reset();   // start-of-frame; render-info then accumulates all passes
   // Clamp the step so a backgrounded tab (huge dt) can't spiral the physics
   // accumulator into thousands of substeps on refocus.
@@ -1123,9 +1185,6 @@ function animate() {
     }
   }
   if (menu.isOpen()) menu.refreshStats();
-
-  previousTime = currentTime;
-  scheduleFrame();
 }
 
 animate();
