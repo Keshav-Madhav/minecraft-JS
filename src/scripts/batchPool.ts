@@ -32,9 +32,163 @@ type PoolOpts = {
   castShadow: boolean,
   colorAttr: 'tintColor' | 'plantColor',
   customDepth?: THREE.Material | null,   // cutout depth material (ultra foliage shadows)
+  // Draw-order group: alpha-tested (cutout) pools pass 1 so they draw AFTER all
+  // solid geometry. Universal GPU win: on immediate-mode GPUs (NVIDIA/AMD) the
+  // already-written terrain depth early-Z-kills foliage fragments hidden behind
+  // it; on TBDR (Apple/mobile) discard-draws stop stalling the opaque HSR stream
+  // (vendor guidance: opaque → alpha-test → blended).
+  renderOrder?: number,
 };
 
-type PageState = { batch: THREE.BatchedMesh, cursor: number, idxCursor: number, liveV: number, liveI: number, freedV: number, inst: number };
+type PageState = { batch: CulledBatchedMesh, cursor: number, idxCursor: number, liveV: number, liveI: number, freedV: number, inst: number };
+
+// ---------------------------------------------------------------------------
+//  CulledBatchedMesh — r184 BatchedMesh with the per-frame cull loop rebuilt
+//  around CACHED LOCAL-SPACE bounding spheres.
+//
+//  Stock r184 onBeforeRender, per VISIBLE INSTANCE per PASS per FRAME, does:
+//  getMatrixAt (16-float texture-array read → Matrix4) + getBoundingSphereAt +
+//  Sphere.applyMatrix4 (matrix·center + getMaxScaleOnAxis = 3 sqrt) + a 6-plane
+//  frustum test. Our instances NEVER MOVE after add (chunks/LOD tiles are
+//  static), so the transformed sphere is a constant — BatchPool computes it
+//  once at add() into a flat Float32Array and the cull loop here is just
+//  6 plane dots per instance. (three issue #28776 tracks this exact hotspot.)
+//
+//  The loop also COUNTING-SORTS surviving instances near→far (64-block distance
+//  buckets, O(n)) before filling the multi-draw list: on immediate-mode GPUs
+//  (NVIDIA/AMD — no TBDR hidden-surface removal) intra-page draw order is
+//  otherwise ADD order, i.e. uncontrolled overdraw inside each page; emitting
+//  buckets front-to-back lets early-Z reject occluded fragments. Order within
+//  a draw call is free to change (opaque/cutout depth-tested content) — the
+//  IMAGE is identical, matching the existing renderer.sortObjects rationale.
+//
+//  Relies on r184 BatchedMesh privates (_instanceInfo/_geometryInfo/_multiDraw*/
+//  _indirectTexture) — same internals-coupling tier as setQuantizedBounds and
+//  the BatchPool allocator notes above. Falls back to stock behaviour for
+//  paths we never use (sortObjects pages, wireframe, ArrayCamera/XR).
+// ---------------------------------------------------------------------------
+const _cullFrustum = new THREE.Frustum();
+const _cullMatrix = new THREE.Matrix4();
+const _camLocal = new THREE.Vector3();
+const _fwdLocal = new THREE.Vector3();
+const BUCKETS = 64;
+const INV_BUCKET = 1 / 64;            // 64-block buckets → orders out to ~4km
+const _bucketCount = new Int32Array(BUCKETS + 1);
+
+type R184InstanceInfo = { visible: boolean, active: boolean, geometryIndex: number };
+type R184GeometryInfo = { start: number, count: number };
+type R184Privates = {
+  _instanceInfo: R184InstanceInfo[],
+  _geometryInfo: R184GeometryInfo[],
+  _multiDrawStarts: Int32Array,
+  _multiDrawCounts: Int32Array,
+  _multiDrawCount: number,
+  _indirectTexture: THREE.DataTexture,
+  _visibilityChanged: boolean,
+};
+
+class CulledBatchedMesh extends THREE.BatchedMesh {
+  // xyzr per instance, LOCAL space (the frame instance matrices live in — the
+  // stock loop builds its frustum via proj·view·matrixWorld, mirrored here).
+  private sphereData: Float32Array;
+  // counting-sort scratch (per page — sized to the page's instance capacity)
+  private order: Int32Array;
+  private bucketOf: Uint8Array;
+
+  constructor(maxInstanceCount: number, maxVertexCount: number, maxIndexCount: number, material: THREE.Material) {
+    super(maxInstanceCount, maxVertexCount, maxIndexCount, material);
+    this.sphereData = new Float32Array(maxInstanceCount * 4);
+    this.order = new Int32Array(maxInstanceCount);
+    this.bucketOf = new Uint8Array(maxInstanceCount);
+  }
+
+  setSphereAt(instId: number, cx: number, cy: number, cz: number, r: number) {
+    const o = instId * 4, s = this.sphereData;
+    s[o] = cx; s[o + 1] = cy; s[o + 2] = cz; s[o + 3] = r;
+  }
+
+  override onBeforeRender(
+    renderer: THREE.WebGLRenderer, scene: THREE.Scene, camera: THREE.Camera,
+    geometry: THREE.BufferGeometry, material: THREE.Material, group: THREE.Group,
+  ): void {
+    // Paths we never hit in BatchPool usage → stock implementation.
+    const mat = material as THREE.Material & { wireframe?: boolean };
+    if (this.sortObjects || mat.wireframe || (camera as THREE.Camera & { isArrayCamera?: boolean }).isArrayCamera) {
+      super.onBeforeRender(renderer, scene, camera, geometry, material, group);
+      return;
+    }
+    const priv = this as unknown as R184Privates;
+    const instanceInfo = priv._instanceInfo;
+    const geometryInfoList = priv._geometryInfo;
+    const multiDrawStarts = priv._multiDrawStarts;
+    const multiDrawCounts = priv._multiDrawCounts;
+    const indirectArray = priv._indirectTexture.image.data as unknown as Uint32Array;
+    const index = geometry.getIndex();
+    const bytesPerElement = index === null ? 1 : index.array.BYTES_PER_ELEMENT;
+    const cull = this.perObjectFrustumCulled;
+
+    if (cull) {
+      _cullMatrix
+        .multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+        .multiply(this.matrixWorld);
+      _cullFrustum.setFromProjectionMatrix(_cullMatrix, (camera as THREE.PerspectiveCamera).coordinateSystem,
+        (camera as THREE.Camera & { reversedDepth?: boolean }).reversedDepth);
+    }
+    // camera position + forward in the page's local frame (for distance buckets)
+    _cullMatrix.copy(this.matrixWorld).invert();
+    _camLocal.setFromMatrixPosition(camera.matrixWorld).applyMatrix4(_cullMatrix);
+    _fwdLocal.set(0, 0, -1).transformDirection(camera.matrixWorld).transformDirection(_cullMatrix);
+
+    const planes = _cullFrustum.planes;
+    const spheres = this.sphereData;
+    const order = this.order, bucketOf = this.bucketOf;
+    _bucketCount.fill(0);
+    let survivors = 0;
+
+    for (let i = 0, l = instanceInfo.length; i < l; i++) {
+      const info = instanceInfo[i];
+      if (!info.visible || !info.active) continue;
+      const o = i * 4;
+      const cx = spheres[o], cy = spheres[o + 1], cz = spheres[o + 2], r = spheres[o + 3];
+      if (cull) {
+        let inside = true;
+        for (let p = 0; p < 6; p++) {
+          const pl = planes[p];
+          if (pl.normal.x * cx + pl.normal.y * cy + pl.normal.z * cz + pl.constant < -r) { inside = false; break; }
+        }
+        if (!inside) continue;
+      }
+      const z = (cx - _camLocal.x) * _fwdLocal.x + (cy - _camLocal.y) * _fwdLocal.y + (cz - _camLocal.z) * _fwdLocal.z;
+      let b = (z * INV_BUCKET) | 0;
+      if (b < 0) b = 0; else if (b >= BUCKETS) b = BUCKETS - 1;
+      bucketOf[survivors] = b;
+      order[survivors] = i;
+      _bucketCount[b + 1]++;
+      survivors++;
+    }
+    // prefix-sum → bucket write cursors, then scatter the multi-draw list near→far
+    for (let b = 0; b < BUCKETS; b++) _bucketCount[b + 1] += _bucketCount[b];
+    for (let k = 0; k < survivors; k++) {
+      const slot = _bucketCount[bucketOf[k]]++;
+      const i = order[k];
+      const gi = geometryInfoList[instanceInfo[i].geometryIndex];
+      multiDrawStarts[slot] = gi.start * bytesPerElement;
+      multiDrawCounts[slot] = gi.count;
+      indirectArray[slot] = i;
+    }
+
+    priv._indirectTexture.needsUpdate = true;
+    priv._multiDrawCount = survivors;
+    priv._visibilityChanged = false;
+  }
+
+  override onBeforeShadow(
+    renderer: THREE.WebGLRenderer, _scene: THREE.Scene, _camera: THREE.Camera, shadowCamera: THREE.Camera,
+    geometry: THREE.BufferGeometry, depthMaterial: THREE.Material, group: THREE.Group,
+  ): void {
+    this.onBeforeRender(renderer, null as unknown as THREE.Scene, shadowCamera, geometry, depthMaterial, group);
+  }
+}
 
 export class BatchPool {
   private pages: PageState[] = [];
@@ -50,7 +204,8 @@ export class BatchPool {
 
   private newPage(): PageState {
     const o = this.opts;
-    const batch = new THREE.BatchedMesh(o.pageInstances, o.pageVerts, (o.pageVerts * 1.6) | 0, this.material);
+    const batch = new CulledBatchedMesh(o.pageInstances, o.pageVerts, (o.pageVerts * 1.6) | 0, this.material);
+    batch.renderOrder = o.renderOrder ?? 0;   // cutout pools draw after all solid geometry
     batch.castShadow = o.castShadow;
     batch.receiveShadow = true;          // matches the chunk meshes sharing this material (program-key uniformity)
     batch.perObjectFrustumCulled = true; // per-instance culling (colour + shadow passes)
@@ -131,6 +286,12 @@ export class BatchPool {
     // carries (offset − 8 per axis). Shadows/raycast/culling all decode free.
     _m.makeScale(QK, QK, QK).setPosition(x - 8, y - 8, z - 8);
     p.batch.setMatrixAt(instId, _m);
+    // Instance-local cull sphere, cached ONCE (instances never move): the
+    // geometry sphere from setQuantizedBounds (normalized units) through the
+    // matrix above — exactly what stock BatchedMesh recomputes every frame.
+    const bs = g.boundingSphere!;
+    p.batch.setSphereAt(instId,
+      bs.center.x * QK + (x - 8), bs.center.y * QK + (y - 8), bs.center.z * QK + (z - 8), bs.radius * QK);
     g.dispose();
     p.cursor += verts; p.idxCursor += idx;
     p.liveV += verts; p.liveI += idx;

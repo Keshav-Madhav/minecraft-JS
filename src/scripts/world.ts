@@ -162,10 +162,14 @@ export class World extends Three.Group {
   // LOD render batches: every tile's terrain/canopy lives in a BatchedMesh page
   // (one draw call per page, per-instance frustum culling inside) — at high view
   // distances this collapses ~1000 LOD draws into ~4-8.
+  // Cutout (alpha-tested) pools carry renderOrder 1 → they draw AFTER all solid
+  // geometry: early-Z kills foliage fragments behind terrain on NVIDIA/AMD, and
+  // the discard-draws stop interrupting the opaque HSR stream on Apple/TBDR.
+  // Depth-tested either way → pixel-identical image.
   private lodTerrainPool = new BatchPool(this.lodGroup, blockArrayMaterial,
     { pageVerts: 2_000_000, pageInstances: 1024, castShadow: false, colorAttr: 'tintColor' });
   private lodCanopyPool = new BatchPool(this.lodGroup, leafArrayMaterial,
-    { pageVerts: 1_000_000, pageInstances: 1024, castShadow: false, colorAttr: 'tintColor' });
+    { pageVerts: 1_000_000, pageInstances: 1024, castShadow: false, colorAttr: 'tintColor', renderOrder: 1 });
 
   // Chunk render batches (chunks beyond NEAR_BATCH_KEEP). Casters/leaves cast
   // shadows like their individual counterparts; plants follow the ultra
@@ -173,9 +177,9 @@ export class World extends Three.Group {
   private casterPool = new BatchPool(this, blockArrayMaterial,
     { pageVerts: 1_500_000, pageInstances: 2048, castShadow: true, colorAttr: 'tintColor' });
   private leafPool = new BatchPool(this, leafArrayMaterial,
-    { pageVerts: 1_000_000, pageInstances: 2048, castShadow: true, colorAttr: 'tintColor' });
+    { pageVerts: 1_000_000, pageInstances: 2048, castShadow: true, colorAttr: 'tintColor', renderOrder: 1 });
   private plantPool = new BatchPool(this, plantMaterial,
-    { pageVerts: 750_000, pageInstances: 2048, castShadow: false, colorAttr: 'plantColor' });
+    { pageVerts: 750_000, pageInstances: 2048, castShadow: false, colorAttr: 'plantColor', renderOrder: 1 });
   // chunkKey → batch handles for chunks rendering through the pools
   private batched = new Map<string, { caster: BatchHandle | null, leaf: BatchHandle | null, plant: BatchHandle | null }>();
 
@@ -225,8 +229,17 @@ export class World extends Three.Group {
   private lastPlayerChunkX = NaN;
   private lastPlayerChunkZ = NaN;
   private lastDrawDistance = NaN;
-  private visibleKeys = new Set<string>();
+  // NUMERIC keys (World.numKey) — the old Set<string> allocated a key string per
+  // visible cell per rescan (up to ~7k at dd64, and rescans fire on every
+  // chunk-cross AND ~8.5° of yaw — real GC pressure while mouse-looking).
+  private visibleKeys = new Set<number>();
   private removalPending = false;
+  // getVisibleChunks scratch: coord objects pooled in `_visBacking` (grow-only)
+  // and re-listed into `_visList` per rescan — zero per-rescan allocation. The
+  // returned list (and `pending`, filtered from it) is only consumed until the
+  // NEXT rescan, which is also the only thing that overwrites the pool.
+  private _visBacking: chunkCoords[] = [];
+  private _visList: chunkCoords[] = [];
 
   // VIEW-FRUSTUM STREAMING: keep only chunks in/near the camera frustum RESIDENT to
   // bound RAM (chunks behind/beside the view UNLOAD; they re-stream on turn). A "fat"
@@ -475,10 +488,11 @@ export class World extends Three.Group {
       this.lastViewYaw = viewYaw;
 
       const visibleChunks = this.getVisibleChunks(player);
-      this.visibleKeys = new Set(visibleChunks.map(({ x, z }) => this.chunkKey(x, z)));
+      this.visibleKeys.clear();
+      for (const vc of visibleChunks) this.visibleKeys.add(World.numKey(vc.x, vc.z));
       this.removalPending = this.removeUnusedChunks();
       this.pending = visibleChunks
-        .filter(({ x, z }) => !this.chunkMap.has(this.chunkKey(x, z)))
+        .filter(({ x, z }) => !this.chunkNumMap.has(World.numKey(x, z)))
         .sort((a, b) => ((a.x - c.x) ** 2 + (a.z - c.z) ** 2) - ((b.x - c.x) ** 2 + (b.z - c.z) ** 2));
       // Player crossed a chunk boundary → re-evaluate which chunks show foliage
       // and swap render representations across the near-batch boundary.
@@ -712,9 +726,9 @@ export class World extends Three.Group {
     } else {
       scan: for (let cx = t.tx * T; cx < t.tx * T + T; cx++) {
         for (let cz = t.tz * T; cz < t.tz * T + T; cz++) {
-          const key = this.chunkKey(cx, cz);
-          if (this.chunkMap.get(key)?.loaded) { anyLoaded = true; continue; }
-          const offscreen = Math.max(Math.abs(cx - pcx), Math.abs(cz - pcz)) <= dd && !this.visibleKeys.has(key);
+          const nk = World.numKey(cx, cz);   // numeric key: no string alloc per scanned cell
+          if (this.chunkNumMap.get(nk)?.loaded) { anyLoaded = true; continue; }
+          const offscreen = Math.max(Math.abs(cx - pcx), Math.abs(cz - pcz)) <= dd && !this.visibleKeys.has(nk);
           if (!offscreen) { hide = false; break scan; }   // someone can see this uncovered spot
         }
       }
@@ -966,6 +980,7 @@ export class World extends Three.Group {
       plant: plants && plants.indices.length ? this.plantPool.add(plants, px, 0, pz) : null,
     };
     this.batched.set(key, entry);
+    chunk.batchEntry = entry;   // mirrored on the chunk for allocation-free hot-path reads
     chunk.loaded = true;   // render representation exists (batched); physics may stand on it
   }
 
@@ -975,6 +990,7 @@ export class World extends Three.Group {
     const { x, z } = chunk.userData as chunkCoords;
     const key = this.chunkKey(x, z);
     const e = this.batched.get(key);
+    chunk.batchEntry = null;
     if (!e) return;
     this.casterPool.remove(e.caster);
     this.leafPool.remove(e.leaf);
@@ -1045,7 +1061,7 @@ export class World extends Three.Group {
         if (!chunk || !chunk.loaded) continue;
         const cheb = Math.max(Math.abs(dx), Math.abs(dz));
         const key = this.chunkKey(pcx + dx, pcz + dz);
-        const isBatched = this.batched.has(key);
+        const isBatched = chunk.batchEntry !== null;
         if (cheb <= K && isBatched) {
           // demote: rebuild individual meshes OFF-THREAD (a worker 'remesh' of
           // the existing data — running the full mesher on the main thread for
@@ -1096,10 +1112,12 @@ export class World extends Three.Group {
   // Toggle a chunk's plant mesh by distance from the player's chunk. Plants cast
   // no shadow, so hiding them never affects the shadow pass (unlike terrain).
   private applyFoliageVisibility(chunk: WorldChunk) {
+    // Runs for EVERY resident chunk on EVERY rescan (refreshFoliageVisibility) —
+    // chunk.batchEntry keeps it free of the old per-chunk key-string + Map.get.
     const { x, z } = chunk.userData as chunkCoords;
     const cheb = Math.max(Math.abs(x - this.lastPlayerChunkX), Math.abs(z - this.lastPlayerChunkZ));
     const vis = this.foliageEnabled && cheb <= this.foliageDistance;
-    const e = this.batched.get(this.chunkKey(x, z));
+    const e = chunk.batchEntry;
     if (e) { this.plantPool.setVisible(e.plant, vis); return; }
     const mesh = chunk.plantMesh;
     if (mesh) mesh.visible = vis;
@@ -1131,7 +1149,10 @@ export class World extends Three.Group {
   forceRescan() { this.lastPlayerChunkX = NaN; this.lastViewYaw = 999; }
 
   getVisibleChunks(player: Player) {
-    const visibleChunks: chunkCoords[] = [];
+    // Pooled output (see _visBacking/_visList): valid until the next rescan.
+    const visibleChunks = this._visList;
+    visibleChunks.length = 0;
+    let poolN = 0;
     const coords = this.worldToChunkCoords(player.position.x, player.position.y, player.position.z);
     const { x, z } = coords.chunk;
     const dd = this.drawDistance;
@@ -1156,7 +1177,11 @@ export class World extends Three.Group {
           this._chunkBox.max.set(i * W + W, H, j * W + W);
           if (!this._frustum.intersectsBox(this._chunkBox)) continue;
         }
-        visibleChunks.push({ x: i, z: j });
+        let o = this._visBacking[poolN];
+        if (!o) { o = { x: 0, z: 0 }; this._visBacking[poolN] = o; }
+        o.x = i; o.z = j;
+        visibleChunks.push(o);
+        poolN++;
       }
     }
 
@@ -1172,7 +1197,8 @@ export class World extends Three.Group {
     let removed = 0;
     for (const [key, chunk] of this.chunkMap) {
       if (removed >= this.maxRemovalsPerFrame) break;
-      if (!this.visibleKeys.has(key)) {
+      const cc = chunk.userData as chunkCoords;
+      if (!this.visibleKeys.has(World.numKey(cc.x, cc.z))) {
         this.meshQueue.delete(chunk);
         this.unbatchChunk(chunk);        // free its batch-page slice (if batched)
         this.noteChunkOverTile(chunk);   // LOD tile over it may need to show again
@@ -1328,6 +1354,8 @@ export class World extends Three.Group {
     this.inflightWorker.clear(); // their (now version-stale) replies won't reach processQueues
     this.workerLoad.clear(); // …so their freeWorker() never fires — drop the stranded load with them, else least-loaded dispatch skews across regenerates
     this.lastPlayerChunkX = NaN; // force a visibility rescan next update()
+    this.demotionsDeferred = false; // stale deferral from the OLD world must not gate the new one's first demotions
+    this.lodWorkerRetryTick = 0;
     this.sampler = createWorldSampler(this.params, this.chunkSize);
     this.lastGenSignature = this.genSignature();
     // Push fresh config (and reset the worker's chunk cache) for this version.

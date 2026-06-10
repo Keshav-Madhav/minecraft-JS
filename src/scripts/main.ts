@@ -10,7 +10,7 @@ import { Clouds } from './clouds';
 import { WorldMap } from './map';
 import { Spectator } from './spectator';
 import { biomeTint, biomeWaterHex } from './chunkGen';
-import { updatePlantWind, toggleReferenceTextures, updateCubeUniforms, setFoliageShadows, registerFogShader, updateFogCamera, CYL_FOG_FRAGMENT } from './blockArrayMaterial';
+import { updatePlantWind, toggleReferenceTextures, updateCubeUniforms, setFoliageShadows, setTextureAnisotropy, registerFogShader, updateFogCamera, CYL_FOG_FRAGMENT } from './blockArrayMaterial';
 import { LightManager } from './lightManager';
 import { PostFX } from './ultraGraphics';
 import { Net } from './net';
@@ -297,14 +297,25 @@ const _wcDeep = new THREE.Color(), _wcShallow = new THREE.Color(), _wcOut = new 
 const WC_STRIDE = 2;
 const WC_N = (WATER_SEG / WC_STRIDE) + 1;            // 25 coarse points per side
 const _waterCoarse = new Float32Array(WC_N * WC_N * 3);
-function updateWaterColors(cx: number, cz: number) {
+// TIME-SLICED recolour job: even the coarse grid is 625 sampler() calls = a
+// ~1-1.5ms synchronous spike on every 24-block snap-move. The grid now samples
+// WC_ROWS_PER_FRAME coarse rows per frame (~0.3ms) and the bilinear fill +
+// GPU upload land once at job end — water colour is a smooth field, so a
+// ≤4-frame colour lag behind the (already 24-block-quantized) plane position
+// is imperceptible. A snap mid-job restarts the job at the new centre.
+const WC_ROWS_PER_FRAME = 7;
+let _wcRow = -1, _wcCx = 0, _wcCz = 0, _wcSpan = 0;   // row < 0 → no job
+function startWaterRecolor(cx: number, cz: number) {
+  _wcCx = cx; _wcCz = cz; _wcSpan = waterSpanCur; _wcRow = 0;
+}
+function stepWaterRecolor() {
+  if (_wcRow < 0) return;
   const seaY = world.params.terrain.waterOffset;
-  const col = waterGeo.attributes.color.array as Float32Array;
-  const n = WATER_SEG + 1, span = waterSpanCur, cg = _waterCoarse;
-  // 1) sample the coarse grid
-  for (let cj = 0; cj < WC_N; cj++) for (let ci = 0; ci < WC_N; ci++) {
+  const cg = _waterCoarse;
+  const rowEnd = Math.min(WC_N, _wcRow + WC_ROWS_PER_FRAME);
+  for (let cj = _wcRow; cj < rowEnd; cj++) for (let ci = 0; ci < WC_N; ci++) {
     const i = ci * WC_STRIDE, j = cj * WC_STRIDE;
-    const wx = cx + (i / WATER_SEG - 0.5) * span, wz = cz + (j / WATER_SEG - 0.5) * span;
+    const wx = _wcCx + (i / WATER_SEG - 0.5) * _wcSpan, wz = _wcCz + (j / WATER_SEG - 0.5) * _wcSpan;
     const s = world.sampler(Math.floor(wx), Math.floor(wz));
     _wcDeep.setHex(biomeWaterHex(s.biome));
     _wcShallow.copy(_wcDeep).lerp(_W_SHALLOW, 0.55);
@@ -313,7 +324,12 @@ function updateWaterColors(cx: number, cz: number) {
     const k = (cj * WC_N + ci) * 3;
     cg[k] = _wcOut.r; cg[k + 1] = _wcOut.g; cg[k + 2] = _wcOut.b;
   }
-  // 2) bilinear-interpolate the coarse colours into every vertex
+  _wcRow = rowEnd;
+  if (_wcRow < WC_N) return;
+  _wcRow = -1;
+  // job complete: bilinear-interpolate the coarse colours into every vertex
+  const col = waterGeo.attributes.color.array as Float32Array;
+  const n = WATER_SEG + 1;
   for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
     const fi = i / WC_STRIDE, fj = j / WC_STRIDE;
     const ci0 = Math.min(WC_N - 2, fi | 0), cj0 = Math.min(WC_N - 2, fj | 0);
@@ -758,19 +774,23 @@ function applyQualityPreset(p: QualityPreset) {
     applyUnifiedViewDistance(32); world.setFoliage(true, 5);
     applyShadowQuality('off'); lightInterval = 4; lightManager.setEnabled(false);
     settings.resolutionScale = 0.85; clouds.visible = false;
+    setTextureAnisotropy(2);   // grazing-angle texture taps — a real fragment lever on weak GPUs
   } else if (p === 'balanced') {
     applyUnifiedViewDistance(64); world.setFoliage(true, 10);
     applyShadowQuality('medium'); lightInterval = 2; lightManager.setEnabled(true);
     settings.resolutionScale = 1; clouds.visible = true;
+    setTextureAnisotropy(4);   // half the worst-case taps of 8×; near-identical on 16×16 pixel art
   } else if (p === 'fancy') {
     applyUnifiedViewDistance(128); world.setFoliage(true, 20);
     applyShadowQuality('high'); lightInterval = 1; lightManager.setEnabled(true);
     settings.resolutionScale = 1; clouds.visible = true;
+    setTextureAnisotropy(8);
   } else if (p === 'ultra') {
     // 48-chunk full-detail ring under a ~3km LOD horizon, 8192 soft shadows.
     applyUnifiedViewDistance(192); world.setFoliage(true, 32);
     applyShadowQuality('ultra'); lightInterval = 1; lightManager.setEnabled(true);
     settings.resolutionScale = 1; clouds.visible = true;
+    setTextureAnisotropy(8);
   } else if (p === 'max') {
     // MAX: every slider at its limit — 64 real chunks + 4km LOD horizon, 8K soft
     // shadows, far foliage, post-FX pipeline, 2× supersampling. The UI shows a
@@ -778,6 +798,7 @@ function applyQualityPreset(p: QualityPreset) {
     applyUnifiedViewDistance(256); world.setFoliage(true, 64);
     applyShadowQuality('ultra'); lightInterval = 1; lightManager.setEnabled(true);
     settings.resolutionScale = 2; clouds.visible = true;
+    setTextureAnisotropy(8);
     setUltraGraphics(true);
   }
   applyResolution();
@@ -1140,8 +1161,9 @@ function renderFrame(currentTime: number) {
     waterMesh.visible = !(localSurf > seaY && camP.y < localSurf - 2);
     if (wsx !== waterSnapX || wsz !== waterSnapZ) {
       waterSnapX = wsx; waterSnapZ = wsz;
-      updateWaterColors(wsx, wsz);
+      startWaterRecolor(wsx, wsz);   // time-sliced — see stepWaterRecolor
     }
+    stepWaterRecolor();
 
     // Caustics ripple + the live sky colour for the water reflection (cheap; the
     // shaders gate the effects off when ultra is disabled).

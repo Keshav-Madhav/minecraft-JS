@@ -5,7 +5,7 @@ import { ChunkParams, ChunkSize, blockIndex, generateChunkData } from './chunkGe
 import { ResourceGenInfo, BLOCK_IDS } from './blockTypes';
 import { blockArrayMaterial, leafArrayMaterial, plantMaterial, cutoutDepthMaterial, getFoliageShadows } from './blockArrayMaterial';
 import { buildChunkGeometry, buildChunkMapTile, scanEmitters, GeometryArrays } from './chunkMesh';
-import { setQuantizedBounds } from './batchPool';
+import { setQuantizedBounds, BatchHandle } from './batchPool';
 import { decodeColumnRLE } from './chunkRle';
 
 // Returns the block id at a world position, or 0 (air) when unknown. Used so a
@@ -41,6 +41,11 @@ export class WorldChunk extends THREE.Group {
   // foliage cheaply and toggle ultra cutout shadows on them.
   plantMesh: THREE.Mesh | null = null;
   leafMesh: THREE.Mesh | null = null;
+  // Batch handles when this chunk renders through the World's BatchPools —
+  // stored ON the chunk so per-rescan hot loops (foliage visibility over every
+  // resident chunk) read it directly instead of a string-key Map lookup.
+  // Owned by World.batchChunk/unbatchChunk; null = individual meshes.
+  batchEntry: { caster: BatchHandle | null, leaf: BatchHandle | null, plant: BatchHandle | null } | null = null;
 
   constructor(size: ChunkSize, params: ChunkParams, dataStore: DataStore) {
     super();
@@ -192,6 +197,9 @@ export class WorldChunk extends THREE.Group {
     mesh.castShadow = castShadow;
     mesh.receiveShadow = true;
     mesh.userData.chunkGeometry = true;
+    // Cutout (alpha-tested) meshes draw AFTER all solid geometry (matches the
+    // leaf/plant BatchPool pages): early-Z / TBDR-HSR overdraw win, same image.
+    if (material !== blockArrayMaterial) mesh.renderOrder = 1;
     // Decode the quantized positions via the matrix: local = norm·(65535/64) − 8.
     // Every render path (colour, three's built-in shadow depth, our cutout depth,
     // raycasting) uses the matrix, so they all decode for free.
@@ -302,5 +310,6 @@ export class WorldChunk extends THREE.Group {
     this.rle = null;
     this.mapTile = null;
     this.mapTileCanvas = null;
+    this.batchEntry = null;
   }
 }

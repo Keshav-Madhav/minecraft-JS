@@ -325,6 +325,18 @@ function createArrayTexture(): THREE.DataArrayTexture {
 
 const arrayTexture = createArrayTexture();
 
+// Anisotropy is a per-fragment texture-tap multiplier (8× ≈ up to 8 taps on
+// grazing-angle ground — exactly where the fragment-bound presets hurt; weaker
+// GPUs pay 5-20% for 8-16× AF in texture-heavy scenes). Quality presets tier it:
+// 2× on low/balanced (16×16 pixel art barely shows the difference), 8× on
+// fancy+. Changing it requires a texture re-upload (sampler params apply at
+// upload) — preset-change-time only, ~160KB, negligible.
+export function setTextureAnisotropy(n: number) {
+  for (const t of [arrayTexture, refArrayTexture]) {
+    if (t && t.anisotropy !== n) { t.anisotropy = n; t.needsUpdate = true; }
+  }
+}
+
 // Shared material for every chunk's opaque geometry. A standard MeshLambertMaterial
 // (so it keeps three's lighting/shadows) is patched to sample the array texture by
 // a per-vertex layer index, using textureGrad with the un-fract'd derivatives so
