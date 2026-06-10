@@ -9,8 +9,6 @@ const screeCenter=new Three.Vector2();
 // the player drops onto the surface instead of inside a mountain.
 const SPAWN = new Three.Vector3(0, 340, 0);
 // Scratch objects reused every frame to avoid per-frame allocations.
-const _hitInside = new Three.Vector3();
-const _hitOutside = new Three.Vector3();
 const _selected = new Three.Vector3();
 const _targeted = new Three.Vector3();
 
@@ -173,34 +171,49 @@ export class Player {
 
   updateRayCast(world: World) {
     this.raycaster.setFromCamera(screeCenter, this.camera);
-    // The pick ray is only 4 units long, so only the player's own chunk and its
-    // immediate neighbours can be hit — intersecting just those avoids walking
-    // every chunk mesh in the world each frame.
-    const candidates = world.getNearbyChunks(this.camera.position, 1);
-    const intersects = this.raycaster.intersectObjects(candidates, true);
-
-    if(intersects.length > 0){
-      const intersection = intersects[0];
-      const dir = this.raycaster.ray.direction; // normalized view direction
-
-      // The hit point sits on the boundary between the targeted solid block and
-      // the empty cell in front of it. Nudging a hair along the view direction
-      // lands inside the block we're looking at; nudging back lands in the
-      // empty neighbour cell where a new block would be placed. Blocks are
-      // centred on integer coordinates, so rounding gives the cell.
-      if(this.activeBlockId === blocks.air.id){
-        _hitInside.copy(intersection.point).addScaledVector(dir, 0.01);
-        this.selectedCoords = _selected.set(Math.round(_hitInside.x), Math.round(_hitInside.y), Math.round(_hitInside.z));
-      } else {
-        _hitOutside.copy(intersection.point).addScaledVector(dir, -0.01);
-        this.selectedCoords = _selected.set(Math.round(_hitOutside.x), Math.round(_hitOutside.y), Math.round(_hitOutside.z));
+    // VOXEL DDA (Amanatides & Woo) over world.getBlockId instead of
+    // THREE.Raycaster.intersectObjects: three has no BVH, so the old path
+    // brute-forced EVERY triangle of every nearby chunk mesh (the 320-tall
+    // chunks' bounding volumes always contain a 4-unit ray) — thousands of
+    // ray-triangle tests per frame for a result the block grid answers in
+    // ≤ ~14 allocation-free array lookups. Blocks are centred on integer
+    // coords, so cell (i,j,k) spans [i−0.5, i+0.5) — boundaries at half-integers.
+    const o = this.raycaster.ray.origin, d = this.raycaster.ray.direction;
+    const air = blocks.air.id;
+    let ix = Math.round(o.x), iy = Math.round(o.y), iz = Math.round(o.z);
+    // Cell the camera is inside counts as a hit (matches the old mesh raycast,
+    // which could hit geometry inside the camera's own cell — e.g. tall grass).
+    let hit = world.getBlockId(ix, iy, iz) !== air;
+    let px = ix, py = iy, pz = iz;   // cell the ray was in BEFORE entering the hit cell
+    if (!hit) {
+      const stepX = d.x >= 0 ? 1 : -1, stepY = d.y >= 0 ? 1 : -1, stepZ = d.z >= 0 ? 1 : -1;
+      const tDeltaX = d.x !== 0 ? Math.abs(1 / d.x) : Infinity;
+      const tDeltaY = d.y !== 0 ? Math.abs(1 / d.y) : Infinity;
+      const tDeltaZ = d.z !== 0 ? Math.abs(1 / d.z) : Infinity;
+      let tMaxX = d.x !== 0 ? (ix + 0.5 * stepX - o.x) / d.x : Infinity;
+      let tMaxY = d.y !== 0 ? (iy + 0.5 * stepY - o.y) / d.y : Infinity;
+      let tMaxZ = d.z !== 0 ? (iz + 0.5 * stepZ - o.z) / d.z : Infinity;
+      const tFar = this.raycaster.far;
+      for (;;) {
+        let t: number;
+        px = ix; py = iy; pz = iz;
+        if (tMaxX <= tMaxY && tMaxX <= tMaxZ) { t = tMaxX; tMaxX += tDeltaX; ix += stepX; }
+        else if (tMaxY <= tMaxZ) { t = tMaxY; tMaxY += tDeltaY; iy += stepY; }
+        else { t = tMaxZ; tMaxZ += tDeltaZ; iz += stepZ; }
+        if (t > tFar) break;
+        if (world.getBlockId(ix, iy, iz) !== air) { hit = true; break; }
       }
+    }
 
-      // The SOLID block actually under the crosshair (nudge INTO the hit) — used
-      // for right-click "use" (open a door/trapdoor) regardless of held block.
-      _targeted.copy(intersection.point).addScaledVector(dir, 0.01);
-      this.targetedBlock = _targeted.set(Math.round(_targeted.x), Math.round(_targeted.y), Math.round(_targeted.z));
-
+    if (hit) {
+      // Breaking targets the hit cell; placing targets the cell the ray came
+      // from (the empty neighbour across the entered face) — same cells the old
+      // ±0.01-nudge-and-round produced from the mesh intersection point.
+      if (this.activeBlockId === air) this.selectedCoords = _selected.set(ix, iy, iz);
+      else this.selectedCoords = _selected.set(px, py, pz);
+      // The SOLID block actually under the crosshair — used for right-click
+      // "use" (open a door/trapdoor) regardless of held block.
+      this.targetedBlock = _targeted.set(ix, iy, iz);
       this.selectionHelper.position.copy(this.selectedCoords);
       this.selectionHelper.visible = true;
     } else {

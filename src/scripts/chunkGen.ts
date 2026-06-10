@@ -1,4 +1,7 @@
-import { SimplexNoise } from 'three/examples/jsm/math/SimplexNoise.js';
+// Bit-identical optimized port of three's SimplexNoise (see fastSimplex.ts) —
+// worldgen runs ~50-100k noise evals per chunk, and the port also keeps the
+// three/examples module out of the worker bundle.
+import { SimplexNoise } from './fastSimplex';
 import { RNG } from './rng';
 import { BLOCK_IDS, ResourceGenInfo, isPlant } from './blockTypes';
 
@@ -73,8 +76,8 @@ export function generateChunkData(
   const biomeMap = new Uint8Array(size.width * size.width);
   const surfaceMap = new Uint8Array(size.width * size.width);
 
-  generateTerrain(simplex, params, size, worldX, worldZ, set, heightMap, biomeMap, outTint, surfaceMap, opts?.surfaceOnly);
-  generateResources(rng, size, worldX, worldZ, resources, get, set, biomeMap);
+  generateTerrain(simplex, params, size, worldX, worldZ, data, heightMap, biomeMap, outTint, surfaceMap, opts?.surfaceOnly);
+  generateResources(rng, size, worldX, worldZ, resources, data, biomeMap);
 
   // Features (trees + ground decorations). generateFeatures re-seeds its own
   // per-WORLD-CELL RNG internally (so placement is identical in every chunk that a
@@ -1152,8 +1155,11 @@ export const LOD_CANOPY: ReadonlyArray<LodCanopy | null> = BIOMES.map((b) => {
 // ===========================================================================
 const ORE_STEP = 2;
 const isHostRock = (id: number) => id === BLOCK_IDS.stone || id === BLOCK_IDS.deepslate;
-function generateResources(rng: RNG, size: ChunkSize, worldX: number, worldZ: number, resources: ResourceGenInfo[], get: GetFn, set: SetFn, biomeMap: Uint8Array) {
-  const W = size.width;
+function generateResources(rng: RNG, size: ChunkSize, worldX: number, worldZ: number, resources: ResourceGenInfo[], data: Uint8Array, biomeMap: Uint8Array) {
+  const W = size.width, H = size.height;
+  // Direct data[] access (the get/set closures + their bounds checks were ~5% of
+  // chunk gen): x/z stay in-bounds by loop construction (ORE_STEP=2 from 0 keeps
+  // x+dx ≤ W-1); only y+dy can step past the window top — guarded explicitly.
   resources.forEach(resource => {
     const simplex = new SimplexNoise(rng);
     const y0 = Math.max(0, resource.minY ?? 0);
@@ -1163,8 +1169,9 @@ function generateResources(rng: RNG, size: ChunkSize, worldX: number, worldZ: nu
     for (let x = 0; x < W; x += ORE_STEP)
       for (let z = 0; z < W; z += ORE_STEP) {
         if (mountainOnly && biomeMap[x * W + z] !== BIOME.mountains) continue;
+        const colBase = x * H * W + z;
         for (let y = y0; y <= y1; y += ORE_STEP) {
-          if (!isHostRock(get(x, y, z))) continue;
+          if (!isHostRock(data[colBase + y * W])) continue;
           // Vertical TRIANGLE: lowest threshold (most ore) at the window midpoint,
           // rising to the edges → each ore clusters at its characteristic depth.
           const tent = 1 - Math.abs(y - peak) / halfSpan;
@@ -1172,12 +1179,16 @@ function generateResources(rng: RNG, size: ChunkSize, worldX: number, worldZ: nu
           const val = simplex.noise3d((worldX + x) / resource.scale.x, y / resource.scale.y, (worldZ + z) / resource.scale.z);
           if (val > thr) {
             for (let dx = 0; dx < ORE_STEP; dx++)
-              for (let dy = 0; dy < ORE_STEP; dy++)
+              for (let dy = 0; dy < ORE_STEP; dy++) {
+                const yy = y + dy;
+                if (yy >= H) continue;
                 for (let dz = 0; dz < ORE_STEP; dz++) {
                   // Per-block jitter breaks the 2×2×2 cell into an irregular blob.
-                  if (hash01(worldX + x + dx + (y + dy) * 131, worldZ + z + dz + (y + dy) * 57) < 0.2) continue;
-                  if (isHostRock(get(x + dx, y + dy, z + dz))) set(x + dx, y + dy, z + dz, resource.id);
+                  if (hash01(worldX + x + dx + yy * 131, worldZ + z + dz + yy * 57) < 0.2) continue;
+                  const di = ((x + dx) * H + yy) * W + (z + dz);
+                  if (isHostRock(data[di])) data[di] = resource.id;
                 }
+              }
           }
         }
       }
@@ -1200,10 +1211,10 @@ export const ICE_SURFACE_TEMP = -0.30;   // more cold water freezes over (was -0
 // solidity) needs no mirror. Shared by the normal fill AND the badlands `band` so
 // mesas get deepslate at depth too (previously they were stone all the way down).
 const DEEPSLATE_TOP = 56;   // deepslate everywhere below ~this Y (±4 jagged per-column wobble)
-function deepRock(wx: number, wz: number, y: number): number {
-  const top = DEEPSLATE_TOP + (hash01(wx + 17, wz + 31) - 0.5) * 8;
-  return y < top ? BLOCK_IDS.deepslate : BLOCK_IDS.stone;
-}
+// (The deepslate boundary `dsTop` is computed ONCE per column in generateTerrain —
+// it's y-independent — and the full deep-cell rule (bedrock floor → cave/lava →
+// deepslate/stone) is inlined into the fill's segmented y-loops there. The old
+// per-cell deepRock/deepCell helpers recomputed the same hash for every deep cell.)
 
 // ===========================================================================
 //  CAVES — deterministic, apron-safe sub-surface air. SPAGHETTI tunnels (the
@@ -1235,23 +1246,16 @@ function caveAir(simplex: SimplexNoise, wx: number, wy: number, wz: number, surf
     if (Math.abs(b) < CAVE_EPS_S * fade) return true;
   }
   // Cheese: sparse big caverns, gated by a coarse rarity field so they don't dominate.
-  const gate = simplex.noise3d(wx / 240, wy / 170, wz / 240);
-  if (gate > 0.36) {
-    const c = simplex.noise3d((wx + 5300) / CAVE_C_XZ, wy / CAVE_C_Y, (wz + 5300) / CAVE_C_XZ);
-    if (Math.abs(c) < CAVE_EPS_C * fade) return true;
+  // Iso-band FIRST, rarity gate second: P(|c|<eps)≈8% vs P(gate>0.36)≈27% (measured
+  // over the real frequency ranges), so testing the band first skips the gate noise
+  // for ~92% of cells — same AND, both fields pure, byte-identical output.
+  const c = simplex.noise3d((wx + 5300) / CAVE_C_XZ, wy / CAVE_C_Y, (wz + 5300) / CAVE_C_XZ);
+  if (Math.abs(c) < CAVE_EPS_C * fade) {
+    const gate = simplex.noise3d(wx / 240, wy / 170, wz / 240);
+    if (gate > 0.36) return true;
   }
   return false;
 }
-// One deep cell: bedrock floor (rough y0-4, always at y0), else cave air/lava, else
-// the deepslate/stone layer. Shared by the normal fill AND the badlands band's deep
-// stone so every biome gets the same caves + bedrock + deep-rock layering.
-function deepCell(simplex: SimplexNoise, wx: number, wz: number, y: number, surfaceH: number): number {
-  if (y === 0) return BLOCK_IDS.bedrock;
-  if (y <= 4 && hash01(wx + y * 9973, wz + y * 131) < (5 - y) / 5) return BLOCK_IDS.bedrock;
-  if (caveAir(simplex, wx, y, wz, surfaceH)) return y <= LAVA_Y ? BLOCK_IDS.lava : BLOCK_IDS.air;
-  return deepRock(wx, wz, y);
-}
-
 // Standalone cave predicate for the stateless APRON (getOutside): its own seed-only
 // simplex has the identical permutation to the generator's, so it returns the exact
 // same carve decision at any world cell → border cave walls mesh seamlessly.
@@ -1261,9 +1265,9 @@ export function createCaveSampler(params: ChunkParams) {
 }
 
 function generateTerrain(simplex: SimplexNoise, params: ChunkParams, size: ChunkSize, worldX: number, worldZ: number,
-  set: SetFn, outHeight: Int16Array, outBiome: Uint8Array, outTint?: Uint8Array, outSurface?: Uint8Array, surfaceOnly?: boolean) {
+  data: Uint8Array, outHeight: Int16Array, outBiome: Uint8Array, outTint?: Uint8Array, outSurface?: Uint8Array, surfaceOnly?: boolean) {
   const cfg = makeSurfaceConfig(params, size);
-  const W = size.width;
+  const W = size.width, H = size.height;
   for (let x = 0; x < W; x++) {
     for (let z = 0; z < W; z++) {
       const cs = columnSurface(simplex, cfg, worldX + x, worldZ + z);
@@ -1283,25 +1287,64 @@ function generateTerrain(simplex: SimplexNoise, params: ChunkParams, size: Chunk
       }
       const band = BIOMES[cs.biome].band;
       const wx = worldX + x, wz = worldZ + z;
+      const h = cs.height;
+      // This fill is the per-cell hot loop of chunk generation (~80k cells/chunk):
+      // it writes data[] directly with an incremental index (cell (x,y,z) is
+      // colBase + y*W) and hoists the per-COLUMN deepslate boundary (deepRock
+      // recomputed an identical hash for every deep cell). The y-range is split
+      // into segments mirroring deepCell's internal early-outs exactly (bedrock
+      // floor / no-cave shallows / cave band / sub-margin), so caveAir runs only
+      // where it can actually carve. Byte-identical to the old per-cell
+      // set()+deepCell path (bench-gen.mjs --compare guards this).
+      const colBase = x * H * W + z;
+      const dsTop = DEEPSLATE_TOP + (hash01(wx + 17, wz + 31) - 0.5) * 8;
       // surfaceOnly (map): fill only the top skin — enough for the top-down
       // scan + structure foundations to read solid, skipping the deep cave/
       // deepslate NOISE fill that dominates cost and is invisible from above.
-      const y0 = surfaceOnly ? Math.max(0, cs.height - 4) : 0;
-      for (let y = y0; y <= cs.height; y++) {
-        if (band) {
-          // Keep the biome's banded subsurface (badlands terracotta), but route its
-          // DEEP plain-stone fill through deepCell so mesas get deepslate, bedrock
-          // and caves at depth too.
-          const b = band(y, cs.height, cfg.sea);
-          set(x, y, z, b === BLOCK_IDS.stone ? deepCell(simplex, wx, wz, y, cs.height) : b);
+      const y0 = surfaceOnly ? Math.max(0, h - 4) : 0;
+      if (band) {
+        // Banded subsurface (badlands terracotta); deep plain-stone cells route
+        // through the same inlined deep logic so mesas get deepslate/bedrock/caves.
+        for (let y = y0; y <= h; y++) {
+          const b = band(y, h, cfg.sea);
+          let id = b;
+          if (b === BLOCK_IDS.stone) {
+            if (y === 0) id = BLOCK_IDS.bedrock;
+            else if (y <= 4 && hash01(wx + y * 9973, wz + y * 131) < (5 - y) / 5) id = BLOCK_IDS.bedrock;
+            else if (y >= CAVE_Y_MIN && y < h - CAVE_SURFACE_MARGIN && caveAir(simplex, wx, y, wz, h)) id = y <= LAVA_Y ? BLOCK_IDS.lava : BLOCK_IDS.air;
+            else id = y < dsTop ? BLOCK_IDS.deepslate : BLOCK_IDS.stone;
+          }
+          data[colBase + y * W] = id;
         }
-        else if (y === cs.height) set(x, y, z, cs.surfaceId);
-        else if (y > cs.height - 4) set(x, y, z, cs.subId);
-        else set(x, y, z, deepCell(simplex, wx, wz, y, cs.height));
+      } else {
+        const deepHi = h - 4;
+        // bedrock floor: y=0 always; y 1..4 a thinning random band
+        if (y0 === 0 && deepHi >= 0) data[colBase] = BLOCK_IDS.bedrock;
+        for (let y = Math.max(1, y0), e = Math.min(4, deepHi); y <= e; y++) {
+          data[colBase + y * W] = hash01(wx + y * 9973, wz + y * 131) < (5 - y) / 5
+            ? BLOCK_IDS.bedrock : (y < dsTop ? BLOCK_IDS.deepslate : BLOCK_IDS.stone);
+        }
+        // y=5: below CAVE_Y_MIN — never carved, plain deep rock
+        for (let y = Math.max(5, y0), e = Math.min(CAVE_Y_MIN - 1, deepHi); y <= e; y++) {
+          data[colBase + y * W] = y < dsTop ? BLOCK_IDS.deepslate : BLOCK_IDS.stone;
+        }
+        // cave band: depth = (h - y) - margin > 0  ⇔  y <= h - margin - 1
+        for (let y = Math.max(CAVE_Y_MIN, y0), e = Math.min(h - CAVE_SURFACE_MARGIN - 1, deepHi); y <= e; y++) {
+          data[colBase + y * W] = caveAir(simplex, wx, y, wz, h)
+            ? (y <= LAVA_Y ? BLOCK_IDS.lava : BLOCK_IDS.air)
+            : (y < dsTop ? BLOCK_IDS.deepslate : BLOCK_IDS.stone);
+        }
+        // sub-margin deep rock: too close under the surface for caves
+        for (let y = Math.max(Math.max(CAVE_Y_MIN, y0), h - CAVE_SURFACE_MARGIN), e = deepHi; y <= e; y++) {
+          data[colBase + y * W] = y < dsTop ? BLOCK_IDS.deepslate : BLOCK_IDS.stone;
+        }
+        // subsoil + surface cap
+        for (let y = Math.max(y0, h - 3); y <= h - 1; y++) data[colBase + y * W] = cs.subId;
+        if (h >= y0) data[colBase + h * W] = cs.surfaceId;
       }
-      if (cs.height < cfg.sea && cs.temp < ICE_SURFACE_TEMP) {
-        set(x, cfg.sea, z, BLOCK_IDS.ice);                                 // walkable frozen surface
-        if (cfg.sea - 1 > cs.height) set(x, cfg.sea - 1, z, BLOCK_IDS.ice); // 2-block cap = solid feel
+      if (h < cfg.sea && cs.temp < ICE_SURFACE_TEMP) {
+        if (cfg.sea < H) data[colBase + cfg.sea * W] = BLOCK_IDS.ice;        // walkable frozen surface
+        if (cfg.sea - 1 > h) data[colBase + (cfg.sea - 1) * W] = BLOCK_IDS.ice; // 2-block cap = solid feel
       }
     }
   }

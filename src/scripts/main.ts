@@ -1169,6 +1169,10 @@ function renderFrame(currentTime: number) {
   fpsFrames++;
   if (currentTime - fpsLast >= 250) {
     fps = fpsFrames * 1000 / (currentTime - fpsLast); fpsFrames = 0; fpsLast = currentTime;
+    // Menu stats refresh rides the same 4 Hz tick — it was running EVERY frame
+    // while the menu was open (10+ DOM textContent writes + the MP tab's button
+    // state flips per frame, pure churn for values that change at ~4 Hz anyway).
+    if (menu.isOpen()) menu.refreshStats();
     if (statsOverlayEl.style.display !== 'none') {
       const r = renderer.info.render;
       const p = mode === 'spectator' ? spectator.camera.position : player.position;
@@ -1184,7 +1188,6 @@ function renderFrame(currentTime: number) {
         `chunks ${world.chunkCount}  ·  lod ${world.lodTileCount}`;
     }
   }
-  if (menu.isOpen()) menu.refreshStats();
 }
 
 animate();

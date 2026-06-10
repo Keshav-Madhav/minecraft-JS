@@ -59,6 +59,16 @@ const FACE_OFFSETS: ReadonlyArray<readonly [number, number, number]> = [
   [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1],
 ];
 
+// Per-id cell class for the greedy sweep's dead-row skipping. 1 = opaque cube
+// (greedy-meshed, occludes every neighbour face); 0 = air / plant / cutout /
+// shaped / fence (not cube-meshed, and never fully occludes a cube neighbour —
+// mirrors faceVisible exactly: for a cube id, the face is visible iff the
+// neighbour is NOT cube-class).
+const CUBE_CLASS = new Uint8Array(256);
+for (let id = 1; id < 256; id++) {
+  if (PLANT_LOOKUP[id] !== 1 && CUTOUT_LOOKUP[id] !== 1 && SHAPED_LOOKUP[id] !== 1 && FENCE_LOOKUP[id] !== 1) CUBE_CLASS[id] = 1;
+}
+
 type DirMeta = {
   aAxis: number, sign: number,
   pAxis: number, qAxis: number,
@@ -269,7 +279,10 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
       let top = 0;
       // Ignore plants (they sit above the surface) so the cube band tracks only
       // terrain/trees — plants get their own pass with their own y-range.
-      for (let y = H - 1; y >= 0; y--) { const id = idAt(x, y, z); if (id !== BLOCK_IDS.air && PLANT_LOOKUP[id] === 0) { top = y; break; } }
+      // Incremental flat index (cell (x,y,z) = (x*H+y)*W+z, so −W per y step)
+      // instead of a blockIndex() call per cell — this scan touches every cell.
+      let di = (x * H + H - 1) * W + z;
+      for (let y = H - 1; y >= 0; y--, di -= W) { const id = data[di]; if (id !== BLOCK_IDS.air && PLANT_LOOKUP[id] === 0) { top = y; break; } }
       if (top > chunkMaxTop) chunkMaxTop = top;
       if (top < chunkMinTop) chunkMinTop = top;
     }
@@ -290,7 +303,8 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
   // lowest air. CAVE_Y_MIN is the floor (bedrock below is never carved).
   let deepestAir = bandLow;
   for (let x = 0; x < W; x++) for (let z = 0; z < W; z++) {
-    for (let y = CAVE_Y_MIN; y < deepestAir; y++) if (idAt(x, y, z) === BLOCK_IDS.air) { deepestAir = y; break; }
+    let di = (x * H + CAVE_Y_MIN) * W + z;
+    for (let y = CAVE_Y_MIN; y < deepestAir; y++, di += W) if (data[di] === BLOCK_IDS.air) { deepestAir = y; break; }
   }
   for (let i = 0; i < W; i++) {
     for (let y = CAVE_Y_MIN; y < deepestAir; y++) if (getOutside(-1, y, i) === BLOCK_IDS.air) { deepestAir = y; break; }
@@ -300,6 +314,36 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
   }
   bandLow = Math.max(0, Math.min(bandLow, deepestAir) - 1);
   const bandHigh = chunkMaxTop;
+
+  // Per-Y occupancy (one linear pass over the band): a mask ROW at level y, for
+  // any direction whose neighbour is IN-CHUNK at the same y (±x/±z interior
+  // slices), can only hold a visible face if that level has BOTH a cube cell
+  // (the face's owner) AND a non-cube cell (the only thing that exposes a cube
+  // face). With caves pulling bandLow to ~6, the underground bulk of the
+  // 320-tall column is solid rows that fail this test — the greedy sweep below
+  // memsets them instead of running idAt+faceVisible per cell. occSpec feeds
+  // the plant pass the same way (levels with no plant/shaped/fence/cutout cell
+  // are skipped outright). Only provably-empty regions are skipped → output
+  // stays byte-identical (mesh-parity.mjs / bench-gen.mjs --compare).
+  const occLo = Math.max(0, bandLow - 1);
+  const occHi = Math.min(H - 1, bandHigh + 5);
+  const occCube = new Uint8Array(H), occNonOcc = new Uint8Array(H), occSpec = new Uint8Array(H);
+  for (let x = 0; x < W; x++) {
+    let di = (x * H + occLo) * W;
+    for (let y = occLo; y <= occHi; y++, di += W) {
+      let cube = 0, non = 0, spec = 0;
+      for (let z = 0; z < W; z++) {
+        const id = data[di + z];
+        if (CUBE_CLASS[id] === 1) cube = 1;
+        else { non = 1; if (id !== BLOCK_IDS.air) spec = 1; }
+      }
+      if (cube) occCube[y] = 1;
+      if (non) occNonOcc[y] = 1;
+      if (spec) occSpec[y] = 1;
+    }
+  }
+  const liveY = new Uint8Array(H);
+  for (let y = occLo; y <= occHi; y++) liveY[y] = occCube[y] & occNonOcc[y];
 
   for (let dir = 0; dir < 6; dir++) {
     const meta = DIR_META[dir];
@@ -313,10 +357,24 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
     const aStart = meta.aAxis === 1 ? bandLow : 0, aEnd = meta.aAxis === 1 ? bandHigh + 1 : dimA;
     const pStart = meta.pAxis === 1 ? bandLow : 0, pEnd = meta.pAxis === 1 ? bandHigh + 1 : dimP;
     const qStart = meta.qAxis === 1 ? bandLow : 0, qEnd = meta.qAxis === 1 ? bandHigh + 1 : dimQ;
+    // The one slice per horizontal direction whose neighbours are OUTSIDE the
+    // chunk (apron) — occupancy says nothing about the apron, so it never skips.
+    const outsideLa = meta.aAxis === 1 ? -1 : (meta.sign > 0 ? dimA - 1 : 0);
+    const vertIsP = meta.pAxis === 1, vertIsQ = meta.qAxis === 1;
 
     for (let la = aStart; la < aEnd; la++) {
+      if (meta.aAxis === 1) {
+        // ±y: the whole slice needs a cube at la and a non-cube at la±1 (or sky).
+        const ny = la + meta.sign;
+        const live = occCube[la] === 1 && (ny >= H || (ny >= 0 && occNonOcc[ny] === 1));
+        if (!live) continue;   // skipped slices never reach the merge, so the stale mask is never read
+      }
+      const allowSkip = la !== outsideLa;
       for (let p = pStart; p < pEnd; p++) {
+        const row = p * dimQ;
+        if (vertIsP && allowSkip && liveY[p] !== 1) { mask.fill(0, row + qStart, row + qEnd); continue; }
         for (let q = qStart; q < qEnd; q++) {
+          if (vertIsQ && allowSkip && liveY[q] !== 1) { mask[row + q] = 0; continue; }
           cell[meta.aAxis] = la; cell[meta.pAxis] = p; cell[meta.qAxis] = q;
           const id = idAt(cell[0], cell[1], cell[2]);
           // Plants, cutout (glass) and shaped/fence blocks aren't greedy cube-meshed
@@ -324,8 +382,8 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
           const vis = id !== BLOCK_IDS.air && PLANT_LOOKUP[id] === 0 && CUTOUT_LOOKUP[id] === 0
             && SHAPED_LOOKUP[id] === 0 && FENCE_LOOKUP[id] === 0
             && faceVisible(id, cell[0], cell[1], cell[2], ox, oy, oz);
-          mask[p * dimQ + q] = vis ? id + 1 : 0;
-          tintMask[p * dimQ + q] = vis && faceTinted(id, dir) ? tintBucket(grassTintAt(cell[0], cell[2])) : -1;
+          mask[row + q] = vis ? id + 1 : 0;
+          tintMask[row + q] = vis && faceTinted(id, dir) ? tintBucket(grassTintAt(cell[0], cell[2])) : -1;
         }
       }
 
@@ -533,6 +591,7 @@ export function buildChunkGeometry(data: Uint8Array, size: ChunkSize, getOutside
   const plantHi = Math.min(H - 1, bandHigh + 5);
   const carpetByY = new Map<number, Uint8Array>();   // per y-level carpet masks (keyed by block id)
   for (let y = plantLo; y <= plantHi; y++) {
+    if (occSpec[y] !== 1) continue;   // no plant/cutout/shaped/fence cell anywhere at this level
     for (let x = 0; x < W; x++) {
       for (let z = 0; z < W; z++) {
         const id = idAt(x, y, z);
@@ -617,8 +676,9 @@ export function buildChunkMapTile(data: Uint8Array, size: ChunkSize, sea: number
   for (let lz = 0; lz < W; lz++) {
     for (let lx = 0; lx < W; lx++) {
       let topY = 0, topId = 0;
-      for (let y = H - 1; y >= 0; y--) {
-        const id = data[blockIndex(lx, y, lz, size)];
+      let di = (lx * H + H - 1) * W + lz;   // incremental flat index (−W per y step)
+      for (let y = H - 1; y >= 0; y--, di -= W) {
+        const id = data[di];
         if (id !== BLOCK_IDS.air && PLANT_LOOKUP[id] === 0) { topY = y; topId = id; break; }
       }
       topIds[lz * W + lx] = topId; topYs[lz * W + lx] = topY;
@@ -655,8 +715,9 @@ export function scanEmitters(data: Uint8Array, size: ChunkSize, worldX: number, 
   const out: number[] = [];
   for (let lx = 0; lx < W; lx++) {
     for (let lz = 0; lz < W; lz++) {
-      for (let y = 0; y < H; y++) {
-        const id = data[blockIndex(lx, y, lz, size)];
+      let di = lx * H * W + lz;   // incremental flat index (+W per y) — same scan order, no per-cell index math
+      for (let y = 0; y < H; y++, di += W) {
+        const id = data[di];
         if (id !== BLOCK_IDS.air && EMITTER_LOOKUP[id] === 1) out.push(worldX + lx, y, worldZ + lz, id);
       }
     }
