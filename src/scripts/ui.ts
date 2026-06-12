@@ -56,12 +56,18 @@ export type MultiplayerControls = {
   join: (code: string) => void,
   leave: () => void,
   getStatus: () => MultiplayerStatus,
+  // Your character (name tag + shirt colour) — shown to the other player.
+  getIdentity: () => { name: string, color: string },
+  setIdentity: (name: string, color: string) => void,
 };
 
 // First-person / spectator view controls (applied live, no rebuild).
 export type PlayerViewControls = {
   getFov: () => number, setFov: (v: number) => void,
   getMouseSensitivity: () => number, setMouseSensitivity: (v: number) => void,
+  // Raw pointer input (pointer-lock unadjustedMovement): disables OS mouse
+  // acceleration. Takes effect the next time the pointer locks.
+  getRawInput: () => boolean, setRawInput: (v: boolean) => void,
 };
 
 export type StatsSnapshot = {
@@ -79,6 +85,8 @@ type MenuOptions = {
   playerView: PlayerViewControls,
   multiplayer: MultiplayerControls,
   regenerate: () => void,
+  // Teleport to surface level at (x, z) — used by the Finder's result button.
+  teleport: (x: number, z: number) => void,
   onViewDistanceChange: () => void,
   getStats: () => StatsSnapshot,
   getMode: () => GameMode,
@@ -277,6 +285,11 @@ export function createMenu(opts: MenuOptions): MenuController {
     if (!res) { finderResult.textContent = `${label}: none found within range.`; return; }
     const dx = res.x - player.position.x, dz = res.z - player.position.z;
     finderResult.textContent = `${label}  —  ${Math.round(res.dist).toLocaleString()} blocks ${compass(dx, dz)}  →  (${Math.round(res.x)}, ${Math.round(res.z)})`;
+    // One-click travel: teleports to the surface (nearest air block above ground)
+    // at the found coordinates and resumes play.
+    const tpRow = el('div', 'menu__btnrow');
+    addButton(tpRow, '🚀  Teleport There', () => { opts.teleport(res.x, res.z); opts.onResume(); }, 'ui-btn--primary');
+    finderResult.append(tpRow);
   };
   const biomeGrid = el('div', 'finder-grid');
   addSection(finderBody, 'Biomes', false).append(biomeGrid);
@@ -300,8 +313,8 @@ export function createMenu(opts: MenuOptions): MenuController {
   modeBody.append(el('div', 'menu__hint', 'Choose how you play. Survival walks (gravity); Creative flies; Spectator is a free orbital camera that ghosts through the world.'));
   const modeCards = el('div', 'menu__modes');
   const MODES: { id: GameMode, name: string, desc: string }[] = [
-    { id: 'survival', name: '🚶  Survival', desc: 'Gravity · walk & sprint · double-tap Space to fly · build' },
-    { id: 'creative', name: '🛩  Creative', desc: 'Flight by default · no gravity · build · double-tap Space to land' },
+    { id: 'survival', name: '🚶  Survival', desc: 'Gravity · walk & sprint · no flight · build' },
+    { id: 'creative', name: '🛩  Creative', desc: 'Flight by default · no gravity · build · extended reach · double-tap Space to land' },
     { id: 'spectator', name: '👁  Spectator', desc: 'Orbital free-cam · drag to look · WASD/Space/Shift fly · no clipping' },
   ];
   const modeBtns: Record<GameMode, HTMLElement> = {} as any;
@@ -331,11 +344,39 @@ export function createMenu(opts: MenuOptions): MenuController {
       + 'The joiner loads the host\'s world (terrain, edits, time of day) and you build side by side. '
       + 'Keep this tab open while connecting.'));
 
+    // --- Your character: name + shirt colour (sent to the other player) ----
+    mpBody.append(el('div', 'ui-subhead', 'Your Character'));
+    const idRow = el('div', 'menu__btnrow');
+    const nameInput = el('input', 'ui-input') as HTMLInputElement;
+    nameInput.placeholder = 'Your name (shown above your head)';
+    nameInput.maxLength = 16;
+    nameInput.spellcheck = false;
+    nameInput.value = mp.getIdentity().name;
+    // Keep typed letters out of the game's document-level key handlers.
+    nameInput.addEventListener('keydown', (e) => e.stopPropagation());
+    nameInput.addEventListener('change', () => mp.setIdentity(nameInput.value, mp.getIdentity().color));
+    idRow.append(nameInput);
+    const SHIRTS = ['#2fa39b', '#d4533b', '#3b6fd4', '#8a4fd4', '#3f9e3f', '#d4a13b'];
+    const swRow = el('div', 'mp-swatches');
+    const syncSwatches = () => {
+      const cur = mp.getIdentity().color;
+      Array.from(swRow.children).forEach((ch, i) => (ch as HTMLElement).classList.toggle('mp-swatch--on', SHIRTS[i] === cur));
+    };
+    for (const shirtCol of SHIRTS) {
+      const sw = el('button', 'mp-swatch') as HTMLButtonElement;
+      sw.style.background = shirtCol;
+      sw.title = 'Shirt colour';
+      sw.addEventListener('click', () => { mp.setIdentity(nameInput.value, shirtCol); syncSwatches(); });
+      swRow.append(sw);
+    }
+    syncSwatches();
+    mpBody.append(idRow, swRow);
+
     const hostRow = el('div', 'menu__btnrow');
     const hostBtn = addButton(hostRow, '🌐  Host This World', () => { mp.host(); refreshMpStatus(); }, 'ui-btn--primary');
 
     const joinRow = el('div', 'menu__btnrow');
-    const codeInput = el('input', 'ui-input') as HTMLInputElement;
+    const codeInput = el('input', 'ui-input mp-code-input') as HTMLInputElement;
     codeInput.placeholder = 'ROOM CODE';
     codeInput.maxLength = 8;
     codeInput.autocapitalize = 'characters';
@@ -402,7 +443,7 @@ export function createMenu(opts: MenuOptions): MenuController {
     ['Jump / Ascend', 'Space'],
     ['Sprint / Descend', 'Shift  (Shift descends while flying)'],
     ['Sprint (toggle)', 'Double-tap W'],
-    ['Toggle flight', 'Double-tap Space  (Survival & Creative)'],
+    ['Toggle flight', 'Double-tap Space  (Creative only)'],
     ['Boost (Spectator)', 'Ctrl'],
     ['Break block', 'Left click'],
     ['Place / Use block', 'Right click'],
@@ -534,6 +575,7 @@ export function createMenu(opts: MenuOptions): MenuController {
   const playerFolder = addSection(setBody, '🏃  Player', true);
   remember(addSlider(playerFolder, 'Field of View (°)', { min: 60, max: 110, step: 1, get: opts.playerView.getFov, set: opts.playerView.setFov }));
   remember(addSlider(playerFolder, 'Mouse Sensitivity', { min: 0.2, max: 3, step: 0.05, decimals: 2, get: opts.playerView.getMouseSensitivity, set: opts.playerView.setMouseSensitivity }));
+  remember(addToggle(playerFolder, 'Raw Mouse Input (no acceleration)', opts.playerView.getRawInput, opts.playerView.setRawInput));
   remember(addSlider(playerFolder, 'Walk Speed (blocks/s)', { min: 2, max: 20, step: 0.5, decimals: 1, get: () => player.maxSpeed, set: (v) => { player.maxSpeed = v; } }));
 
   // --- World (queued; Apply rebuilds) ---

@@ -54,6 +54,10 @@ export class RemotePlayer {
   private head: THREE.Group;
   private armL: THREE.Group; private armR: THREE.Group;
   private legL: THREE.Group; private legR: THREE.Group;
+  // Shirt-coloured meshes (torso + arms) with their texture dims, so the peer's
+  // chosen shirt colour can re-speckle them live. Name tag floats above the head.
+  private shirtParts: Array<{ mesh: THREE.Mesh, w: number, h: number }> = [];
+  private tag: THREE.Sprite;
 
   private snaps: Snap[] = [];
   private swingPhase = 0;
@@ -102,8 +106,56 @@ export class RemotePlayer {
     this.legL.position.x = -0.125; this.legR.position.x = 0.125;
 
     this.group.add(this.head, torso, this.armL, this.armR, this.legL, this.legR);
+    this.shirtParts.push(
+      { mesh: torso.children[0] as THREE.Mesh, w: 8, h: 12 },
+      { mesh: this.armL.children[0] as THREE.Mesh, w: 4, h: 12 },
+      { mesh: this.armR.children[0] as THREE.Mesh, w: 4, h: 12 },
+    );
+
+    // NAME TAG: a billboarded sprite above the head, drawn by setIdentity.
+    this.tag = new THREE.Sprite(new THREE.SpriteMaterial({ transparent: true, depthWrite: false }));
+    this.tag.center.set(0.5, 0);   // anchor at the bottom → scales upward
+    this.tag.position.y = 2.12;
+    this.tag.visible = false;
+    this.group.add(this.tag);
+
     this.group.scale.setScalar(0.9);
     this.group.visible = false;
+  }
+
+  // Apply the peer's identity card: name tag text + shirt colour (torso/arms).
+  setIdentity(name: string, shirtHex: string) {
+    for (const p of this.shirtParts) {
+      const old = p.mesh.material;
+      p.mesh.material = speckleMat(p.w, p.h, shirtHex);
+      for (const m of Array.isArray(old) ? old : [old]) {
+        (m as THREE.MeshLambertMaterial).map?.dispose();
+        m.dispose();
+      }
+    }
+    const c = document.createElement('canvas');
+    c.width = 256; c.height = 56;
+    const g = c.getContext('2d');
+    if (g) {
+      g.font = '600 30px ui-sans-serif, system-ui, sans-serif';
+      const tw = Math.min(244, g.measureText(name).width);
+      g.fillStyle = 'rgba(10, 12, 18, 0.55)';
+      g.beginPath();
+      g.roundRect(128 - tw / 2 - 9, 6, tw + 18, 44, 8);
+      g.fill();
+      g.fillStyle = '#ffffff';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.fillText(name, 128, 29, 244);
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    const mtl = this.tag.material;
+    mtl.map?.dispose();
+    mtl.map = tex;
+    mtl.needsUpdate = true;
+    this.tag.scale.set(1.5, 1.5 * (56 / 256), 1);
+    this.tag.visible = name.length > 0;
   }
 
   reset() { this.snaps.length = 0; this.speed = 0; }

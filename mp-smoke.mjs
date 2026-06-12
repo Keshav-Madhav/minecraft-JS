@@ -48,7 +48,7 @@ try {
 
   // GUEST: type the code, join.
   await guest.evaluate((c) => {
-    const i = document.querySelector('input.ui-input');
+    const i = document.querySelector('input.mp-code-input');
     i.value = c;
     [...document.querySelectorAll('button')].find((b) => (b.textContent || '').includes('Join')).click();
   }, code);

@@ -52,6 +52,97 @@ first). **fps barely moves → vertex/triangle-bound** (ship vertex quantization
 - **WebGPU dual path** — deferred: our draws are already collapsed; the compute-culling
   prize demands a TSL shader rewrite.
 
+## Shipped 2026-06-10 — exact-output worker + main-thread package
+Full-audit round (frame loop / worker pipeline / mesher / streaming / GPU /
+LOD / physics / UI / map / net). All worldgen+mesher changes are **byte-identical**
+(bench-gen.mjs --compare over 40 mixed chunks + mesh-parity golden + rle-parity +
+lod-smoke + mp-smoke all green). **Measured: full Ultra ring (3655 chunks)
+18.4s → 7.1s = 2.6× fill throughput (198 → 515 chunks/s @ 8 workers, same-session
+stash A/B); node pipeline bench 9.6 → 6.8 ms/chunk (mesher 5.5 → 3.2).**
+- **fastSimplex.ts**: bit-identical SimplexNoise port (typed perm/permMod12, flat
+  grad table, inlined dots, hoisted F2/G2; verified `Object.is`-equal over 15M
+  samples × 5 seeds and through the full pipeline). chunkGen imports it now.
+- **chunkMesh occupancy row-skip**: one linear pass marks per-Y "any cube" / "any
+  non-occluder" / "any special"; the greedy sweep memsets provably-dead mask rows
+  (the whole solid underground that caves dragged into the band) instead of
+  running idAt+faceVisible per cell; plant pass skips dead Y levels; all column
+  scans use incremental flat indices. Outside-facing border slices are exempt
+  (apron unknown to occupancy).
+- **generateTerrain segmented fill**: direct data[] writes (no set-closure), per-
+  column deepslate boundary hoisted (deepRock re-hashed per cell), y-loop split
+  into bedrock / no-cave / cave-band / sub-margin segments mirroring deepCell's
+  early-outs exactly; caveAir cheese check reordered iso-band-first (P≈8% vs
+  gate P≈27%, measured) — pure AND, same result, ~92% fewer gate noise calls.
+- **generateResources**: direct data[] access (get/set closures + bounds checks
+  were ~5% of gen).
+- **Player pick = voxel DDA** over world.getBlockId (≤ ~14 lookups) replacing
+  Raycaster.intersectObjects over the 3×3 chunk groups — three has no BVH, so
+  every pick brute-forced thousands of ray-triangle tests/frame (320-tall chunk
+  bounds always contain the 4-unit ray). Same break/place/targeted cells
+  (verified against block data); plants/partial blocks now target as full cells
+  (MC-like).
+- **menu.refreshStats** gated to the existing 4 Hz stats tick (was 10+ DOM writes
+  + MP-tab button flips every frame while paused).
+- New harness: **bench-gen.mjs** (esbuild-bundles the real worker pipeline into
+  node; per-phase ms/chunk + sha256 byte-parity vs a saved baseline). Use it to
+  gate ANY future worldgen/mesher change: `node bench-gen.mjs --save base.json`
+  before, `--compare base.json` after.
+- Audited-and-rejected this round: lightManager worst-slot scan (only runs per
+  accepted emitter — fine); batch-page "full re-upload per add" claim (partial
+  updates verified earlier); ensureFlat "per-edit decode" (idempotent); fog/
+  caustics shader micro-rewrites (visual risk ≫ gain at measured bounds).
+- Deferred (real but niche): dataStore.forEachEdit scans ALL edits for chunks
+  that have any (nested per-chunk map would fix; touches save/MP-init shape);
+  mapWorker chunkTops not IDB-persisted (cold deep-zoom regen); worker sweep
+  fusion (emitters+mapTile+top scans share one pass, ~0.3ms/chunk).
+- Next fill-speed lever beyond this: **output-changing** coarse-lattice cave/ore
+  noise (4×4×4 trilinear, MC-style) — would cut the remaining ~32% noise share
+  several-fold but changes the world (saves/golden invalidated); decide as a
+  product call, not a perf patch.
+
+## Shipped 2026-06-10 (round 2) — cross-GPU render package (IMR/NVIDIA-targeted)
+Apple TBDR gets overdraw-free opaque via hidden-surface removal; Windows/NVIDIA/AMD
+(immediate-mode) do NOT — early-Z there is only as good as draw order. This round
+ships universal wins that are at worst neutral on Apple (verified: deterministic
+seed-4242 headed A/B, Balanced 357-360 vs baseline 359 fps, Ultra 93-94 vs 94 —
+parity within launch noise) and structurally help IMR GPUs:
+- **Cutout-after-opaque draw order**: leaf/plant/LOD-canopy pools + individual
+  leaf/plant chunk meshes carry `renderOrder = 1` → ALL alpha-tested (discard)
+  geometry draws after ALL solid terrain. IMR: terrain depth early-Z-kills hidden
+  foliage fragments; TBDR: discard draws stop interleaving the opaque HSR stream
+  (vendor ordering: opaque → alpha-test → blended). Depth-tested → image identical.
+- **CulledBatchedMesh** (batchPool.ts): r184 BatchedMesh recomputed every visible
+  instance's world bounding sphere EVERY pass (getMatrixAt + Sphere.applyMatrix4 =
+  3 sqrts + 6 plane dots; three issue #28776). Instances never move → BatchPool.add
+  caches the page-local sphere once (Float32Array xyzr) and the override loop is
+  6 dots/instance. Also COUNTING-SORTS survivors near→far (64-block buckets, O(n))
+  into the multi-draw list — intra-page order was ADD order = uncontrolled overdraw
+  inside each page on IMR. Coupled to r184 privates (_instanceInfo/_geometryInfo/
+  _multiDraw*/_indirectTexture) — re-verify on any three upgrade; falls back to
+  stock for sortObjects/wireframe/ArrayCamera.
+- **Rescan de-allocation**: visibleKeys is now Set<number> (numKey), getVisibleChunks
+  fills a pooled coord array (valid until next rescan — pending is rebuilt within the
+  same rescan), pending-filter + refreshLodVisibility use chunkNumMap, and
+  applyFoliageVisibility reads chunk.batchEntry (mirrored handle on the chunk)
+  instead of a string-key Map get. Kills ~15-20k allocs per rescan at dd64 (rescans
+  fire per chunk-cross AND per ~8.5° yaw — was real GC pressure while mouselooking).
+- **Anisotropy per preset** (setTextureAnisotropy): low 2× / balanced 4× / fancy+ 8×.
+  AF multiplies grazing-angle texture taps — a real fragment lever on weak GPUs.
+- **Water recolour time-sliced**: the 625-sampler coarse grid runs 7 rows/frame
+  (~0.3ms) instead of one ~1-1.5ms synchronous spike per 24-block snap; bilinear
+  fill + upload land at job end (≤4-frame colour lag on a smooth field).
+- **God rays at half res** (ultraGraphics.ts): the 48-tap march renders to a
+  half-res HalfFloat RT (¼ the taps), composite upsamples — shafts are soft, no
+  visible difference; march skipped entirely when the sun is off-screen.
+- **State-reset gaps**: generate() now resets demotionsDeferred + lodWorkerRetryTick.
+- Verified: tsc, mesh-parity, rle-parity, lod-smoke, mp-smoke all green; lod-shots
+  screenshots correct (no cull holes). NVIDIA-side gains NOT locally measurable
+  (no Windows box) — re-run ab-fps.mjs there when available.
+- Refuted this round (don't re-flag): physics getBlockId alloc claim (numeric path
+  already), minimap idle heartbeat (epoch-gated), PostFX target leak (composer
+  disposes), RemotePlayer avatar leak (singleton reuse), spectator damping-while-
+  paused (deliberate, micro).
+
 ## Explicitly rejected (researched, wrong tool)
 - **Geometry clipmaps as a structure** — fights worker meshing/blocky walls/tints/canopy.
 - **Impostor/RTT horizon rings** — we're triangle-bound, not draw-bound; impostors trade

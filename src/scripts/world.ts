@@ -24,6 +24,11 @@ const FRUSTUM_MARGIN = 96;      // world units to fatten the frustum (hysteresis
 // high draw distance — so the win scales with draw distance while play stays smooth.
 const FRUSTUM_NEAR_KEEP = 6;
 const VIEW_YAW_RESCAN = 0.15;   // camera-yaw delta (rad, ~8.5°) that triggers a frustum re-evaluation
+// TURN-BACK CACHE: how long an out-of-frustum (but still in-range) chunk stays
+// resident before frustum streaming may evict it. Without this, a quick 180°
+// turn dumped everything behind the camera and a turn-back re-streamed it all
+// through the worker queue — a multi-second "the world is reloading" spike.
+const FRUSTUM_EVICT_GRACE_MS = 10_000;
 
 // CHUNK DRAW-CALL COLLAPSE: chunks beyond this Chebyshev radius render through
 // BatchedMesh pools (a handful of multi-draw calls) instead of 1-3 meshes each.
@@ -233,6 +238,9 @@ export class World extends Three.Group {
   // visible cell per rescan (up to ~7k at dd64, and rescans fire on every
   // chunk-cross AND ~8.5° of yaw — real GC pressure while mouse-looking).
   private visibleKeys = new Set<number>();
+  // numKey → performance.now() when the chunk left the visible set (turn-back
+  // cache bookkeeping; cleared the moment it's visible again — see update()).
+  private chunkMissSince = new Map<number, number>();
   private removalPending = false;
   // getVisibleChunks scratch: coord objects pooled in `_visBacking` (grow-only)
   // and re-listed into `_visList` per rescan — zero per-rescan allocation. The
@@ -490,6 +498,15 @@ export class World extends Three.Group {
       const visibleChunks = this.getVisibleChunks(player);
       this.visibleKeys.clear();
       for (const vc of visibleChunks) this.visibleKeys.add(World.numKey(vc.x, vc.z));
+      // Turn-back cache: stamp when a resident chunk leaves the visible set;
+      // clear the stamp the moment it's visible again.
+      const now = performance.now();
+      for (const chunk of this.chunkMap.values()) {
+        const cc = chunk.userData as chunkCoords;
+        const nk = World.numKey(cc.x, cc.z);
+        if (this.visibleKeys.has(nk)) this.chunkMissSince.delete(nk);
+        else if (!this.chunkMissSince.has(nk)) this.chunkMissSince.set(nk, now);
+      }
       this.removalPending = this.removeUnusedChunks();
       this.pending = visibleChunks
         .filter(({ x, z }) => !this.chunkNumMap.has(World.numKey(x, z)))
@@ -1195,23 +1212,36 @@ export class World extends Three.Group {
     // draw-distance unused at once) doesn't hitch disposing thousands of
     // geometries in a single frame. Off-screen leftovers are frustum-culled.
     let removed = 0;
+    let deferred = false;
+    const now = performance.now();
+    const px = this.lastPlayerChunkX, pz = this.lastPlayerChunkZ;
     for (const [key, chunk] of this.chunkMap) {
       if (removed >= this.maxRemovalsPerFrame) break;
       const cc = chunk.userData as chunkCoords;
-      if (!this.visibleKeys.has(World.numKey(cc.x, cc.z))) {
-        this.meshQueue.delete(chunk);
-        this.unbatchChunk(chunk);        // free its batch-page slice (if batched)
-        this.noteChunkOverTile(chunk);   // LOD tile over it may need to show again
-        chunk.disposeInstance();
-        this.remove(chunk);
-        this.chunkMap.delete(key);
-        const c = chunk.userData as chunkCoords;
-        this.chunkNumMap.delete(World.numKey(c.x, c.z));
-        removed++;
+      const nk = World.numKey(cc.x, cc.z);
+      if (this.visibleKeys.has(nk)) continue;
+      // TURN-BACK CACHE: a chunk that's merely outside the view frustum (still
+      // within draw range) stays resident for a grace window, so a quick 180°
+      // look-back finds everything still loaded instead of restreaming it all.
+      // Out-of-RANGE chunks (the player moved away) still evict immediately —
+      // the LOD ring covers them and RAM reclaim shouldn't lag travel.
+      const inRange = Math.max(Math.abs(cc.x - px), Math.abs(cc.z - pz)) <= this.drawDistance;
+      if (inRange && now - (this.chunkMissSince.get(nk) ?? now) < FRUSTUM_EVICT_GRACE_MS) {
+        deferred = true;   // keep the removal pass alive so it evicts once the grace expires
+        continue;
       }
+      this.meshQueue.delete(chunk);
+      this.unbatchChunk(chunk);        // free its batch-page slice (if batched)
+      this.noteChunkOverTile(chunk);   // LOD tile over it may need to show again
+      chunk.disposeInstance();
+      this.remove(chunk);
+      this.chunkMap.delete(key);
+      this.chunkNumMap.delete(nk);
+      this.chunkMissSince.delete(nk);
+      removed++;
     }
     // No worker eviction needed — the worker is stateless (no chunk cache).
-    return removed >= this.maxRemovalsPerFrame;
+    return removed >= this.maxRemovalsPerFrame || deferred;
   }
 
   generateChunk(x: number, z: number) {
@@ -1347,6 +1377,7 @@ export class World extends Three.Group {
     this.add(this.lodGroup);   // this.clear() detached the (now empty) LOD group — re-adopt it
     this.chunkMap.clear();
     this.chunkNumMap.clear();
+    this.chunkMissSince.clear();
     this.pending = [];
     this.meshQueue.clear();
     this.applyQueue.length = 0;

@@ -49,6 +49,20 @@ let previousTime = performance.now();
 const settings = { uncapFPS: false, fpsCap: 0, fog: true, fogNear: 0.85, resolutionScale: 1, biomeLighting: true, dayNight: true, statsOverlay: true };
 const SKY_COLOR = 0x80a0e0;
 
+// --- persisted player preferences (localStorage) -----------------------------
+// The knobs people actually re-tune every session: mouse sensitivity, FOV, raw
+// input, and the quality preset. Loaded at boot, saved on change. World/terrain
+// settings deliberately NOT persisted (the seed UI owns those).
+type Prefs = { fov?: number, sens?: number, raw?: boolean, preset?: string, name?: string, color?: string };
+const PREFS_KEY = 'mcjs-prefs-v1';
+const prefs: Prefs = (() => {
+  try { return JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') as Prefs; } catch { return {}; }
+})();
+function savePrefs(patch: Prefs) {
+  Object.assign(prefs, patch);
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch { /* private mode etc. — prefs just don't stick */ }
+}
+
 // Frame scheduler. requestAnimationFrame is hard-locked to the display refresh
 // rate (e.g. 60/120 Hz). To render uncapped, drive the loop via a MessageChannel,
 // which has no minimum-delay clamp the way setTimeout(0) does.
@@ -348,6 +362,18 @@ function stepWaterRecolor() {
 const player = new Player(scene);
 const physics = new Physics(scene);
 
+// Restore persisted view prefs (sensitivity / FOV / raw input) onto both cameras.
+if (typeof prefs.fov === 'number' && prefs.fov >= 60 && prefs.fov <= 110) {
+  player.setFov(prefs.fov);
+  spectator.camera.fov = prefs.fov;
+  spectator.camera.updateProjectionMatrix();
+}
+if (typeof prefs.sens === 'number' && prefs.sens >= 0.2 && prefs.sens <= 3) {
+  player.controls.pointerSpeed = prefs.sens;
+  spectator.controls.rotateSpeed = prefs.sens;
+}
+player.rawMouseInput = prefs.raw === true;
+
 // Spawn AT the surface (deterministic via the sampler — no chunk load needed)
 // instead of free-falling from y=340: that long drop, if the spawn chunk hadn't
 // meshed yet, left the player frozen mid-air with no feedback. Over ocean, spawn at
@@ -364,6 +390,16 @@ const physics = new Physics(scene);
 // per-chunk tiles (always in sync, no regeneration); the fullscreen map streams
 // IDB-persisted worker tiles.
 const _camDir = new THREE.Vector3();
+// Shared teleport (map clicks + the Finder's Teleport button): always lands at
+// the nearest air above the surface — over ocean that's the waterline, not the
+// seabed (the old map teleport could drop you under water).
+function teleportTo(x: number, z: number) {
+  const surf = Math.max(world.sampler(Math.floor(x), Math.floor(z)).height, world.params.terrain.waterOffset);
+  player.position.set(x, surf + 3, z);
+  player.velocity.set(0, 0, 0);
+  spectator.camera.getWorldDirection(_camDir);
+  spectator.placeAt(new THREE.Vector3(x, surf + 30, z), _camDir);
+}
 const worldMap = new WorldMap({
   getPlayer: () => {
     const cam = mode === 'spectator' ? spectator.camera : player.camera;
@@ -373,13 +409,7 @@ const worldMap = new WorldMap({
   },
   getChunkTile: (cx, cz, allowBuild = true) => world.getChunkMapTileCanvas(cx, cz, allowBuild),
   getMapEpoch: () => world.mapTileEpoch,
-  onTeleport: (x, z) => {
-    const surface = world.sampler(Math.floor(x), Math.floor(z));
-    player.position.set(x, surface.height + 3, z);
-    player.velocity.set(0, 0, 0);
-    spectator.camera.getWorldDirection(_camDir);
-    spectator.placeAt(new THREE.Vector3(x, surface.height + 30, z), _camDir);
-  },
+  onTeleport: teleportTo,
   onOpen: () => {
     player.enabled = false;
     if (mode === 'spectator') spectator.setEnabled(false);
@@ -419,10 +449,31 @@ const statsOverlayEl = document.createElement('div');
 statsOverlayEl.id = 'stats-overlay';
 statsOverlayEl.style.display = 'none';
 document.body.appendChild(statsOverlayEl);
+
+// Active-block label above the hotbar: always shows WHAT you're holding — the
+// only feedback when a right-click pick selects a block that has no hotbar slot.
+const activeBlockEl = document.createElement('div');
+activeBlockEl.id = 'active-block-label';
+document.body.appendChild(activeBlockEl);
+const _idToName: Record<number, string> = {};
+for (const [k, v] of Object.entries(BLOCK_IDS)) {
+  if (_idToName[v as number] === undefined)
+    _idToName[v as number] = k.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase());
+}
+player.onActiveBlockChange = (id) => {
+  activeBlockEl.textContent = id === blocks.air.id ? '⛏ Pickaxe' : (_idToName[id] ?? `Block #${id}`);
+  // retrigger the pop animation
+  activeBlockEl.classList.remove('active-block-label--pop');
+  void activeBlockEl.offsetWidth;
+  activeBlockEl.classList.add('active-block-label--pop');
+};
+player.onActiveBlockChange(player.activeBlockId);
+
 function updateHudVisibility() {
   const playing = !paused && !worldMap.isOpen();
   const fpsPlay = isFPS() && playing;
   if (toolbarEl) toolbarEl.style.display = fpsPlay ? '' : 'none';
+  activeBlockEl.style.display = fpsPlay ? '' : 'none';
   if (crosshairEl) crosshairEl.style.display = (fpsPlay && player.controls.isLocked) ? '' : 'none';
   if (statsOverlayEl) statsOverlayEl.style.display = (playing && settings.statsOverlay) ? '' : 'none';
 }
@@ -443,8 +494,11 @@ function setMode(m: GameMode) {
     }
     spectator.setEnabled(false);
     player.enabled = true;
-    player.canFly = true;
+    // Flight is Creative-only now (tester feedback: survival shouldn't fly).
+    player.canFly = m === 'creative';
     player.setFlying(m === 'creative');   // Creative flies by default; Survival walks
+    // Longer block reach while in Creative (like MC) — survival keeps the tight 4.
+    player.raycaster.far = m === 'creative' ? 6 : 4;
   }
   updateHudVisibility();
 }
@@ -466,7 +520,7 @@ function pause() {
 function resume() {
   paused = false;
   menu.close();
-  if (isFPS()) { player.enabled = true; player.controls.lock(); }   // resume() always runs from a user gesture
+  if (isFPS()) { player.enabled = true; player.controls.lock(player.rawMouseInput); }   // resume() always runs from a user gesture
   else spectator.setEnabled(true);
   updateHudVisibility();
 }
@@ -482,7 +536,7 @@ player.controls.addEventListener('unlock', () => {
 // map with Esc) re-locks the pointer. The block-edit handler below is gated on
 // isLocked, so this locking click never also edits.
 renderer.domElement.addEventListener('mousedown', () => {
-  if (isFPS() && !paused && !worldMap.isOpen() && !player.controls.isLocked) player.controls.lock();
+  if (isFPS() && !paused && !worldMap.isOpen() && !player.controls.isLocked) player.controls.lock(player.rawMouseInput);
 });
 
 // Scroll adjusts FLIGHT SPEED while flying in Creative / Survival-flight (spectator
@@ -536,6 +590,7 @@ moonSprite.layers.enable(1);
 scene.add(sunSprite);
 scene.add(moonSprite);
 const _sunDir = new THREE.Vector3();
+const _moonDir = new THREE.Vector3();
 
 const SUN_DISTANCE = 240;
 let sunAzimuth = 199;
@@ -697,9 +752,20 @@ function updateSky(delta: number) {
 
   const azr = sunAzimuth * Math.PI / 180, elr = elevReal * Math.PI / 180, ce = Math.cos(elr);
   _sunDir.set(Math.cos(azr) * ce, Math.sin(elr), Math.sin(azr) * ce);
+  // The moon gets its OWN arc (opposite phase to the sun) instead of mirroring
+  // the sun's direction: the sun only dips ~14° below the horizon at midnight,
+  // so the mirrored moon sat at ~14° elevation — grazing block TOPS (sin 14°)
+  // while hitting SIDE faces nearly head-on (cos 14° ≈ 0.97 of full intensity).
+  // That's why grass sides stayed bright green at night while tops went dark.
+  // The real arc keeps the moon high (~68-82°) all night: tops catch the
+  // moonlight, sides fall correctly dark.
+  const moonAzr = azr + Math.PI;
+  const moonElr = (SUN_BIAS + SUN_AMP * Math.sin((timeOfDay - 0.75) * Math.PI * 2)) * Math.PI / 180;
+  const mce = Math.cos(moonElr);
+  _moonDir.set(Math.cos(moonAzr) * mce, Math.sin(moonElr), Math.sin(moonAzr) * mce);
   const skyDist = player.camera.far * 0.9;
   sunSprite.position.copy(player.position).addScaledVector(_sunDir, skyDist);
-  moonSprite.position.copy(player.position).addScaledVector(_sunDir, -skyDist);
+  moonSprite.position.copy(player.position).addScaledVector(_moonDir, skyDist);
   const ss = skyDist * 0.13, ms = skyDist * 0.09;
   sunSprite.scale.set(ss, ss, 1);
   moonSprite.scale.set(ms, ms, 1);
@@ -709,7 +775,7 @@ function updateSky(delta: number) {
   // Moon only rises once the sun is nearly gone — previously sun + moon + hemi
   // all contributed through dusk, additively over-brightening those frames.
   moon.intensity = MOON_PEAK * (1 - daylight) * (1 - sstep(daylight, 0.05, 0.2));
-  moon.position.copy(player.position).addScaledVector(_sunDir, -SUN_DISTANCE);
+  moon.position.copy(player.position).addScaledVector(_moonDir, SUN_DISTANCE);
   moon.target.position.copy(player.position);
 }
 
@@ -718,8 +784,9 @@ function onMouseDown(event: MouseEvent) {
   if (event.button === 2) {
     const t = player.targetedBlock;
     if (t && world.interactBlock(t.x, t.y, t.z)) return;
-    const s = player.selectedCoords;
-    if (s) player.activeBlockId = world.getBlock(s.x, s.y, s.z)?.id ?? blocks.air.id;
+    // Pick the SOLID block under the crosshair (selectedCoords is the empty
+    // neighbour while holding a block — picking that always returned air).
+    if (t) player.setActiveBlock(world.getBlock(t.x, t.y, t.z)?.id ?? blocks.air.id);
     return;
   }
   if (event.button === 0 && player.selectedCoords) {
@@ -759,9 +826,12 @@ function applyUnifiedViewDistance(v: number) {
   updateViewDistance();
 }
 
-let qualityPreset: QualityPreset = 'balanced';   // sensible default out of the box
+const PRESET_NAMES: QualityPreset[] = ['low', 'balanced', 'fancy', 'ultra', 'max'];
+let qualityPreset: QualityPreset =                // sensible default out of the box,
+  PRESET_NAMES.includes(prefs.preset as QualityPreset) ? prefs.preset as QualityPreset : 'balanced';   // or the last-used preset
 function applyQualityPreset(p: QualityPreset) {
   qualityPreset = p;
+  if (PRESET_NAMES.includes(p)) savePrefs({ preset: p });
   // Ultra Graphics (post-FX) stays an independent ADD-ON for the normal ladder —
   // only MAX forces it on ("everything maxed"); other presets leave it as-is.
   // Every preset sets ONE unified View Distance (chunks): the slider value IS
@@ -844,6 +914,14 @@ let lastPosSendAt = 0, lastTimeSyncAt = 0;
 const _netEuler = new THREE.Euler(0, 0, 0, 'YXZ');
 
 net.getInitPayload = () => ({ params: world.params, edits: world.dataStore.data, timeOfDay });
+
+// Identity card: our name + shirt colour (persisted prefs) → the peer's avatar.
+const myIdentity = () => ({
+  name: (prefs.name ?? '').trim().slice(0, 16) || 'Friend',
+  color: /^#[0-9a-f]{6}$/i.test(prefs.color ?? '') ? prefs.color! : '#2fa39b',
+});
+net.getHello = myIdentity;
+net.onHello = (name, color) => remote.setIdentity(name, color);
 
 // GUEST: adopt the host's world wholesale — same machinery as world.load().
 net.onInit = ({ params, edits, timeOfDay: tod }) => {
@@ -963,6 +1041,11 @@ const menu = createMenu({
     join: (code) => net.join(code),
     leave: () => net.leave(),
     getStatus: () => net.status,
+    getIdentity: () => ({ name: prefs.name ?? '', color: myIdentity().color }),
+    setIdentity: (name, color) => {
+      savePrefs({ name: name.trim().slice(0, 16), color });
+      net.sendHello();   // live-update the peer's view of us (no-op when offline)
+    },
   },
   lighting: {
     getSun: () => sunPeak, setSun: (v) => { sunPeak = v; },
@@ -978,12 +1061,16 @@ const menu = createMenu({
   playerView: {
     getFov: () => player.baseFov,
     // Apply to BOTH cameras so the view matches in survival/creative and spectator.
-    setFov: (v) => { player.setFov(v); spectator.camera.fov = v; spectator.camera.updateProjectionMatrix(); },
+    setFov: (v) => { player.setFov(v); spectator.camera.fov = v; spectator.camera.updateProjectionMatrix(); savePrefs({ fov: v }); },
     // One sensitivity drives the first-person look (PointerLockControls) and the
     // spectator orbit drag (OrbitControls). Applied live on the next mouse move.
     getMouseSensitivity: () => player.controls.pointerSpeed,
-    setMouseSensitivity: (v) => { player.controls.pointerSpeed = v; spectator.controls.rotateSpeed = v; },
+    setMouseSensitivity: (v) => { player.controls.pointerSpeed = v; spectator.controls.rotateSpeed = v; savePrefs({ sens: v }); },
+    // Raw pointer input (no OS mouse acceleration) — applies on the next pointer lock.
+    getRawInput: () => player.rawMouseInput,
+    setRawInput: (v) => { player.rawMouseInput = v; savePrefs({ raw: v }); },
   },
+  teleport: teleportTo,
   quality: {
     applyPreset: applyQualityPreset,
     getPreset: () => qualityPreset,

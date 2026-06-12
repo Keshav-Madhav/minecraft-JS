@@ -2217,10 +2217,13 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
   };
   const clearApproach = (doorXs: readonly number[], z0: number, base: number, stairs: StairSet, foundId: number) => {
     for (const wx of doorXs) {
-      for (let i = 1; i <= 4; i++) {
+      // Run extended 4 → 8: on a steep walk-out (platformDoor allows the lane to
+      // sit up to maxSpread below base) the old 4-step run could end mid-air,
+      // leaving an unclimbable drop back up to the door.
+      for (let i = 1; i <= 8; i++) {
         const wz = z0 - i, sh = colAt(wx, wz).height;
         // walk-out headroom over the descending run (always above-surface: the
-        // lane is bounded by base via platformDoor for i≤3; the max() guards i=4)
+        // lane is bounded by base via platformDoor for i≤3; the max() guards i>3)
         for (let wy = Math.max(base + 1 - i, sh) + 1; wy <= base + 3; wy++) place(wx, wy, wz, B.air);
         const stepY = base + 2 - i;            // i=1 → the classic base+1 doorstep
         if (sh >= stepY) break;                // ground meets the run — flush walk-off
@@ -2264,7 +2267,13 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
   };
   // Gable roof (saddle): two slopes meeting at a ridge along the longer axis.
   // Adds a 1-block overhang on the eaves for a proper medieval silhouette.
-  const gableRoof = (x0: number, z0: number, x1: number, z1: number, y0: number, stairs: StairSet, capSlab: number) => {
+  // `endId` (id or per-cell picker) closes the triangular GABLE END WALLS at the
+  // two ridge ends — without it the attic is an open void you can see straight
+  // into. The rect passed in is the wall rect +1 overhang on every side, so the
+  // end-wall planes sit one block inside the rect ends.
+  type CellPick = number | ((wx: number, wy: number, wz: number) => number);
+  const pick = (p: CellPick, wx: number, wy: number, wz: number) => typeof p === 'function' ? p(wx, wy, wz) : p;
+  const gableRoof = (x0: number, z0: number, x1: number, z1: number, y0: number, stairs: StairSet, capSlab: number, endId?: CellPick) => {
     const dx = x1 - x0 + 1, dz = z1 - z0 + 1;
     if (dx >= dz) {
       const rows = Math.ceil(dz / 2);
@@ -2273,6 +2282,10 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
         if (za > zb) break;
         if (za === zb) for (let wx = x0; wx <= x1; wx++) place(wx, y, za, capSlab);
         else for (let wx = x0; wx <= x1; wx++) { place(wx, y, za, stairs[2]); place(wx, y, zb, stairs[3]); }
+        if (endId !== undefined) for (let wz = za + 1; wz <= zb - 1; wz++) {
+          place(x0 + 1, y, wz, pick(endId, x0 + 1, y, wz));
+          place(x1 - 1, y, wz, pick(endId, x1 - 1, y, wz));
+        }
       }
     } else {
       const rows = Math.ceil(dx / 2);
@@ -2281,6 +2294,10 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
         if (xa > xb) break;
         if (xa === xb) for (let wz = z0; wz <= z1; wz++) place(xa, y, wz, capSlab);
         else for (let wz = z0; wz <= z1; wz++) { place(xa, y, wz, stairs[0]); place(xb, y, wz, stairs[1]); }
+        if (endId !== undefined) for (let wx = xa + 1; wx <= xb - 1; wx++) {
+          place(wx, y, z0 + 1, pick(endId, wx, y, z0 + 1));
+          place(wx, y, z1 - 1, pick(endId, wx, y, z1 - 1));
+        }
       }
     }
   };
@@ -2402,7 +2419,7 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     // TOP PLATE: log
     walls(x0, z0, x1, z1, base + 5, base + 5, logId);
     // GABLE ROOF (with 1-block eave overhang) — ridge runs along x (longer side)
-    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 6, roofSt, roofSlab);
+    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 6, roofSt, roofSlab, plankId);
     // CHIMNEY through the ridge on the +x gable
     chimney(x1 - 1, z1 - 1, base + 1, base + 9);
     // FRONT DOOR + step up + log lintel
@@ -2422,14 +2439,18 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     place(x1 - 1, base + 2, z1 - 1, B.craftingTable); place(x1 - 1, base + 2, z1 - 2, B.bookshelf);
     place(x1 - 1, base + 2, oz, B.furnace);
     place(x0 + 1, base + 2, oz, B.barrel); place(x0 + 1, base + 3, oz, B.flowerPot);
-    // FENCE-SUPPORTED FRONT PORCH AWNING: 2 fence posts + a roof slab plate
+    // FENCE-SUPPORTED FRONT PORCH AWNING: 2 fence posts + a roof slab plate.
+    // The slab plate sits at base+4 (NOT base+3 = the door's upper half): a slab
+    // at head height directly in front of the door blocked walking through it.
     place(ox - 2, base + 2, z0 - 1, B.oakFence);
     place(ox + 2, base + 2, z0 - 1, B.oakFence);
-    place(ox - 2, base + 3, z0 - 1, B.oakSlab);
-    place(ox - 1, base + 3, z0 - 1, B.oakSlab);
-    place(ox, base + 3, z0 - 1, B.oakSlab);
-    place(ox + 1, base + 3, z0 - 1, B.oakSlab);
-    place(ox + 2, base + 3, z0 - 1, B.oakSlab);
+    place(ox - 2, base + 3, z0 - 1, B.oakFence);
+    place(ox + 2, base + 3, z0 - 1, B.oakFence);
+    place(ox - 2, base + 4, z0 - 1, B.oakSlab);
+    place(ox - 1, base + 4, z0 - 1, B.oakSlab);
+    place(ox, base + 4, z0 - 1, B.oakSlab);
+    place(ox + 1, base + 4, z0 - 1, B.oakSlab);
+    place(ox + 2, base + 4, z0 - 1, B.oakSlab);
     // INTERIOR LIGHT (hung from ridge): lantern reads as a warm hearth lamp.
     // Glowstone is a Nether block — overworld houses use lanterns / torches.
     place(ox, base + 5, oz, B.lantern);
@@ -2471,15 +2492,18 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     fillRect(x0 + 1, z0 + 1, x1 - 1, z1 - 1, base + 5, plankId);
     fillRect(x0 + 1, z0 + 1, x1 - 1, z1 - 1, base + 9, plankId);
     // GABLE ROOF with overhang
-    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 10, roofSt, roofSlab);
+    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 10, roofSt, roofSlab, plankId);
     // CHIMNEY through the +x gable
     chimney(x1 - 1, z1 - 1, base + 1, base + 13);
     // FRONT DOOR + porch awning supported by fence posts
     place(ox, base + 2, z0, B.oakDoorLowerClosed); place(ox, base + 3, z0, B.oakDoorUpperClosed);
     place(ox, base + 4, z0, logId);
+    // Awning at base+4 (a base+3 slab sat at door-head height and blocked entry).
     place(ox - 2, base + 2, z0 - 1, B.oakFence);
     place(ox + 2, base + 2, z0 - 1, B.oakFence);
-    for (let dx = -2; dx <= 2; dx++) place(ox + dx, base + 3, z0 - 1, B.oakSlab);
+    place(ox - 2, base + 3, z0 - 1, B.oakFence);
+    place(ox + 2, base + 3, z0 - 1, B.oakFence);
+    for (let dx = -2; dx <= 2; dx++) place(ox + dx, base + 4, z0 - 1, B.oakSlab);
     // WINDOWS (2 storeys, all sides)
     for (const fy of [base + 3, base + 7]) {
       place(x0, fy, oz, B.glass); place(x1, fy, oz, B.glass);
@@ -2559,7 +2583,7 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     }
     walls(x0, z0, x1, z1, base + 7, base + 7, B.darkOakLog);
     // GABLE ROOF (dark oak palette uses oak stairs since no dark-oak stairs exist)
-    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 8, OAK_ST, B.oakSlab);
+    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 8, OAK_ST, B.oakSlab, weatheredStoneBricks);
     // INNER BOOKSHELF LINING — leaves a 1-block gap above for clerestory windows
     walls(x0 + 1, z0 + 1, x1 - 1, z1 - 1, base + 2, base + 4, B.bookshelf);
     // ENTRY ALCOVE clear + door with chiseled-stone lintel
@@ -2600,7 +2624,7 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     }
     walls(x0, z0, x1, z1, base + 6, base + 6, B.darkOakLog);
     // DARK-OAK GABLE ROOF
-    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 7, OAK_ST, B.oakSlab);
+    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 7, OAK_ST, B.oakSlab, weatheredStoneBricks);
     // ENTRANCE (open arch — no door, blacksmiths stay open)
     place(ox, base + 2, z0, B.air); place(ox, base + 3, z0, B.air); place(ox, base + 4, z0, B.air);
     place(ox - 1, base + 4, z0, OAK_ST[1]); place(ox + 1, base + 4, z0, OAK_ST[0]);
@@ -2647,7 +2671,7 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     walls(x0, z0, x1, z1, base + 7, base + 7, B.tree);    // top plate
     // HAY-BALE THATCHED ROOF (gabled with hay slabs as the cap)
     fillRect(x0 + 1, z0 + 1, x1 - 1, z1 - 1, base + 7, B.oakPlanks);
-    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 8, OAK_ST, B.oakSlab);
+    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 8, OAK_ST, B.oakSlab, B.oakPlanks);
     // Replace the central ridge with hay bales for thatched effect
     for (let wx = x0; wx <= x1; wx++) {
       const idx = wx - x0;
@@ -2659,9 +2683,10 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
       place(ox + dx, base + 3, z0, B.oakDoorUpperClosed);
     }
     place(ox - 1, base + 4, z0, B.tree); place(ox, base + 4, z0, B.tree);
-    // PORCH AWNING (fence-supported, slab roof)
-    for (const dx of [-2, 2]) place(ox + dx, base + 2, z0 - 1, B.oakFence);
-    for (const dx of [-3, -2, -1, 0, 1, 2, 3]) place(ox + dx, base + 3, z0 - 1, B.oakSlab);
+    // PORCH AWNING (fence-supported, slab roof) at base+4 — a base+3 slab sat at
+    // door-head height and blocked the 2-wide entrance.
+    for (const dx of [-2, 2]) { place(ox + dx, base + 2, z0 - 1, B.oakFence); place(ox + dx, base + 3, z0 - 1, B.oakFence); }
+    for (const dx of [-3, -2, -1, 0, 1, 2, 3]) place(ox + dx, base + 4, z0 - 1, B.oakSlab);
     // WINDOWS upstairs
     for (const dx of [-3, -1, 1, 3]) place(ox + dx, base + 5, z0, B.glass);
     for (const dx of [-3, -1, 1, 3]) place(ox + dx, base + 5, z1, B.glass);
@@ -3189,7 +3214,7 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     fillRect(mx0 + 1, mz0 + 1, mx1 - 1, mz1 - 1, F3, B.darkOakPlanks);
     fillRect(mx0 + 1, mz0 + 1, mx1 - 1, mz1 - 1, ROOF, B.darkOakPlanks);   // roof plate
     // ===== ROOF: BIG GABLE with eave overhang =====
-    gableRoof(mx0 - 1, mz0 - 1, mx1 + 1, mz1 + 1, ROOF + 1, OAK_ST, B.oakSlab);
+    gableRoof(mx0 - 1, mz0 - 1, mx1 + 1, mz1 + 1, ROOF + 1, OAK_ST, B.oakSlab, B.darkOakPlanks);
     // ===== CHIMNEYS through the roof (3 of them along the ridge) =====
     chimney(mx0 + 2, oz, F0 + 2, ROOF + 8);
     chimney(mx1 - 2, oz, F0 + 2, ROOF + 8);
@@ -3718,7 +3743,7 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     }
     // ROOF PLATE + GABLE ROOF
     fillRect(ox - r, oz - r, ox + r, oz + r, fy + 4, B.darkOakPlanks);
-    gableRoof(ox - r - 1, oz - r - 1, ox + r + 1, oz + r + 1, fy + 5, OAK_ST, B.oakSlab);
+    gableRoof(ox - r - 1, oz - r - 1, ox + r + 1, oz + r + 1, fy + 5, OAK_ST, B.oakSlab, B.darkOakPlanks);
     // CHIMNEY (cobble) through the roof
     chimney(ox - r + 1, oz + r - 1, fy + 1, fy + 9);
     // DOOR (south side) + log lintel
@@ -3777,7 +3802,7 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
     }
     walls(x0, z0, x1, z1, base + 7, base + 7, B.darkOakLog);
     // STONE GABLE ROOF (stair slopes, slab ridge) — reads as slate at distance
-    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 8, STN_ST, B.stoneSlab);
+    gableRoof(x0 - 1, z0 - 1, x1 + 1, z1 + 1, base + 8, STN_ST, B.stoneSlab, weatheredStoneBricks);
     // DOOR (-z wall) + chiseled lintel + entry alcove
     place(ox, base + 2, z0 + 1, B.air); place(ox, base + 3, z0 + 1, B.air);
     place(ox, base + 2, z0, B.oakDoorLowerClosed); place(ox, base + 3, z0, B.oakDoorUpperClosed);
@@ -3959,20 +3984,40 @@ function generateStructures(simplex: SimplexNoise, params: ChunkParams, size: Ch
       }
     }
 
+    // A point is "inside the village fabric" if it sits in a building's
+    // footprint+overhang (±7) or its door approach lane (door faces -z, the
+    // graded walk-out runs up to 8 cells out) — used to keep the watchtower
+    // and the streetlamps from spawning inside/in front of houses.
+    const nearBuilding = (wx: number, wz: number, pad: number) =>
+      placed.some(p => Math.abs(p.x - wx) < pad && wz - p.z > -(pad + 8) && wz - p.z < pad);
+
     // ---- 5) Watchtower at the village outskirts (sits well outside the
     //         building cluster, connected back to the plaza via its own
     //         winding path; no trail since the village's roads link things) ----
+    // The radial building slots reach out to ~40 blocks, so a random angle at
+    // r=42 could land the tower ON a house. Deterministically rotate through
+    // candidate angles until one clears every placed building (skip if none).
     const towerAng = rng.random() * Math.PI * 2;
-    const towerX = ox + Math.round(Math.cos(towerAng) * 42);
-    const towerZ = oz + Math.round(Math.sin(towerAng) * 42);
-    tower(towerX, towerZ, rng, false);
-    drawWindingPath(towerX, towerZ, ox, oz, 1, B.gravel, B.cobblestone, roadAvoid);
+    for (let t = 0; t < 8; t++) {
+      const ang = towerAng + t * (Math.PI / 4);
+      const towerX = ox + Math.round(Math.cos(ang) * 42);
+      const towerZ = oz + Math.round(Math.sin(ang) * 42);
+      if (nearBuilding(towerX, towerZ, 20)) continue;
+      tower(towerX, towerZ, rng, false);
+      drawWindingPath(towerX, towerZ, ox, oz, 1, B.gravel, B.cobblestone, roadAvoid);
+      break;
+    }
 
     // ---- 6) STREETLAMPS along each road every ~8 steps ----
+    // Skip lamp spots that fall inside a building / its door approach (the
+    // f=0.85 spot of a near building used to land INSIDE the house, leaving
+    // log posts blocking walls and doors) or on the plaza (it has its own).
     for (const s of placed) {
       for (let f = 0.25; f <= 0.85; f += 0.3) {
         const lx = Math.round(ox + (s.x - ox) * f);
         const lz = Math.round(oz + (s.z - oz) * f);
+        if (nearBuilding(lx, lz, 8)) continue;
+        if (Math.abs(lx - ox) <= plazaR + 1 && Math.abs(lz - oz) <= plazaR + 1) continue;
         const c = colAt(lx, lz);
         if (c.height > sea && onSurfaceAllowed(c.surfaceId)) {
           lampPost(lx, lz, c.height, B.darkOakLog);

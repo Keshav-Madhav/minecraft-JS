@@ -24,11 +24,12 @@ const JUMP_BUFFER = 0.16;        // s a jump press is remembered (fires the inst
 const SPRINT_JUMP_BOOST = 1.18;  // forward-speed multiplier kicked in on a sprint-jump
 const DOUBLE_TAP_MS = 280;       // double-tap-forward window to start sprinting
 const BASE_FOV = 70, FOV_SPRINT_KICK = 8;   // sprint widens FOV by this many degrees
-// --- flight (creative + survival's "enable flight") -------------------------
-const FLY_BASE = 1.6;            // fly speed = maxSpeed × this (horizontal AND vertical)
+// --- flight (creative) -------------------------------------------------------
+const FLY_BASE = 1.6;            // fly speed = maxSpeed × this (horizontal)
 const FLY_SPRINT = 3.0;          // fly-sprint multiplier (double-tap-forward while flying)
 const FLY_ACCEL = 80;            // responsive full-control acceleration while flying
 const FLY_TOGGLE_MS = 300;       // double-tap-space window to toggle flight on/off
+const FLY_VERT = 0.7;            // vertical fly speed = horizontal × this (standard game feel)
 // move cur toward target by at most maxStep (per-substep linear acceleration).
 const approach = (cur: number, target: number, maxStep: number) => {
   const d = target - cur;
@@ -98,6 +99,13 @@ export class Player {
   selectionHelper: Three.Mesh;
 
   activeBlockId = blocks.air.id;
+  // Fired whenever the active block changes (hotbar key or right-click pick) —
+  // main.ts shows the block name on the HUD so picks of non-hotbar blocks are visible.
+  onActiveBlockChange?: (id: number) => void;
+
+  // Raw pointer input (pointer lock unadjustedMovement): bypasses OS mouse
+  // acceleration. Applied on the NEXT pointer lock; toggled in Settings → Player.
+  rawMouseInput = false;
 
   // When false (e.g. the world map is open) keyboard input is ignored so the
   // pointer isn't re-grabbed and the player doesn't move.
@@ -136,6 +144,16 @@ export class Player {
     this.updateRayCast(world)
     this.tool.update();
     this.#updateFov();
+  }
+
+  // Select the active block (hotbar key or right-click pick): updates the hotbar
+  // highlight (no-op for non-hotbar ids), the held tool, and notifies the HUD.
+  setActiveBlock(id: number) {
+    document.getElementById(`toolbar-${this.activeBlockId}`)?.classList.remove('selected');
+    this.activeBlockId = id;
+    document.getElementById(`toolbar-${id}`)?.classList.add('selected');
+    this.tool.visible = id === blocks.air.id;
+    this.onActiveBlockChange?.(id);
   }
 
   // Toggle flight (double-tap space, or set by the mode switch). Clears vertical
@@ -324,7 +342,7 @@ export class Player {
     }
 
     const vy = (this.#kUp ? 1 : 0) - (this.#kDown ? 1 : 0);
-    if (vy !== 0) this.velocity.y = approach(this.velocity.y, vy * speed, accel);
+    if (vy !== 0) this.velocity.y = approach(this.velocity.y, vy * speed * FLY_VERT, accel);
     else { this.velocity.y *= damp; if (Math.abs(this.velocity.y) < 0.05) this.velocity.y = 0; }
   }
 
@@ -358,7 +376,7 @@ export class Player {
       event.key === 'F11' ||
       event.key === 'F12'
     )) {
-      this.controls.lock();
+      this.controls.lock(this.rawMouseInput);
     }
 
     // Letters lowercased so Shift/CapsLock combos (e.g. Shift+W while sprinting,
@@ -374,10 +392,7 @@ export class Player {
       case '6':
       case '7':
       case '8':
-        document.getElementById(`toolbar-${this.activeBlockId}`)?.classList.remove('selected')
-        this.activeBlockId = parseInt(key);
-        document.getElementById(`toolbar-${this.activeBlockId}`)?.classList.add('selected')
-        this.tool.visible = this.activeBlockId === blocks.air.id;
+        this.setActiveBlock(parseInt(key));
         break;
       case 'w':
         // double-tap forward starts sprinting (sticky until forward is released)

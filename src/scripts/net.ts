@@ -49,7 +49,10 @@ type InitMsg = { t: 'init'; params: ChunkParams; edits: Record<string, number>; 
 type EditMsg = { t: 'edit'; x: number; y: number; z: number; id: number };
 type PosMsg = { t: 'pos'; p: [number, number, number]; yaw: number; pitch: number };
 type TimeMsg = { t: 'time'; tod: number };
-type NetMsg = InitMsg | EditMsg | PosMsg | TimeMsg;
+// Identity card (name + shirt colour) — sent by BOTH sides on connect and again
+// whenever the player edits their character mid-session.
+type HelloMsg = { t: 'hello'; name: string; color: string };
+type NetMsg = InitMsg | EditMsg | PosMsg | TimeMsg | HelloMsg;
 
 // Room codes: 6 chars, no lookalikes (0/O, 1/I/L). The code IS the host's peer
 // id (namespaced) — the broker does the rendezvous, no room registry needed.
@@ -74,7 +77,9 @@ export class Net {
   onPos?: (p: [number, number, number], yaw: number, pitch: number) => void;
   onTime?: (tod: number) => void;
   onPeerChange?: (connected: boolean) => void;   // remote avatar show/hide
+  onHello?: (name: string, color: string) => void;   // peer's identity card (name tag + shirt)
   getInitPayload?: () => { params: ChunkParams; edits: Record<string, number>; timeOfDay: number };
+  getHello?: () => { name: string; color: string };
 
   private peer: Peer | null = null;
   private conn: DataConnection | null = null;
@@ -151,6 +156,7 @@ export class Net {
         const p = this.getInitPayload();
         this.sendMsg({ t: 'init', params: p.params, edits: p.edits, timeOfDay: p.timeOfDay });
       }
+      this.sendHello();   // both sides introduce themselves (name + shirt colour)
       this.onPeerChange?.(true);
     });
     conn.on('data', (raw) => this.handle(raw));
@@ -207,6 +213,14 @@ export class Net {
       case 'time':
         if (!this.isHost && fin(m.tod)) this.onTime?.(((m.tod % 1) + 1) % 1);   // host owns the clock
         break;
+      case 'hello': {
+        if (typeof m.name !== 'string' || typeof m.color !== 'string') return;
+        // Untrusted text: strip control chars, cap the length; colour must be #rrggbb.
+        const name = m.name.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 16);
+        const color = /^#[0-9a-f]{6}$/i.test(m.color) ? m.color : '#2fa39b';
+        this.onHello?.(name || 'Friend', color);
+        break;
+      }
     }
   }
 
@@ -240,6 +254,12 @@ export class Net {
     this.sendMsg({ t: 'pos', p: [p.x, p.y, p.z], yaw, pitch });
   }
   sendTime(tod: number) { if (this.isHost) this.sendMsg({ t: 'time', tod }); }
+  // (Re)send our identity card — on connect, and live when the player edits it.
+  sendHello() {
+    if (!this.getHello) return;
+    const h = this.getHello();
+    this.sendMsg({ t: 'hello', name: h.name, color: h.color });
+  }
   // Re-snapshot the world to the guest (host regenerate / load while connected).
   sendInit() {
     if (this.isHost && this.getInitPayload) {

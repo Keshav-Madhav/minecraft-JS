@@ -29,6 +29,8 @@ const MAX_CACHE = 1200;       // LRU cap on in-memory tile canvases (touch-on-us
 const MAP_WORKERS = Math.max(3, Math.min(8, navigator.hardwareConcurrency || 4));
 const MAX_TILE_OUTSTANDING = MAP_WORKERS * 6;   // queue a few per worker so none idles
 
+const HINT_DEFAULT = 'Drag to pan · scroll to zoom · click to pick a teleport spot · Esc/M to close';
+
 // Choose the world-size whose pixels are at-or-finer than the screen, so tiles
 // are crisp (never upscaled into a muddy blur).
 function pickTileWorld(worldPerPixel: number): number {
@@ -92,6 +94,10 @@ export class WorldMap {
   // fullscreen map
   private overlay: HTMLElement;
   private big: HTMLCanvasElement;
+  private hint: HTMLElement;
+  // Teleport is a 2-click flow: first click drops a marker showing the target
+  // coords; clicking the marker confirms, clicking elsewhere moves it.
+  private pendingTp: { wx: number, wz: number } | null = null;
   private open = false;
   private centerX = 0;
   private centerZ = 0;
@@ -130,14 +136,14 @@ export class WorldMap {
     this.overlay.className = 'worldmap';
     this.big = document.createElement('canvas');
     this.big.className = 'worldmap__canvas';
-    const hint = document.createElement('div');
-    hint.className = 'worldmap__hint';
-    hint.textContent = 'Drag to pan · scroll to zoom · click to teleport · Esc/M to close';
+    this.hint = document.createElement('div');
+    this.hint.className = 'worldmap__hint';
+    this.hint.textContent = HINT_DEFAULT;
     const close = document.createElement('button');
     close.className = 'worldmap__close';
     close.textContent = '✕';
     close.addEventListener('click', () => this.close());
-    this.overlay.append(this.big, hint, close);
+    this.overlay.append(this.big, this.hint, close);
     document.body.append(this.overlay);
 
     this.bindMapEvents();
@@ -228,8 +234,16 @@ export class WorldMap {
       try { this.big.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
       if (!this.dragMoved) {
         const { wx, wz } = this.screenToWorld(e.clientX, e.clientY);
-        this.opts.onTeleport(wx, wz);
-        this.close();
+        const p = this.pendingTp;
+        // Second click on (near) the marker confirms; anywhere else (re)places it.
+        if (p && Math.abs(wx - p.wx) <= 14 * this.wpp && Math.abs(wz - p.wz) <= 14 * this.wpp) {
+          this.pendingTp = null;
+          this.opts.onTeleport(p.wx, p.wz);
+          this.close();
+        } else {
+          this.pendingTp = { wx, wz };
+          this.hint.textContent = `Teleport to (${wx}, ${wz})?  Click the marker to confirm · click elsewhere to move it`;
+        }
       }
     });
     // Gentle, proportional zoom (exp of scroll delta).
@@ -257,6 +271,8 @@ export class WorldMap {
   openMap() {
     if (this.open) return;
     const p = this.opts.getPlayer();
+    this.pendingTp = null;
+    this.hint.textContent = HINT_DEFAULT;
     this.centerX = p.x; this.centerZ = p.z;
     const aspect = window.innerHeight / window.innerWidth;
     this.big.width = 640;
@@ -431,13 +447,41 @@ export class WorldMap {
         this.overlayLoadedChunks(this.bigBuf, p.x, p.z);   // instant + in-sync over the (slower) worker tiles
         this.pumpRequests();
       }
-      // Per-frame: one buffer blit + the live player dot.
+      // Per-frame: one buffer blit + the live player dot + the teleport marker.
       const ctx = this.big.getContext('2d');
       if (ctx && this.bigBuf) {
         ctx.drawImage(this.bigBuf, 0, 0);
         this.drawPlayerOnMap(p.x, p.z);
+        this.drawPendingMarker();
       }
     }
+  }
+
+  // Teleport target marker (2-click flow): ringed crosshair + a coords label so
+  // you can note the destination before committing.
+  private drawPendingMarker() {
+    const p = this.pendingTp;
+    if (!p) return;
+    const ctx = this.big.getContext('2d'); if (!ctx) return;
+    const sx = this.big.width / 2 + (p.wx - this.centerX) / this.wpp;
+    const sy = this.big.height / 2 + (p.wz - this.centerZ) / this.wpp;
+    ctx.strokeStyle = '#ffd34d';
+    ctx.fillStyle = 'rgba(255, 211, 77, 0.22)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(sx, sy, 9, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(sx - 13, sy); ctx.lineTo(sx + 13, sy);
+    ctx.moveTo(sx, sy - 13); ctx.lineTo(sx, sy + 13);
+    ctx.stroke();
+    const label = `(${p.wx}, ${p.wz}) — click to teleport`;
+    ctx.font = '12px ui-sans-serif, system-ui, sans-serif';
+    const w = ctx.measureText(label).width;
+    ctx.fillStyle = 'rgba(11, 15, 23, 0.85)';
+    ctx.fillRect(sx - w / 2 - 6, sy - 36, w + 12, 19);
+    ctx.fillStyle = '#ffd34d';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, sx, sy - 22);
+    ctx.textAlign = 'left';
   }
 
   // Overlay the game's already-generated chunk tiles onto the fullscreen map.
