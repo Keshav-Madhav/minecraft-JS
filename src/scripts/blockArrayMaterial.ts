@@ -220,6 +220,12 @@ LAYER_URLS[TEXTURE_LAYER.jackLanternTop] = B + 'jack_lantern_top.png';
 
 const TILE = 16;
 
+// Texture file for a layer index (null for generated layers like `white`).
+// Used by the inventory UI to draw block icons from the same source PNGs.
+export function textureLayerUrl(layer: number): string | null {
+  return LAYER_URLS[layer] ?? null;
+}
+
 // Cutout-mip fix (Voxy's "solidify" pass): transparent texels in our PNGs carry
 // RGB(0,0,0), so the driver's mip chain averages BLACK into every cutout layer —
 // distant leaves/foliage read darker the further the mip (the LOD canopy

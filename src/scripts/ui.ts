@@ -447,8 +447,10 @@ export function createMenu(opts: MenuOptions): MenuController {
     ['Boost (Spectator)', 'Ctrl'],
     ['Break block', 'Left click'],
     ['Place / Use block', 'Right click'],
-    ['Pick block', 'Right click on block'],
-    ['Hotbar', '0 – 8'],
+    ['Pick block', 'Middle click  (or right click with an empty hand)'],
+    ['Hotbar', '1 – 9  ·  scroll wheel cycles'],
+    ['Inventory', 'E  (all blocks · search · drag to hotbar)'],
+    ['Fly speed', 'Ctrl + scroll while flying'],
     ['Open map', 'M  (or click the minimap)'],
     ['Respawn', 'R'],
     ['Menu', 'Esc'],
@@ -628,7 +630,13 @@ export function createMenu(opts: MenuOptions): MenuController {
     open = v;
     root.classList.toggle('menu--open', v);
     if (v) { resumeBtn.textContent = everPlayed ? 'Resume' : 'Play'; syncMode(); syncSettings(); }
-    else { everPlayed = true; }
+    else {
+      everPlayed = true;
+      // A focused menu input (room code / character name) would keep swallowing
+      // game keys via its stopPropagation keydown handler after the menu hides.
+      const focused = document.activeElement as HTMLElement | null;
+      if (focused && root.contains(focused)) focused.blur();
+    }
   };
 
   return {

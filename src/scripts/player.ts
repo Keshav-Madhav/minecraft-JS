@@ -9,8 +9,8 @@ const screeCenter=new Three.Vector2();
 // the player drops onto the surface instead of inside a mountain.
 const SPAWN = new Three.Vector3(0, 340, 0);
 // Scratch objects reused every frame to avoid per-frame allocations.
-const _selected = new Three.Vector3();
 const _targeted = new Three.Vector3();
+const _place = new Three.Vector3();
 
 // ---- movement tuning -------------------------------------------------------
 const SPRINT_MULT = 1.35;        // sprint speed = maxSpeed × this
@@ -94,14 +94,13 @@ export class Player {
   cameraHelper = new Three.CameraHelper(this.camera);
 
   raycaster = new Three.Raycaster(undefined, undefined, 0, 4);
-  selectedCoords:  Three.Vector3 | null = null;
-  targetedBlock:   Three.Vector3 | null = null;   // the SOLID block under the crosshair (for right-click "use")
+  targetedBlock: Three.Vector3 | null = null;   // the SOLID block under the crosshair (break / use / pick)
+  placeCell:     Three.Vector3 | null = null;   // the empty cell the ray entered the hit from (place target)
   selectionHelper: Three.Mesh;
 
   activeBlockId = blocks.air.id;
-  // Fired whenever the active block changes (hotbar key or right-click pick) —
-  // main.ts shows the block name on the HUD so picks of non-hotbar blocks are visible.
-  onActiveBlockChange?: (id: number) => void;
+  // Hotbar digit keys (1-9) — wired by main.ts to the inventory.
+  onHotbarKey?: (slot: number) => void;
 
   // Raw pointer input (pointer lock unadjustedMovement): bypasses OS mouse
   // acceleration. Applied on the NEXT pointer lock; toggled in Settings → Player.
@@ -146,14 +145,11 @@ export class Player {
     this.#updateFov();
   }
 
-  // Select the active block (hotbar key or right-click pick): updates the hotbar
-  // highlight (no-op for non-hotbar ids), the held tool, and notifies the HUD.
+  // Set the held block (driven by the inventory's selected slot). The pickaxe
+  // tool shows for an empty hand; a held block hides it.
   setActiveBlock(id: number) {
-    document.getElementById(`toolbar-${this.activeBlockId}`)?.classList.remove('selected');
     this.activeBlockId = id;
-    document.getElementById(`toolbar-${id}`)?.classList.add('selected');
     this.tool.visible = id === blocks.air.id;
-    this.onActiveBlockChange?.(id);
   }
 
   // Toggle flight (double-tap space, or set by the mode switch). Clears vertical
@@ -224,19 +220,16 @@ export class Player {
     }
 
     if (hit) {
-      // Breaking targets the hit cell; placing targets the cell the ray came
-      // from (the empty neighbour across the entered face) — same cells the old
-      // ±0.01-nudge-and-round produced from the mesh intersection point.
-      if (this.activeBlockId === air) this.selectedCoords = _selected.set(ix, iy, iz);
-      else this.selectedCoords = _selected.set(px, py, pz);
-      // The SOLID block actually under the crosshair — used for right-click
-      // "use" (open a door/trapdoor) regardless of held block.
+      // MC semantics: the SOLID hit cell is the break/use/pick target (and the
+      // highlight), the cell the ray came from (the empty neighbour across the
+      // entered face) is where a held block places.
       this.targetedBlock = _targeted.set(ix, iy, iz);
-      this.selectionHelper.position.copy(this.selectedCoords);
+      this.placeCell = _place.set(px, py, pz);
+      this.selectionHelper.position.copy(this.targetedBlock);
       this.selectionHelper.visible = true;
     } else {
-      this.selectedCoords = null;
       this.targetedBlock = null;
+      this.placeCell = null;
       this.selectionHelper.visible = false;
     }
   }
@@ -383,7 +376,6 @@ export class Player {
     // which fires as 'W') still match; named keys like 'Shift'/' ' pass through.
     const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
     switch(key) {
-      case '0':
       case '1':
       case '2':
       case '3':
@@ -392,7 +384,8 @@ export class Player {
       case '6':
       case '7':
       case '8':
-        this.setActiveBlock(parseInt(key));
+      case '9':
+        this.onHotbarKey?.(parseInt(key) - 1);
         break;
       case 'w':
         // double-tap forward starts sprinting (sticky until forward is released)

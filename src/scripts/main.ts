@@ -4,7 +4,7 @@ import { Player } from './player';
 import { Physics } from './physics';
 import { World } from './world';
 import { blocks } from './blocks';
-import { BLOCK_IDS } from './blockTypes';
+import { BLOCK_IDS, isPlant, isLiquid } from './blockTypes';
 import { ModelLoader } from './ModelLoader';
 import { Clouds } from './clouds';
 import { WorldMap } from './map';
@@ -15,6 +15,7 @@ import { LightManager } from './lightManager';
 import { PostFX } from './ultraGraphics';
 import { Net } from './net';
 import { RemotePlayer } from './remotePlayer';
+import { Inventory } from './inventory';
 
 // Get window size
 let winWidth = window.innerWidth;
@@ -53,7 +54,10 @@ const SKY_COLOR = 0x80a0e0;
 // The knobs people actually re-tune every session: mouse sensitivity, FOV, raw
 // input, and the quality preset. Loaded at boot, saved on change. World/terrain
 // settings deliberately NOT persisted (the seed UI owns those).
-type Prefs = { fov?: number, sens?: number, raw?: boolean, preset?: string, name?: string, color?: string };
+type Prefs = {
+  fov?: number, sens?: number, raw?: boolean, preset?: string, name?: string, color?: string,
+  hotbar?: (string | null)[],
+};
 const PREFS_KEY = 'mcjs-prefs-v1';
 const prefs: Prefs = (() => {
   try { return JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') as Prefs; } catch { return {}; }
@@ -450,28 +454,41 @@ statsOverlayEl.id = 'stats-overlay';
 statsOverlayEl.style.display = 'none';
 document.body.appendChild(statsOverlayEl);
 
-// Active-block label above the hotbar: always shows WHAT you're holding — the
-// only feedback when a right-click pick selects a block that has no hotbar slot.
+// Active-block label above the hotbar: always shows WHAT you're holding.
 const activeBlockEl = document.createElement('div');
 activeBlockEl.id = 'active-block-label';
 document.body.appendChild(activeBlockEl);
-const _idToName: Record<number, string> = {};
-for (const [k, v] of Object.entries(BLOCK_IDS)) {
-  if (_idToName[v as number] === undefined)
-    _idToName[v as number] = k.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase());
-}
-player.onActiveBlockChange = (id) => {
-  activeBlockEl.textContent = id === blocks.air.id ? '⛏ Pickaxe' : (_idToName[id] ?? `Block #${id}`);
-  // retrigger the pop animation
-  activeBlockEl.classList.remove('active-block-label--pop');
-  void activeBlockEl.offsetWidth;
-  activeBlockEl.classList.add('active-block-label--pop');
-};
-player.onActiveBlockChange(player.activeBlockId);
+
+// HOTBAR + CREATIVE INVENTORY (E). The inventory owns the 9 hotbar slots and
+// the block-catalog overlay; the player just holds the selected slot's block.
+const inventory = new Inventory({
+  restore: prefs.hotbar,
+  persist: (slotKeys) => savePrefs({ hotbar: slotKeys }),
+  onSelectionChange: (entry) => {
+    player.setActiveBlock(entry ? entry.blockId : blocks.air.id);
+    activeBlockEl.textContent = entry ? entry.label : '✋ Hand — break blocks';
+    activeBlockEl.classList.remove('active-block-label--pop');
+    void activeBlockEl.offsetWidth;
+    activeBlockEl.classList.add('active-block-label--pop');
+  },
+  // Opening releases the pointer WITHOUT pausing (the world keeps rendering
+  // behind the overlay, like the map); closing re-grabs it.
+  onOpen: () => {
+    player.enabled = false;
+    document.exitPointerLock();
+    updateHudVisibility();
+  },
+  onClose: () => {
+    player.enabled = true;
+    if (!paused && isFPS() && !worldMap.isOpen()) player.controls.lock(player.rawMouseInput);
+    updateHudVisibility();
+  },
+});
+player.onHotbarKey = (slot) => inventory.select(slot);
 
 function updateHudVisibility() {
   const playing = !paused && !worldMap.isOpen();
-  const fpsPlay = isFPS() && playing;
+  const fpsPlay = isFPS() && playing && !inventory.isOpen();
   if (toolbarEl) toolbarEl.style.display = fpsPlay ? '' : 'none';
   activeBlockEl.style.display = fpsPlay ? '' : 'none';
   if (crosshairEl) crosshairEl.style.display = (fpsPlay && player.controls.isLocked) ? '' : 'none';
@@ -528,7 +545,7 @@ function resume() {
 // Pointer-lock events drive the FPS pause flow: Esc exits lock → menu opens.
 player.controls.addEventListener('lock', () => { paused = false; menu.close(); updateHudVisibility(); });
 player.controls.addEventListener('unlock', () => {
-  if (worldMap.isOpen() || !isFPS()) return;   // map / spectator manage themselves
+  if (worldMap.isOpen() || inventory.isOpen() || !isFPS()) return;   // map / inventory / spectator manage themselves
   if (!paused) pause();
 });
 
@@ -539,22 +556,29 @@ renderer.domElement.addEventListener('mousedown', () => {
   if (isFPS() && !paused && !worldMap.isOpen() && !player.controls.isLocked) player.controls.lock(player.rawMouseInput);
 });
 
-// Scroll adjusts FLIGHT SPEED while flying in Creative / Survival-flight (spectator
-// has its own wheel handler). Exponential, clamped — scroll up = faster.
+// Scroll cycles the HOTBAR (MC behaviour); Ctrl+scroll keeps the old flight-speed
+// adjust while flying (spectator has its own wheel handler).
 renderer.domElement.addEventListener('wheel', (e) => {
-  if (mode === 'spectator' || !player.flying || !player.controls.isLocked) return;
+  if (mode === 'spectator' || !player.controls.isLocked) return;
   e.preventDefault();
-  player.flySpeedScale = Math.min(8, Math.max(0.25, player.flySpeedScale * Math.exp(-e.deltaY * 0.0015)));
+  if (e.ctrlKey && player.flying) {
+    player.flySpeedScale = Math.min(8, Math.max(0.25, player.flySpeedScale * Math.exp(-e.deltaY * 0.0015)));
+  } else {
+    inventory.cycle(e.deltaY > 0 ? 1 : -1);   // scroll down → next slot, like MC
+  }
 }, { passive: false });
 
 document.addEventListener('keydown', (event) => {
   const k = event.key;
   if (k === 'm' || k === 'M') {
-    if (!paused) worldMap.toggle();
+    if (!paused && !inventory.isOpen()) worldMap.toggle();
+  } else if (k === 'e' || k === 'E') {
+    if (!paused && isFPS() && !worldMap.isOpen()) inventory.toggle();
   } else if (k === 'o' || k === 'O') {
-    toggleReferenceTextures();   // DEV-only texture compare
+    if (!inventory.isOpen()) toggleReferenceTextures();   // DEV-only texture compare
   } else if (k === 'Escape') {
-    if (worldMap.isOpen()) worldMap.close();
+    if (inventory.isOpen()) inventory.close();
+    else if (worldMap.isOpen()) worldMap.close();
     else if (paused) resume();
     else if (!isFPS()) pause();   // spectator has no pointer-lock event to hook
     // FPS + unpaused: the browser exits pointer lock → 'unlock' handler opens the menu
@@ -779,36 +803,62 @@ function updateSky(delta: number) {
   moon.target.position.copy(player.position);
 }
 
+// Would placing a block into cell `c` overlap the player's collider? (MC blocks
+// this too — otherwise placing at your feet traps you inside the new block.)
+function placeIntersectsPlayer(c: THREE.Vector3): boolean {
+  const p = player.position;   // camera sits at the TOP of the 1.8-tall collider
+  if (Math.max(Math.abs(c.x - p.x), Math.abs(c.z - p.z)) > 0.5 + player.radius) return false;
+  return c.y + 0.5 > p.y - player.height && c.y - 0.5 < p.y + 0.1;
+}
+
+// Stair entries auto-orient to the camera's facing (like MC): walking forward
+// climbs the stair, i.e. the tall back lands on the far side of your view.
+function orientedStairId(set: readonly [number, number, number, number]): number {
+  const d = player.camera.getWorldDirection(_camDir);
+  return Math.abs(d.x) > Math.abs(d.z) ? (d.x > 0 ? set[0] : set[1]) : (d.z > 0 ? set[2] : set[3]);
+}
+
+// MC mouse semantics: LEFT breaks the targeted block, MIDDLE picks it,
+// RIGHT uses it (door/trapdoor) or places the held block into the adjacent cell
+// (with an empty hand, RIGHT picks — handy fallback for mice without a wheel click).
 function onMouseDown(event: MouseEvent) {
   if (!player.controls.isLocked) return;   // also blocks edits in spectator / when paused
-  if (event.button === 2) {
-    const t = player.targetedBlock;
-    if (t && world.interactBlock(t.x, t.y, t.z)) return;
-    // Pick the SOLID block under the crosshair (selectedCoords is the empty
-    // neighbour while holding a block — picking that always returned air).
-    if (t) player.setActiveBlock(world.getBlock(t.x, t.y, t.z)?.id ?? blocks.air.id);
+  const t = player.targetedBlock;
+  if (event.button === 0) {
+    if (t) {
+      world.removeBlock(t.x, t.y, t.z);
+      player.tool.startAnimation();
+    }
     return;
   }
-  if (event.button === 0 && player.selectedCoords) {
-    const c = player.selectedCoords;
-    if (player.activeBlockId === blocks.air.id) {
-      world.removeBlock(c.x, c.y, c.z);
-      player.tool.startAnimation();
-    } else {
-      world.setBlock(c.x, c.y, c.z, player.activeBlockId);
-      if (player.activeBlockId === BLOCK_IDS.oakDoorLowerClosed) world.setBlock(c.x, c.y + 1, c.z, BLOCK_IDS.oakDoorUpperClosed);
-      // Beds are 2 cells (foot + head): auto-place the matching half one cell along
-      // the player's facing (cardinal) so a hotbar-placed bed is a complete bed, not
-      // an orphan half. Skip if that cell is occupied.
-      else if (player.activeBlockId === BLOCK_IDS.bedFoot || player.activeBlockId === BLOCK_IDS.bedHead) {
-        const d = player.camera.getWorldDirection(_camDir);
-        const dx = Math.abs(d.x) > Math.abs(d.z) ? Math.sign(d.x) : 0;
-        const dz = dx === 0 ? Math.sign(d.z) || 1 : 0;
-        const other = player.activeBlockId === BLOCK_IDS.bedFoot ? BLOCK_IDS.bedHead : BLOCK_IDS.bedFoot;
-        if ((world.getBlock(c.x + dx, c.y, c.z + dz)?.id ?? blocks.air.id) === blocks.air.id)
-          world.setBlock(c.x + dx, c.y, c.z + dz, other);
-      }
+  if (event.button === 1) {
+    event.preventDefault();   // no middle-click autoscroll
+    if (t) inventory.pickBlock(world.getBlock(t.x, t.y, t.z)?.id ?? blocks.air.id);
+    return;
+  }
+  if (event.button !== 2) return;
+  if (t && world.interactBlock(t.x, t.y, t.z)) return;
+  const entry = inventory.selectedEntry;
+  const c = player.placeCell;
+  if (entry && c) {
+    const id = entry.stairSet ? orientedStairId(entry.stairSet) : entry.blockId;
+    // Only COLLIDING blocks are barred from the player's own cells — placing a
+    // flower/torch at your feet is normal MC behaviour (they don't collide).
+    if (placeIntersectsPlayer(c) && !isPlant(id) && !isLiquid(id)) return;
+    world.setBlock(c.x, c.y, c.z, id);
+    // Multi-cell entries: doors/2-tall plants add their upper half, beds their head.
+    if (entry.upperId !== undefined) {
+      if ((world.getBlock(c.x, c.y + 1, c.z)?.id ?? blocks.air.id) === blocks.air.id)
+        world.setBlock(c.x, c.y + 1, c.z, entry.upperId);
+    } else if (entry.bedPair) {
+      const d = player.camera.getWorldDirection(_camDir);
+      const dx = Math.abs(d.x) > Math.abs(d.z) ? Math.sign(d.x) : 0;
+      const dz = dx === 0 ? Math.sign(d.z) || 1 : 0;
+      if ((world.getBlock(c.x + dx, c.y, c.z + dz)?.id ?? blocks.air.id) === blocks.air.id)
+        world.setBlock(c.x + dx, c.y, c.z + dz, BLOCK_IDS.bedHead);
     }
+  } else if (t) {
+    inventory.pickBlock(world.getBlock(t.x, t.y, t.z)?.id ?? blocks.air.id);
   }
 }
 document.addEventListener('mousedown', onMouseDown);
@@ -964,7 +1014,7 @@ world.onAfterGenerate = () => { configureMap(); net.sendInit(); };
 // through this (host edits → guest world, avatar tracking, perf metrics).
 // Read-only convenience in prod.
 (window as unknown as Record<string, unknown>).__mcDebug = {
-  world, player, net, remote, BLOCK_IDS, renderer,
+  world, player, net, remote, BLOCK_IDS, renderer, inventory,
   // Automated fragment-vs-vertex-bound GATE (perf-roadmap.md §0). Run on a REAL
   // GPU — `await __mcDebug.gate()` from the console while standing still over
   // dense terrain. It uncaps the loop, samples loop-fps at resolutionScale 1.0
